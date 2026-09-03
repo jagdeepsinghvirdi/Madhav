@@ -10,7 +10,7 @@ def on_cancel(self,method):
                 doc = frappe.get_doc("Work Order",self.work_order)
                 doc.db_set("completed_pcs",max(0, doc.completed_pcs - row.pieces))
                 doc.db_set("pending_pcs",doc.pieces - doc.completed_pcs)
-                doc.db_set("pending_qty",doc.qty - row.qty)
+                doc.db_set("pending_qty",doc.qty - doc.produced_qty)
 
 def validate(doc, method):
     """Recalculate rates/amounts safely for this app.
@@ -404,15 +404,13 @@ def set_custom_supplier_from_batch(doc):
         doc.db_set("custom_supplier", supplier, update_modified=False)
 
 @frappe.whitelist()
-def cancel_linked_psles(doc, method=None):
-    # Run BEFORE frappe checks links — required for Stock Transfer rollback
+def cancel_linked_psles(doc, method):
+    # Run BEFORE frappe checks links
     psles = frappe.get_all(
         "Piece Stock Ledger Entry",
         filters={"voucher_no": doc.name, "docstatus": 1},
-        pluck="name",
+        pluck="name"
     )
     for psle in psles:
         psle_doc = frappe.get_doc("Piece Stock Ledger Entry", psle)
-        psle_doc.flags.ignore_permissions = True
-        psle_doc.flags.ignore_links = True
         psle_doc.cancel()

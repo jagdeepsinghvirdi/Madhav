@@ -1,6 +1,7 @@
 import frappe
 from frappe.utils import now,flt
 from erpnext.stock.serial_batch_bundle import get_batchwise_qty
+from pypika.functions import Sum
 
 def create_piece_stock_ledger_entry(sle_doc, method):
     # Check if piece_qty exists in the parent document, else skip
@@ -109,35 +110,52 @@ def adjust_piece_qty_sign(sle_doc, piece_qty):
 
 # 	return flt(batch_qty[0][0]) if batch_qty else 0.0
 
-def update_batch_piece_on_sle(sle_doc, piece_qty):
+def update_batch_piece_on_sle(sle_doc, piece_qty=None):
 	"""
-	Update Batch.pieces safely using row lock.
-	Called once per Piece Stock Ledger Entry.
+	Recalculate Batch.pieces from Piece Stock Ledger Entry (row-locked),
+	instead of incrementally patching it. Batch is resolved via the
+	Serial and Batch Bundle child table since PSLE only stores the bundle.
+	Called once per Piece Stock Ledger Entry on submit/cancel.
 	"""
 
-	if not sle_doc.batch_no:
+	if not sle_doc.serial_and_batch_bundle:
 		return
 
-	doctype = frappe.qb.DocType("Batch")
-
-	query = (
-		frappe.qb.from_(doctype)
-		.select(doctype.pieces)
-		.where(doctype.name == sle_doc.batch_no)
-		.for_update()
+	batch_no = frappe.db.get_value(
+		"Serial and Batch Entry",
+		{"parent": sle_doc.serial_and_batch_bundle},
+		"batch_no",
 	)
 
-	current = query.run()
-	current_qty = flt(current[0][0]) if current else 0
+	if not batch_no:
+		return
 
-	# Reverse on cancel
-	if sle_doc.is_cancelled:
-		piece_qty = -piece_qty
+	batch_doctype = frappe.qb.DocType("Batch")
+
+	# Lock the Batch row first so concurrent SLE submissions
+	# for the same batch serialize instead of racing.
+	(
+		frappe.qb.from_(batch_doctype)
+		.select(batch_doctype.name)
+		.where(batch_doctype.name == batch_no)
+		.for_update()
+	).run()
+
+	total_pieces = flt(frappe.db.sql("""
+		SELECT COALESCE(SUM(psle.actual_qty), 0)
+		FROM `tabPiece Stock Ledger Entry` psle
+		WHERE psle.is_cancelled = 0
+		  AND psle.serial_and_batch_bundle IN (
+		      SELECT DISTINCT parent
+		      FROM `tabSerial and Batch Entry`
+		      WHERE batch_no = %s
+		  )
+	""", (batch_no,))[0][0])
 
 	frappe.db.set_value(
 		"Batch",
-		sle_doc.batch_no,
+		batch_no,
 		"pieces",
-		current_qty + piece_qty,
+		total_pieces,
 		update_modified=False
 	)
