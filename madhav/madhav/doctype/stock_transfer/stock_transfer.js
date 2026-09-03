@@ -135,21 +135,36 @@ async function recalculate_row(cdt, cdn, changed_field) {
         // Re-fetch row after validation (values might have changed)
         row = locals[cdt][cdn];
 
-        /* PIECES CHANGED → Calculate QTY */
+        /* PIECES CHANGED
+           Prefer keeping transferred Tonne qty when qty is already set.
+           Deriving qty from pcs×length×section_weight overwrote 1T → ~0.788
+           whenever Batch/Item section_weight did not match the physical
+           pcs/length for that tonne transfer. */
         if (changed_field === "pieces") {
 
-            if (row.length && row.section_weight) {
+            if (row.length && flt(row.pieces) && flt(row.qty)) {
+                let section_weight =
+                    (flt(row.qty) * 1000) / (flt(row.pieces) * flt(row.length));
+
+                frappe.model.set_value(
+                    cdt,
+                    cdn,
+                    "section_weight",
+                    flt(section_weight, 6),
+                    null,
+                    false
+                );
+            } else if (row.length && row.section_weight) {
 
                 let qty = (flt(row.pieces) * flt(row.length) * flt(row.section_weight)) / 1000;
 
-                // fire_changes: false prevents triggering qty event again
                 frappe.model.set_value(
                     cdt,
                     cdn,
                     "qty",
                     flt(qty, 3),
-                    null,   // callback
-                    false   // fire_changes = false
+                    null,
+                    false
                 );
             }
         }
@@ -159,24 +174,21 @@ async function recalculate_row(cdt, cdn, changed_field) {
 
             if (row.length && row.section_weight) {
 
-                // ✅ FIXED: Use section_weight instead of row.pieces
                 let pieces = (flt(row.qty) * 1000) / (flt(row.length) * flt(row.section_weight));
 
-                // fire_changes: false prevents triggering pieces event again
                 frappe.model.set_value(
                     cdt,
                     cdn,
                     "pieces",
                     Math.round(pieces),
-                    null,   // callback
-                    false   // fire_changes = false
+                    null,
+                    false
                 );
             }
         }
 
     } finally {
 
-        // Small delay to ensure all pending events are processed
         setTimeout(() => {
             calculating = false;
         }, 100);

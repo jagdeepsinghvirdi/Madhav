@@ -1,7 +1,7 @@
 import frappe
 from frappe.utils import now,flt
 from erpnext.stock.serial_batch_bundle import get_batchwise_qty
-from pypika.functions import Sum
+
 
 def create_piece_stock_ledger_entry(sle_doc, method):
     # Check if piece_qty exists in the parent document, else skip
@@ -64,6 +64,7 @@ def get_piece_qty(sle_doc):
 
     return frappe.db.get_value(child_doctype, detail_no, "pieces")
 
+
 def adjust_piece_qty_sign(sle_doc, piece_qty):
     """Make piece_qty negative for outgoing transactions"""
     if sle_doc.voucher_type == "Delivery Note":
@@ -91,71 +92,36 @@ def adjust_piece_qty_sign(sle_doc, piece_qty):
     # Default: assume incoming
     return abs(piece_qty)
 
-# def update_batch_piece(voucher_type, voucher_no, docstatus, via_landed_cost_voucher=False):
-# 	batches = get_batchwise_qty(voucher_type, voucher_no)
-# 	if not batches:
-# 		return
 
-# 	precision = frappe.get_precision("Batch", "pieces")
-# 	for batch, pieces in batches.items():
-# 		current_qty = get_batch_current_qty(batch)
-# 		current_qty += flt(pieces, precision) * (-1 if docstatus == 2 else 1)
-
-# 		frappe.db.set_value("Batch", batch, "pieces", current_qty)
-  
-# def get_batch_current_qty(batch):
-# 	doctype = frappe.qb.DocType("Batch")
-# 	query = frappe.qb.from_(doctype).select(doctype.pieces).where(doctype.name == batch).for_update()
-# 	batch_qty = query.run()
-
-# 	return flt(batch_qty[0][0]) if batch_qty else 0.0
-
-def update_batch_piece_on_sle(sle_doc, piece_qty=None):
+def update_batch_piece_on_sle(sle_doc, piece_qty):
 	"""
-	Recalculate Batch.pieces from Piece Stock Ledger Entry (row-locked),
-	instead of incrementally patching it. Batch is resolved via the
-	Serial and Batch Bundle child table since PSLE only stores the bundle.
-	Called once per Piece Stock Ledger Entry on submit/cancel.
+	Update Batch.pieces safely using row lock.
+	Called once per Piece Stock Ledger Entry.
 	"""
 
-	if not sle_doc.serial_and_batch_bundle:
+	if not sle_doc.batch_no:
 		return
 
-	batch_no = frappe.db.get_value(
-		"Serial and Batch Entry",
-		{"parent": sle_doc.serial_and_batch_bundle},
-		"batch_no",
+	doctype = frappe.qb.DocType("Batch")
+
+	query = (
+		frappe.qb.from_(doctype)
+		.select(doctype.pieces)
+		.where(doctype.name == sle_doc.batch_no)
+		.for_update()
 	)
 
-	if not batch_no:
-		return
+	current = query.run()
+	current_qty = flt(current[0][0]) if current else 0
 
-	batch_doctype = frappe.qb.DocType("Batch")
-
-	# Lock the Batch row first so concurrent SLE submissions
-	# for the same batch serialize instead of racing.
-	(
-		frappe.qb.from_(batch_doctype)
-		.select(batch_doctype.name)
-		.where(batch_doctype.name == batch_no)
-		.for_update()
-	).run()
-
-	total_pieces = flt(frappe.db.sql("""
-		SELECT COALESCE(SUM(psle.actual_qty), 0)
-		FROM `tabPiece Stock Ledger Entry` psle
-		WHERE psle.is_cancelled = 0
-		  AND psle.serial_and_batch_bundle IN (
-		      SELECT DISTINCT parent
-		      FROM `tabSerial and Batch Entry`
-		      WHERE batch_no = %s
-		  )
-	""", (batch_no,))[0][0])
+	# Reverse on cancel
+	if sle_doc.is_cancelled:
+		piece_qty = -piece_qty
 
 	frappe.db.set_value(
 		"Batch",
-		batch_no,
+		sle_doc.batch_no,
 		"pieces",
-		total_pieces,
+		current_qty + piece_qty,
 		update_modified=False
 	)
