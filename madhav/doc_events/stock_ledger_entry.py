@@ -2,6 +2,7 @@ import frappe
 from frappe.utils import now,flt
 from erpnext.stock.serial_batch_bundle import get_batchwise_qty
 
+
 def create_piece_stock_ledger_entry(sle_doc, method):
     # Check if piece_qty exists in the parent document, else skip
     if not frappe.db.get_value("Item",sle_doc.item_code,"required_stock_in_pieces"):
@@ -63,6 +64,7 @@ def get_piece_qty(sle_doc):
 
     return frappe.db.get_value(child_doctype, detail_no, "pieces")
 
+
 def adjust_piece_qty_sign(sle_doc, piece_qty):
     """Make piece_qty negative for outgoing transactions"""
     if sle_doc.voucher_type == "Delivery Note":
@@ -90,24 +92,6 @@ def adjust_piece_qty_sign(sle_doc, piece_qty):
     # Default: assume incoming
     return abs(piece_qty)
 
-# def update_batch_piece(voucher_type, voucher_no, docstatus, via_landed_cost_voucher=False):
-# 	batches = get_batchwise_qty(voucher_type, voucher_no)
-# 	if not batches:
-# 		return
-
-# 	precision = frappe.get_precision("Batch", "pieces")
-# 	for batch, pieces in batches.items():
-# 		current_qty = get_batch_current_qty(batch)
-# 		current_qty += flt(pieces, precision) * (-1 if docstatus == 2 else 1)
-
-# 		frappe.db.set_value("Batch", batch, "pieces", current_qty)
-  
-# def get_batch_current_qty(batch):
-# 	doctype = frappe.qb.DocType("Batch")
-# 	query = frappe.qb.from_(doctype).select(doctype.pieces).where(doctype.name == batch).for_update()
-# 	batch_qty = query.run()
-
-# 	return flt(batch_qty[0][0]) if batch_qty else 0.0
 
 def update_batch_piece_on_sle(sle_doc, piece_qty):
 	"""
