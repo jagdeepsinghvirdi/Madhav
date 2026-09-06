@@ -5,6 +5,8 @@
 tags
 node_modules
 __pycache__
+dump.rdb
+*.rdb
 
 # Documents
 *.pdf

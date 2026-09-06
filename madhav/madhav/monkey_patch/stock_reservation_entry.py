@@ -340,7 +340,13 @@ def _build_stock_reservation_summary(prep_items, filtered_out, reservation_resul
 
 
 def _update_sb_entries_custom_fields(doc):
-    """Stamp length, pieces and section_weight on each Serial and Batch Entry row."""
+    """Stamp length, pieces and section_weight on each Serial and Batch Entry row.
+
+    Intended for newly auto-reserved SO lines only: batch-first length and
+    integer pieces are derived here so reservation rows match physical batch
+    dimensions. DN cancel restore reuses snapshot values instead — see
+    ``_recreate_stock_reservation_from_snapshot`` in delivery_note.py.
+    """
     if doc.voucher_type != "Sales Order" or not doc.voucher_detail_no:
         return
 

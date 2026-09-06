@@ -195,6 +195,7 @@ doc_events = {
         "on_submit": "madhav.doc_events.stock_entry.after_submit",
         "before_submit": "madhav.doc_events.stock_entry.validation_section_weight",
         "validate": "madhav.doc_events.stock_entry.validate",
+        "before_cancel": "madhav.doc_events.stock_entry.cancel_linked_psles",
         "on_cancel":"madhav.doc_events.stock_entry.on_cancel"
     },
     "Purchase Invoice": {

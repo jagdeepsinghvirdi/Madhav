@@ -404,13 +404,15 @@ def set_custom_supplier_from_batch(doc):
         doc.db_set("custom_supplier", supplier, update_modified=False)
 
 @frappe.whitelist()
-def cancel_linked_psles(doc, method):
-    # Run BEFORE frappe checks links
+def cancel_linked_psles(doc, method=None):
+    # Run BEFORE frappe checks links — required for Stock Transfer rollback
     psles = frappe.get_all(
         "Piece Stock Ledger Entry",
         filters={"voucher_no": doc.name, "docstatus": 1},
-        pluck="name"
+        pluck="name",
     )
     for psle in psles:
         psle_doc = frappe.get_doc("Piece Stock Ledger Entry", psle)
+        psle_doc.flags.ignore_permissions = True
+        psle_doc.flags.ignore_links = True
         psle_doc.cancel()

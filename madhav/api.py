@@ -1544,10 +1544,20 @@ def update_child_qty_rate(parent_doctype, trans_items, parent_doctype_name, chil
     any_qty_changed = False  # updated to true if any item's qty changes
     items_added_or_removed = False  # updated to true if any new item is added or removed
     any_conversion_factor_changed = False
+    # Madhav: track stock-impacting SO line changes so we do NOT wipe all SREs
+    # on every Update Items (rate / date / length / pieces alone must keep reservations).
+    removed_so_item_names = []
+    so_lines_needing_sre_cancel = set()
 
     parent = frappe.get_doc(parent_doctype, parent_doctype_name)
 
     check_doc_permissions(parent, "write")
+
+    if parent_doctype == "Sales Order":
+        updated_item_names = {d.get("docname") for d in data if d.get("docname")}
+        removed_so_item_names = [
+            item.name for item in parent.items if item.name not in updated_item_names
+        ]
 
     if parent_doctype == "Quotation":
         ordered_items = get_ordered_items(parent.name)
@@ -1620,6 +1630,23 @@ def update_child_qty_rate(parent_doctype, trans_items, parent_doctype_name, chil
                 and length_unchanged
             ):
                 continue
+
+            # Stock-impacting changes on an existing SO line → cancel that line's
+            # SREs only (never wipe the whole SO). Length/pieces/rate/date alone
+            # must not recreate reservations (picks wrong batches via length window).
+            # Qty increase keeps existing SREs; only decrease / WH / UOM force cancel.
+            if parent_doctype == "Sales Order" and d.get("docname"):
+                prev_warehouse = child_item.get("warehouse")
+                new_warehouse = d.get("warehouse") or prev_warehouse
+                warehouse_changed = prev_warehouse != new_warehouse
+                qty_decreased = new_qty < prev_qty
+                if (
+                    qty_decreased
+                    or not conversion_factor_unchanged
+                    or not uom_unchanged
+                    or warehouse_changed
+                ):
+                    so_lines_needing_sre_cancel.add(d.get("docname"))
 
         validate_quantity_and_rate(child_item, d)
 
@@ -1820,15 +1847,33 @@ def update_child_qty_rate(parent_doctype, trans_items, parent_doctype_name, chil
     parent.validate_uom_is_integer("uom", "qty")
     parent.validate_uom_is_integer("stock_uom", "stock_qty")
 
-    # Cancel and Recreate Stock Reservation Entries.
+    # Madhav: do NOT cancel-all + auto-recreate SREs on every SO Update Items.
+    # That wiped BWRT / Finish WO / length-window batch picks and re-reserved
+    # different batches even when only rate / date / length / pieces changed.
+    # Only cancel SREs for removed lines or stock-impacting line edits.
+    # User re-reserves manually via Stock Reservation / Batch Wise Reservation.
     if parent_doctype == "Sales Order":
-        from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
-            cancel_stock_reservation_entries,
-            has_reserved_stock,
+        _cancel_so_line_stock_reservations(
+            parent.name,
+            set(removed_so_item_names) | so_lines_needing_sre_cancel,
         )
 
-        if has_reserved_stock(parent.doctype, parent.name):
-            cancel_stock_reservation_entries(parent.doctype, parent.name)
 
-            if parent.per_picked == 0:
-                parent.create_stock_reservation_entries()
+def _cancel_so_line_stock_reservations(sales_order, so_item_names):
+    """Cancel submitted SREs linked to specific Sales Order Item rows only."""
+    if not so_item_names:
+        return
+
+    from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
+        cancel_stock_reservation_entries,
+    )
+
+    for so_detail in so_item_names:
+        if not so_detail:
+            continue
+        cancel_stock_reservation_entries(
+            voucher_type="Sales Order",
+            voucher_no=sales_order,
+            voucher_detail_no=so_detail,
+            notify=False,
+        )

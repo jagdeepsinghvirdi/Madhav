@@ -56,7 +56,8 @@ frappe.ui.form.on('Delivery Note Item', {
 	batch_no(frm, cdt, cdn) {
 		let d = locals[cdt][cdn];
 
-		if (!d.batch_no) return;
+		// Bundle rows carry batches on Serial/Batch Bundle entries only.
+		if (!d.batch_no || d.serial_and_batch_bundle) return;
 
 		// fetch pieces from Batch only once
 		frappe.db.get_value(
