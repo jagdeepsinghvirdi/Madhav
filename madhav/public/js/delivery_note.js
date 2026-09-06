@@ -103,7 +103,7 @@ function calculate_qty(cdt, cdn) {
 	// Reserved / Deliver-as-Qty rows: physical Qty comes from reservation weight.
 	// Do not rebuild Qty from pieces×length×section_weight (that drifts 0.445→0.443).
 	if (
-		row.against_sales_order &&
+		(row.against_sales_order || row.against_sales_invoice) &&
 		(cint(row.custom_deliver_as_qty) || row.serial_and_batch_bundle)
 	) {
 		return;

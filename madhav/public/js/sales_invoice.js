@@ -8,6 +8,16 @@ frappe.ui.form.on("Sales Invoice", {
     validate(frm){
         update_taxes_fields(frm);
     },
+    refresh(frm) {
+    if (frm.doc.docstatus === 1 && frm.doc.deliver_as_qty !== undefined) {
+        frm.add_custom_button(__("Delivery Note"), function () {
+            frappe.model.open_mapped_doc({
+                method: "madhav.doc_events.delivery_note.make_delivery_note_from_si",
+                frm: frm,
+            });
+        }, __("Create"));
+    }
+},
 });
 function update_taxes_fields(frm) {
     if (!frm.doc.taxes) return;
