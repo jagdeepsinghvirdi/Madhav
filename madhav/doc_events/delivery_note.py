@@ -521,6 +521,10 @@ def _apply_reserved_dims_to_dn_item(dn_item, so_item, sre):
 		reserved_length = so_length
 	if reserved_length and hasattr(dn_item, "length_size"):
 		dn_item.length_size = reserved_length
+	# Keep average_length in sync — used by Stock Reconciliation / reports.
+	# fetch_from batch_no.average_length often fails when batch_no is blank (SABB).
+	if reserved_length and hasattr(dn_item, "average_length"):
+		dn_item.average_length = reserved_length
 
 	# Prefer undelivered pieces on SRE batch rows (skip fully delivered batches).
 	sre_pieces = 0
@@ -1727,6 +1731,35 @@ def create_stock_reconciliation(self):
                     entry_diff_qty = entry_invoice_qty - batch_qty
                     entry_dn_qty = batch_qty
 
+                    # Prefer bundle/Batch length — DN.average_length is often 0
+                    # (batch_no blank when using Serial and Batch Bundle).
+                    entry_length = (
+                        flt(getattr(entry, "length", 0))
+                        or flt(row.get("length_size"))
+                        or flt(row.get("average_length"))
+                        or flt(row.get("length"))
+                        or flt(
+                            frappe.db.get_value(
+                                "Batch", entry.batch_no, "average_length"
+                            )
+                            or 0
+                        )
+                    )
+                    entry_section_weight = (
+                        flt(getattr(entry, "section_weight", 0))
+                        or flt(row.get("section_weight"))
+                        or flt(
+                            frappe.db.get_value(
+                                "Batch", entry.batch_no, "section_weight"
+                            )
+                            or 0
+                        )
+                    )
+                    entry_pieces = (
+                        flt(getattr(entry, "pieces", 0))
+                        or (flt(row.get("pieces")) * ratio if row.get("pieces") else 0)
+                    )
+
                     sr.append(
                         "items",
                         {
@@ -1740,14 +1773,10 @@ def create_stock_reconciliation(self):
                             "delivery_note_qty": entry_dn_qty,
                             "valuation_rate": valuation_rate,
                             "current_rate": flt(row.incoming_rate),
-                            "pieces": (
-                                flt(row.get("pieces")) * ratio
-                                if row.get("pieces")
-                                else 0
-                            ),
-                            "length": flt(row.get("length")),
-                            "average_length": flt(row.get("average_length")),
-                            "section_weight": flt(row.get("section_weight")),
+                            "pieces": entry_pieces,
+                            "length": entry_length,
+                            "average_length": entry_length,
+                            "section_weight": entry_section_weight,
                             "delivery_note_ref": self.name,
                             "serial_and_batch_bundle": None,
                         },
