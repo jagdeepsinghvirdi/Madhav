@@ -1,6 +1,54 @@
 import frappe
 from frappe.utils import flt
 
+def _ensure_baseline_piece_sle(item_code, warehouse, batch_no, company):
+    """
+    recalculate_batch_pieces() resums from ACTIVE (is_cancelled=0) Piece
+    Stock Ledger Entry rows only. A batch can have stale, cancelled rows
+    left over from earlier transactions/testing while having NO active
+    ledger history at all - checking mere row existence (regardless of
+    is_cancelled) wrongly treats that as "already tracked," skipping the
+    baseline seed and leaving the very next delivery's own row as the
+    entire resummed total (e.g. batch shows pieces=10, no active
+    history, deliver all 10 -> resums to -10 instead of 0).
+
+    Seed a baseline equal to Batch.pieces only when the ACTIVE sum is
+    zero - this is safe to call on every delivery; once genuine active
+    history exists it never fires again.
+    """
+    if not batch_no:
+        return
+
+    active_sum = flt(frappe.db.sql(
+        """
+        SELECT COALESCE(SUM(actual_qty), 0)
+        FROM `tabPiece Stock Ledger Entry`
+        WHERE batch_no = %s AND docstatus = 1 AND is_cancelled = 0
+        """,
+        batch_no,
+    )[0][0])
+    if active_sum:
+        return
+
+    current_pieces = flt(frappe.db.get_value("Batch", batch_no, "pieces"))
+    if not current_pieces:
+        return
+
+    frappe.get_doc({
+        "doctype": "Piece Stock Ledger Entry",
+        "posting_date": frappe.utils.nowdate(),
+        "posting_time": "00:00:00",
+        "item_code": item_code,
+        "warehouse": warehouse,
+        "voucher_type": "Batch",
+        "voucher_no": batch_no,
+        "actual_qty": current_pieces,
+        "company": company,
+        "unit_of_measure": "Piece",
+        "is_cancelled": 0,
+        "batch_no": batch_no,
+        "docstatus": 1,
+    }).insert(ignore_permissions=True)
 
 def create_piece_stock_ledger_entry(sle_doc, method):
     if not frappe.db.get_value("Item", sle_doc.item_code, "required_stock_in_pieces"):
@@ -63,6 +111,7 @@ def create_piece_stock_ledger_entry(sle_doc, method):
     if len(batch_nos) == 1:
         # Single batch: apply the whole pieces value directly - no ratio
         # split, no rounding drift.
+        _ensure_baseline_piece_sle(sle_doc.item_code, sle_doc.warehouse, batch_nos[0], sle_doc.company)
         _create_piece_sle_row(sle_doc, batch_nos[0], signed_piece_qty)
     else:
         # Multiple batches under one bundle: split proportionally by
@@ -80,6 +129,7 @@ def create_piece_stock_ledger_entry(sle_doc, method):
         for batch_no, batch_piece_qty in zip(batch_nos, allocated):
             if not batch_piece_qty:
                 continue
+            _ensure_baseline_piece_sle(sle_doc.item_code, sle_doc.warehouse, batch_no, sle_doc.company)
             _create_piece_sle_row(sle_doc, batch_no, batch_piece_qty)
 
     for batch_no in batch_nos:

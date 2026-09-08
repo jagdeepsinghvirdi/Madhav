@@ -9,7 +9,8 @@ frappe.ui.form.on("Sales Invoice", {
         update_taxes_fields(frm);
     },
     refresh(frm) {
-    if (frm.doc.docstatus === 1 && frm.doc.deliver_as_qty !== undefined) {
+    if (frm.doc.docstatus === 1 && cint(frm.doc.deliver_as_qty)) {
+        frm.remove_custom_button(__("Delivery Note"), __("Create"));
         frm.add_custom_button(__("Delivery Note"), function () {
             frappe.model.open_mapped_doc({
                 method: "madhav.doc_events.delivery_note.make_delivery_note_from_si",

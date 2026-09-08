@@ -117,6 +117,28 @@ def before_validate(self, method):
         if bundle_warehouse and row.warehouse != bundle_warehouse:
             row.warehouse = bundle_warehouse
 
+def _validate_piece_availability(doc):
+    """
+    Pieces requested against a batch must never exceed the batch's
+    actual available pieces - unlike qty (which auto-corrects via
+    Stock Reconciliation on shortfall), an over-piece selection is
+    always a hard error, since pieces are discrete physical units that
+    can't be partially topped up the way weight/qty can.
+    """
+    pieces_needed = {}
+    for row in doc.items:
+        if not row.batch_no or not flt(row.get("pieces")):
+            continue
+        pieces_needed[row.batch_no] = pieces_needed.get(row.batch_no, 0) + flt(row.pieces)
+
+    for batch_no, needed in pieces_needed.items():
+        available_pieces = flt(frappe.db.get_value("Batch", batch_no, "pieces") or 0)
+        if needed > available_pieces + 0.0001:
+            frappe.throw(
+                _(
+                    "Batch {0}: total pieces requested ({1}) exceed available pieces ({2})."
+                ).format(frappe.bold(batch_no), needed, available_pieces)
+            )
 
 def fix_group_cost_center(self):
     """
@@ -462,13 +484,13 @@ def validate(self, method):
         if deliver_as_qty and not row.custom_deliver_as_qty:
             row.custom_deliver_as_qty = deliver_as_qty
 
-    if _has_deliver_as_qty_over_delivery(self):
-        for args in self.status_updater:
-            if (
-                args.get("target_dt") == "Sales Order Item"
-                and args.get("overflow_type") == "delivery"
-            ):
-                args["validate_qty"] = False
+        if _has_deliver_as_qty_over_delivery(self):
+            for args in self.status_updater:
+                if (
+                    args.get("target_dt") in ("Sales Order Item", "Sales Invoice Item")
+                    and args.get("overflow_type") == "delivery"
+                ):
+                    args["validate_qty"] = False
 
 
 def _has_deliver_as_qty_over_delivery(doc):
@@ -480,6 +502,10 @@ def _has_deliver_as_qty_over_delivery(doc):
         if row.so_detail:
             so_qty = flt(frappe.db.get_value("Sales Order Item", row.so_detail, "qty"))
             if flt(row.invoice_qty) > so_qty:
+                return True
+        if row.si_detail:
+            si_qty = flt(frappe.db.get_value("Sales Invoice Item", row.si_detail, "qty"))
+            if flt(row.invoice_qty) > si_qty:
                 return True
     return False
 
@@ -852,13 +878,13 @@ def get_batch_qty_from_sle(item_code, warehouse, batch_no):
 
 
 def get_available_qty_for_item(row):
-    """"Available" must mean the batch's real physical stock, not the
-    tentative reservation amount sitting on this row's bundle. A
-    reservation can legitimately be smaller than what a batch truly
-    holds - checking the shortfall against the reservation size alone
-    was falsely flagging perfectly healthy deliveries as short and
-    dragging them into an unnecessary Stock Reconciliation, which then
-    double-counted against the DN's own bundle subtraction.
+    """"Available" must always be live physical stock when it can be
+    resolved, never averaged/maxed against a bundle's reservation-time
+    snapshot. A max() with the snapshot fixes a stale-too-small
+    reservation causing a false shortfall, but just as easily hides a
+    genuine shortfall when the snapshot is stale-too-large (e.g. other
+    deliveries drew the batch down since this row was reserved). Live
+    stock is the only figure that can't go stale either direction.
     """
     warehouse = row.warehouse
     if not warehouse and row.serial_and_batch_bundle:
@@ -866,20 +892,32 @@ def get_available_qty_for_item(row):
             "Serial and Batch Bundle", row.serial_and_batch_bundle, "warehouse"
         )
 
-    batch_available = 0
-    if row.batch_no and warehouse:
-        batch_available = get_batch_qty_from_sle(row.item_code, warehouse, row.batch_no)
+    batch_entries = []
+    if row.serial_and_batch_bundle:
+        batch_entries = frappe.get_all(
+            "Serial and Batch Entry",
+            filters={
+                "parent": row.serial_and_batch_bundle,
+                "parenttype": "Serial and Batch Bundle",
+            },
+            fields=["batch_no"],
+        )
+
+    batch_nos = {row.batch_no} if row.batch_no else set()
+    batch_nos.update(e.batch_no for e in batch_entries if e.batch_no)
+
+    if batch_nos and warehouse:
+        live_total = sum(
+            get_batch_qty_from_sle(row.item_code, warehouse, b) for b in batch_nos
+        )
+        if live_total:
+            return live_total
 
     if row.serial_and_batch_bundle:
         sbb = frappe.get_doc("Serial and Batch Bundle", row.serial_and_batch_bundle)
         bundle_qty = sum(abs(flt(e.qty)) for e in sbb.entries if e.batch_no)
-        if batch_available:
-            return max(batch_available, bundle_qty)
         if bundle_qty:
             return bundle_qty
-
-    if batch_available:
-        return batch_available
 
     if row.against_sales_order and row.so_detail:
         sre_rows = frappe.get_all(
@@ -1029,6 +1067,8 @@ from frappe.utils import get_datetime, add_to_date, nowtime
 
 
 def before_submit(self, method):
+    _validate_piece_availability(self)
+
     for i in self.items:
         if not i.custom_deliver_as_qty:
             i.difference_qty = 0
@@ -1961,34 +2001,26 @@ def create_stock_reconciliation(self):
         batch_update = {}
         if frappe.db.has_column("Batch", "batch_qty"):
             batch_update["batch_qty"] = flt(sr_item.qty)
-        if frappe.db.has_column("Batch", "pieces") and sr_item.get("pieces"):
-            # Pieces taken must be subtracted from what the batch actually
-            # held, not overwritten with the taken amount — e.g. a batch
-            # starting at 35 pieces, with 20 taken via this invoice,
-            # should end at 15, not be overwritten to show 20 as if that
-            # were the batch's entire remaining stock.
-            #
-            # NOTE: this direct write is only the final value for items
-            # where required_stock_in_pieces is OFF (the generic Piece
-            # Stock Ledger mechanism never fires for those, so this is
-            # the sole correction). For items where it IS on, the DN's
-            # own natural delivery (processed right after this function
-            # returns, still within the same before_submit flow) will
-            # independently call recalculate_batch_pieces() and overwrite
-            # this value based on the full ledger sum — do NOT also
-            # insert a Piece Stock Ledger Entry here, or the same pieces
-            # get subtracted twice (once here, once by the DN's own
-            # delivery), producing a negative/wrong final value.
+            piece_tracked = frappe.db.get_value(
+            "Item", sr_item.item_code, "required_stock_in_pieces"
+        )
+        if (
+            not piece_tracked
+            and frappe.db.has_column("Batch", "pieces")
+            and sr_item.get("pieces")
+        ):
+            # Only this branch ever writes Batch.pieces directly, and only
+            # for items where required_stock_in_pieces is OFF. For
+            # piece-tracked items, the generic Piece Stock Ledger
+            # mechanism (recalculate_batch_pieces, fired by the Stock
+            # Reconciliation's / DN's own SLEs) is the sole, exclusive
+            # authority — this guard guarantees the two mechanisms can
+            # never both write the same batch's pieces, instead of
+            # relying on write-ordering (and the SR-skip in
+            # adjust_piece_qty_sign / create_piece_stock_ledger_entry) to
+            # sort it out.
             starting_pieces = original_batch_pieces.get(sr_item.batch_no, 0)
             batch_update["pieces"] = max(starting_pieces - flt(sr_item.pieces), 0)
-        # Client requirement: Length must also reflect the reconciled
-        # value. Only write it when the SR item actually carries a
-        # positive length — never overwrite existing Batch length with
-        # a blank/zero from an SR item that had no length data (e.g.
-        # a plain qty-only reconciliation for a non-steel item).
-        length_val = sr_item.get("length") or sr_item.get("average_length")
-        if frappe.db.has_column("Batch", "average_length") and flt(length_val):
-            batch_update["average_length"] = flt(length_val)
         if batch_update:
             frappe.db.set_value(
                 "Batch", sr_item.batch_no, batch_update, update_modified=False
@@ -2206,6 +2238,16 @@ def make_delivery_note_from_si(source_name, target_doc=None):
         # these in on save once si_detail/against_sales_invoice are set.
         target.batch_no = None
         target.warehouse = None
+
+        # Preserve SO linkage when this SI line itself originated from a
+        # Sales Order (core ERPNext stamps sales_order/so_detail on the
+        # Sales Invoice Item in that case) — without this, DN cancel and
+        # SO status/reservation sync (cancel_stock_reservations_from_so,
+        # update_sales_order_quantities_on_cancel) silently no-op since
+        # they key entirely off against_sales_order/so_detail.
+        if source.get("sales_order") and source.get("so_detail"):
+            target.against_sales_order = source.sales_order
+            target.so_detail = source.so_detail
 
     target_doc = get_mapped_doc(
         "Sales Invoice",
