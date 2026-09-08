@@ -5,6 +5,9 @@ import frappe
 from frappe import _
 from frappe.utils import flt
 from frappe.model.document import Document
+from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
+	get_available_qty_to_reserve,
+)
 
 
 def resolve_sre_sb_dimensions(pieces=None, length=None, section_weight=None, batch_vals=None):
@@ -138,9 +141,17 @@ class StockTransfer(Document):
 
         # Fallback for legacy docs (blank stock_entry / stock_transfer link):
         # match Material Transfer by this ST's warehouses + posting date + batch.
+        #
+        # Stock Entries owned by another Stock Transfer are excluded, otherwise
+        # cancelling this transfer would reverse someone else's stock movement
+        # when both moved the same batch between the same warehouses on the
+        # same day. If more than one unowned candidate still matches, the match
+        # is ambiguous and we return nothing so the caller fails loudly instead
+        # of cancelling the wrong document.
         if not self.transfer_item:
             return None
 
+        candidates = set()
         for row in self.transfer_item:
             batch_no = row.batch
             if not batch_no:
@@ -153,29 +164,39 @@ class StockTransfer(Document):
 
             rows = frappe.db.sql(
                 """
-                SELECT se.name
+                SELECT DISTINCT se.name
                 FROM `tabStock Entry` se
                 INNER JOIN `tabStock Entry Detail` sed ON sed.parent = se.name
                 WHERE se.docstatus = 1
                   AND se.stock_entry_type = 'Material Transfer'
-                  AND se.from_warehouse = %s
-                  AND se.to_warehouse = %s
-                  AND se.posting_date = %s
-                  AND sed.batch_no = %s
-                  AND sed.item_code = %s
-                ORDER BY se.creation DESC
-                LIMIT 1
+                  AND se.from_warehouse = %(from_wh)s
+                  AND se.to_warehouse = %(to_wh)s
+                  AND se.posting_date = %(posting_date)s
+                  AND sed.batch_no = %(batch_no)s
+                  AND sed.item_code = %(item_code)s
+                  AND IFNULL(se.stock_transfer, '') IN ('', %(name)s)
+                  AND se.name NOT IN (
+                      SELECT IFNULL(st.stock_entry, '')
+                      FROM `tabStock Transfer` st
+                      WHERE st.name != %(name)s
+                        AND IFNULL(st.stock_entry, '') != ''
+                  )
                 """,
-                (
-                    from_wh,
-                    to_wh,
-                    self.posting_date,
-                    batch_no,
-                    row.item_code,
-                ),
+                {
+                    "from_wh": from_wh,
+                    "to_wh": to_wh,
+                    "posting_date": self.posting_date,
+                    "batch_no": batch_no,
+                    "item_code": row.item_code,
+                    "name": self.name,
+                },
             )
-            if rows:
-                return rows[0][0]
+            candidates.update(r[0] for r in rows)
+
+        # One Stock Transfer always creates exactly one Material Transfer, so a
+        # genuine match collapses to a single Stock Entry across all rows.
+        if len(candidates) == 1:
+            return candidates.pop()
 
         return None
 
@@ -519,7 +540,6 @@ class StockTransfer(Document):
 
         item = so_items[0]
         so_detail = item.name
-        available_qty = max(0, flt(item.qty) - flt(item.stock_reserved_qty or 0))
 
         over_reservation_allowance = flt(
             frappe.db.get_single_value("Stock Settings", "over_reservation_allowance") or 0
@@ -553,6 +573,24 @@ class StockTransfer(Document):
         if reserve_qty <= 0:
             return
 
+        has_batch_no = frappe.get_cached_value("Item", item_code, "has_batch_no")
+
+        # ERPNext requires a non-zero `available_qty` ("Available Qty to
+        # Reserve") and means warehouse stock that can still be reserved.
+        # Deriving it from the SO line's leftover qty made it 0 as soon as an
+        # earlier transfer reserved the whole line, so a later transfer was
+        # rejected with "Available Qty to Reserve is required" even though the
+        # over-reservation allowance still permitted the reservation.
+        # Warehouse level (no batch) matches ERPNext and stays correct for
+        # bundle-tracked batches, where batch-level lookups read 0.
+        physical_available_qty = flt(get_available_qty_to_reserve(item_code, warehouse))
+        if physical_available_qty <= 0:
+            return
+
+        reserve_qty = flt(min(reserve_qty, physical_available_qty), 3)
+        if reserve_qty <= 0:
+            return
+
         sre = frappe.new_doc("Stock Reservation Entry")
 
         sre.item_code = item_code
@@ -568,10 +606,7 @@ class StockTransfer(Document):
         sre.from_voucher_detail_no = from_voucher_detail_no
         sre.reserved_qty = reserve_qty
         sre.voucher_qty = flt(so_qty, 3)
-        sre.available_qty = flt(available_qty, 3)
-        sre.available_qty_to_reserve = reserve_qty
-
-        has_batch_no = frappe.get_cached_value("Item", item_code, "has_batch_no")
+        sre.available_qty = flt(physical_available_qty, 3)
 
         if batch_no and has_batch_no and reserve_qty > 0:
             sre.has_batch_no = 1
