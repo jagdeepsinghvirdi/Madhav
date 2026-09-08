@@ -2,6 +2,7 @@ import frappe
 from frappe.utils import flt
 
 
+
 def create_piece_stock_ledger_entry(sle_doc, method):
 	"""Create Piece SLE(s) and keep Batch.pieces in sync.
 
@@ -230,6 +231,7 @@ def get_piece_qty(sle_doc):
 		return None
 
 	return frappe.db.get_value(child_doctype, detail_no, "pieces")
+
 
 
 def adjust_piece_qty_sign(sle_doc, piece_qty):
