@@ -8,7 +8,21 @@ def on_submit(self, method=None):
     Only update qty / incoming_rate — never pieces (physical PC must stay).
     Match DN rows via bundle + batch + delivery_note_qty so duplicate
     item/batch lines on one DN update the correct row.
+
+    Also: DN-linked SR must NOT overwrite Batch.average_length / pieces.
+    A site Server Script ("Update Batch details") used to copy SR row
+    values onto Batch; DN rows often have average_length=0, which wiped
+    Length Size and reset Length/Pieces to the delivered count.
     """
+    # Keep after_submit importable for no_reload workers still on old hooks path.
+    import madhav.doc_events.stock_reconciliation as _self_mod
+    if not hasattr(_self_mod, "after_submit"):
+        from madhav.doc_events.stock_reconciliation_hooks import (
+            after_submit as _after_submit,
+        )
+
+        _self_mod.after_submit = _after_submit
+
     matched_dn_items = set()
 
     for row in self.items:
@@ -29,6 +43,21 @@ def on_submit(self, method=None):
             },
             update_modified=False,
         )
+
+
+def after_submit(self, method=None):
+    """Delegate to stock_reconciliation_hooks (kept for direct imports/tests)."""
+    from madhav.doc_events.stock_reconciliation_hooks import after_submit as _after_submit
+
+    return _after_submit(self, method)
+
+
+def _restore_batch_length_if_wiped(batch_no, sr_row=None):
+    from madhav.doc_events.stock_reconciliation_hooks import (
+        _restore_batch_length_if_wiped as _restore,
+    )
+
+    return _restore(batch_no, sr_row)
 
 
 def _find_dn_item_for_sr_row(row, matched=None):
