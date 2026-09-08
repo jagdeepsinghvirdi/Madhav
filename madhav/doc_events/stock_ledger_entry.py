@@ -1,253 +1,312 @@
 import frappe
 from frappe.utils import flt
 
-def _ensure_baseline_piece_sle(item_code, warehouse, batch_no, company):
-    """
-    recalculate_batch_pieces() resums from ACTIVE (is_cancelled=0) Piece
-    Stock Ledger Entry rows only. A batch can have stale, cancelled rows
-    left over from earlier transactions/testing while having NO active
-    ledger history at all - checking mere row existence (regardless of
-    is_cancelled) wrongly treats that as "already tracked," skipping the
-    baseline seed and leaving the very next delivery's own row as the
-    entire resummed total (e.g. batch shows pieces=10, no active
-    history, deliver all 10 -> resums to -10 instead of 0).
-
-    Seed a baseline equal to Batch.pieces only when the ACTIVE sum is
-    zero - this is safe to call on every delivery; once genuine active
-    history exists it never fires again.
-    """
-    if not batch_no:
-        return
-
-    active_sum = flt(frappe.db.sql(
-        """
-        SELECT COALESCE(SUM(actual_qty), 0)
-        FROM `tabPiece Stock Ledger Entry`
-        WHERE batch_no = %s AND docstatus = 1 AND is_cancelled = 0
-        """,
-        batch_no,
-    )[0][0])
-    if active_sum:
-        return
-
-    current_pieces = flt(frappe.db.get_value("Batch", batch_no, "pieces"))
-    if not current_pieces:
-        return
-
-    frappe.get_doc({
-        "doctype": "Piece Stock Ledger Entry",
-        "posting_date": frappe.utils.nowdate(),
-        "posting_time": "00:00:00",
-        "item_code": item_code,
-        "warehouse": warehouse,
-        "voucher_type": "Batch",
-        "voucher_no": batch_no,
-        "actual_qty": current_pieces,
-        "company": company,
-        "unit_of_measure": "Piece",
-        "is_cancelled": 0,
-        "batch_no": batch_no,
-        "docstatus": 1,
-    }).insert(ignore_permissions=True)
 
 def create_piece_stock_ledger_entry(sle_doc, method):
-    if not frappe.db.get_value("Item", sle_doc.item_code, "required_stock_in_pieces"):
-        return
+	"""Create Piece SLE(s) and keep Batch.pieces in sync.
 
-    if sle_doc.is_cancelled:
-        # This SLE call represents cancellation of the original stock
-        # ledger entries for this voucher. get_piece_qty/adjust_piece_qty_sign
-        # only know the source doc's static pieces field and voucher_type -
-        # they cannot distinguish a creation call from a cancellation call,
-        # so computing a fresh signed value here would create another entry
-        # with the SAME sign as the original, compounding rather than
-        # reversing it (observed: a second -20 row instead of a +20
-        # reversal, leaving the original -20 row permanently active).
-        # Cancel the existing Piece SLE row(s) for this exact voucher directly.
-        frappe.db.sql(
-            """
-            UPDATE `tabPiece Stock Ledger Entry`
-            SET is_cancelled = 1
-            WHERE voucher_type = %s AND voucher_no = %s AND is_cancelled = 0
-            """,
-            (sle_doc.voucher_type, sle_doc.voucher_no),
-        )
-        affected_batches = frappe.db.sql(
-            """
-            SELECT DISTINCT batch_no FROM `tabPiece Stock Ledger Entry`
-            WHERE voucher_type = %s AND voucher_no = %s AND batch_no IS NOT NULL
-            """,
-            (sle_doc.voucher_type, sle_doc.voucher_no),
-        )
-        for (batch_no,) in affected_batches:
-            recalculate_batch_pieces(batch_no)
-        return
+	Does NOT touch Batch.average_length (Length Size) — that stays static.
 
-    if sle_doc.voucher_type == "Stock Reconciliation":
-        return
+	When stock moves via Serial and Batch Bundle, ERPNext often leaves
+	SLE.batch_no blank. Older code then wrote one PSLE with no batch, so
+	Batch.Length/Pieces never reduced on Delivery Note. Resolve batches
+	from the bundle and post one PSLE per batch.
+	"""
+	if not frappe.db.get_value("Item", sle_doc.item_code, "required_stock_in_pieces"):
+		return
 
-    piece_qty = get_piece_qty(sle_doc)
-    if piece_qty is None:
-        return
+	if sle_doc.is_cancelled:
+		# Cancelling the SLE must cancel existing Piece SLE rows for this
+		# voucher — do NOT insert another signed row (that doubles the hit).
+		frappe.db.sql(
+			"""
+			UPDATE `tabPiece Stock Ledger Entry`
+			SET is_cancelled = 1
+			WHERE voucher_type = %s AND voucher_no = %s AND is_cancelled = 0
+			""",
+			(sle_doc.voucher_type, sle_doc.voucher_no),
+		)
+		affected_batches = _batches_touched_by_voucher(sle_doc.voucher_type, sle_doc.voucher_no)
+		for batch_no in affected_batches:
+			recalculate_batch_pieces(batch_no)
+		return
 
-    signed_piece_qty = adjust_piece_qty_sign(sle_doc, piece_qty)
-    if not signed_piece_qty:
-        return
+	if sle_doc.voucher_type == "Stock Reconciliation":
+		return
 
-    # Batch-tracked items almost always move stock through a Serial and
-    # Batch Bundle - the SLE header's own batch_no field is frequently
-    # left blank even for a genuinely single-batch transaction (the real
-    # batch/qty split lives on the bundle's own entries). Resolve the
-    # actual batch(es) and their relative qty share from the bundle when
-    # one exists, falling back to sle_doc.batch_no only when there is no
-    # bundle at all.
-    batch_qty_shares = _get_batch_qty_shares(sle_doc)
-    if not batch_qty_shares:
-        return
+	piece_qty = get_piece_qty(sle_doc)
+	if piece_qty is None:
+		return
 
-    total_share_qty = sum(batch_qty_shares.values()) or 1
-    batch_nos = list(batch_qty_shares.keys())
+	signed_piece_qty = adjust_piece_qty_sign(sle_doc, piece_qty)
+	if not signed_piece_qty:
+		return
 
-    if len(batch_nos) == 1:
-        # Single batch: apply the whole pieces value directly - no ratio
-        # split, no rounding drift.
-        _ensure_baseline_piece_sle(sle_doc.item_code, sle_doc.warehouse, batch_nos[0], sle_doc.company)
-        _create_piece_sle_row(sle_doc, batch_nos[0], signed_piece_qty)
-    else:
-        # Multiple batches under one bundle: split proportionally by
-        # each batch's qty share, absorbing rounding remainder on the
-        # first batch so the pieces sum stays exact.
-        allocated = []
-        for batch_no in batch_nos:
-            ratio = batch_qty_shares[batch_no] / total_share_qty
-            allocated.append(round(signed_piece_qty * ratio))
+	batch_piece_map = _get_batch_piece_allocation(sle_doc, signed_piece_qty)
+	if not batch_piece_map:
+		return
 
-        leftover = signed_piece_qty - sum(allocated)
-        if allocated:
-            allocated[0] += leftover
+	for batch_no, batch_piece_qty in batch_piece_map.items():
+		if not batch_piece_qty:
+			continue
+		# A batch whose current Batch.pieces predates the Piece Ledger (set
+		# via receipt/manual entry with no corresponding PSLE row) has no
+		# history to resum from — its very first delivery's own row would
+		# become the ENTIRE ledger, so a batch showing pieces=20 with zero
+		# ledger rows resums to -20 after a 20-piece delivery, and 0 after
+		# that delivery is cancelled, instead of correctly landing on 0 and
+		# reverting to 20. Seed a one-time anchor row equal to the batch's
+		# current pieces value before applying any delta.
+		_ensure_baseline_piece_sle(sle_doc.item_code, sle_doc.warehouse, batch_no, sle_doc.company)
+		_create_piece_sle_row(sle_doc, batch_no, batch_piece_qty)
 
-        for batch_no, batch_piece_qty in zip(batch_nos, allocated):
-            if not batch_piece_qty:
-                continue
-            _ensure_baseline_piece_sle(sle_doc.item_code, sle_doc.warehouse, batch_no, sle_doc.company)
-            _create_piece_sle_row(sle_doc, batch_no, batch_piece_qty)
-
-    for batch_no in batch_nos:
-        recalculate_batch_pieces(batch_no)
+	for batch_no in batch_piece_map:
+		recalculate_batch_pieces(batch_no)
 
 
-def _get_batch_qty_shares(sle_doc):
-    """Return {batch_no: qty_share} for this SLE, preferring the Serial
-    and Batch Bundle's own entries (which reliably carry batch_no) over
-    the SLE header's batch_no field (which is often blank)."""
-    if sle_doc.serial_and_batch_bundle:
-        entries = frappe.get_all(
-            "Serial and Batch Entry",
-            filters={"parent": sle_doc.serial_and_batch_bundle},
-            fields=["batch_no", "qty"],
-        )
-        return {e.batch_no: abs(flt(e.qty)) for e in entries if e.batch_no}
+def _ensure_baseline_piece_sle(item_code, warehouse, batch_no, company):
+	"""
+	recalculate_batch_pieces() resums from the Piece Stock Ledger alone.
+	Seed one anchor row equal to the batch's current pieces value before
+	applying any delta — only fires once per batch (checks for any
+	existing row first, cancelled or not, so it never re-seeds after the
+	batch has real history).
+	"""
+	if not batch_no:
+		return
+	if frappe.db.exists("Piece Stock Ledger Entry", {"batch_no": batch_no, "docstatus": 1}):
+		return
 
-    if sle_doc.batch_no:
-        return {sle_doc.batch_no: 1.0}
+	current_pieces = flt(frappe.db.get_value("Batch", batch_no, "pieces"))
+	if not current_pieces:
+		return
 
-    return {}
+	frappe.get_doc({
+		"doctype": "Piece Stock Ledger Entry",
+		"posting_date": frappe.utils.nowdate(),
+		"posting_time": "00:00:00",
+		"item_code": item_code,
+		"warehouse": warehouse,
+		"voucher_type": "Batch",
+		"voucher_no": batch_no,
+		"actual_qty": current_pieces,
+		"company": company,
+		"unit_of_measure": "Piece",
+		"is_cancelled": 0,
+		"batch_no": batch_no,
+		"docstatus": 1,
+	}).insert(ignore_permissions=True)
+
+
+def _batches_touched_by_voucher(voucher_type, voucher_no):
+	"""Batches linked to this voucher via PSLE.batch_no or via SABB entries."""
+	named = frappe.db.sql(
+		"""
+		SELECT DISTINCT batch_no
+		FROM `tabPiece Stock Ledger Entry`
+		WHERE voucher_type = %s AND voucher_no = %s
+		  AND IFNULL(batch_no, '') != ''
+		""",
+		(voucher_type, voucher_no),
+	)
+	from_bundle = frappe.db.sql(
+		"""
+		SELECT DISTINCT sbe.batch_no
+		FROM `tabPiece Stock Ledger Entry` psle
+		INNER JOIN `tabSerial and Batch Entry` sbe
+			ON sbe.parent = psle.serial_and_batch_bundle
+		WHERE psle.voucher_type = %s AND psle.voucher_no = %s
+		  AND IFNULL(sbe.batch_no, '') != ''
+		""",
+		(voucher_type, voucher_no),
+	)
+	return {r[0] for r in named + from_bundle if r and r[0]}
+
+
+def _get_batch_piece_allocation(sle_doc, signed_piece_qty):
+	"""Return {batch_no: signed_pieces} for this SLE.
+
+	Prefer Serial and Batch Entry.pieces when present; otherwise split the
+	voucher piece qty by each batch's qty share.
+	"""
+	sign = 1 if flt(signed_piece_qty) >= 0 else -1
+
+	if sle_doc.serial_and_batch_bundle:
+		entries = frappe.get_all(
+			"Serial and Batch Entry",
+			filters={"parent": sle_doc.serial_and_batch_bundle},
+			fields=["batch_no", "qty", "pieces"],
+			order_by="idx asc",
+		)
+		sle_outward = flt(sle_doc.actual_qty) < 0
+		directional = []
+		for e in entries:
+			if not e.batch_no:
+				continue
+			qty = flt(e.qty)
+			if qty == 0:
+				continue
+			if sle_outward and qty > 0:
+				continue
+			if (not sle_outward) and qty < 0:
+				continue
+			directional.append(e)
+		if not directional:
+			directional = [e for e in entries if e.batch_no]
+
+		if not directional:
+			return {}
+
+		with_pieces = {
+			e.batch_no: abs(flt(e.pieces)) for e in directional if abs(flt(e.pieces)) > 0
+		}
+		if with_pieces:
+			return {b: sign * p for b, p in with_pieces.items()}
+
+		qty_shares = {e.batch_no: abs(flt(e.qty)) for e in directional}
+		total = sum(qty_shares.values()) or 1
+		batch_nos = list(qty_shares.keys())
+		if len(batch_nos) == 1:
+			return {batch_nos[0]: signed_piece_qty}
+
+		allocated = []
+		for batch_no in batch_nos:
+			ratio = qty_shares[batch_no] / total
+			allocated.append(round(signed_piece_qty * ratio))
+		leftover = signed_piece_qty - sum(allocated)
+		if allocated:
+			allocated[0] += leftover
+		return {b: q for b, q in zip(batch_nos, allocated) if q}
+
+	if sle_doc.batch_no:
+		return {sle_doc.batch_no: signed_piece_qty}
+
+	return {}
 
 
 def _create_piece_sle_row(sle_doc, batch_no, piece_qty):
-    piece_doc = frappe.new_doc("Piece Stock Ledger Entry")
-    piece_doc.update({
-        "posting_date": sle_doc.posting_date,
-        "posting_time": sle_doc.posting_time,
-        "item_code": sle_doc.item_code,
-        "warehouse": sle_doc.warehouse,
-        "voucher_type": sle_doc.voucher_type,
-        "voucher_no": sle_doc.voucher_no,
-        "serial_and_batch_bundle": sle_doc.serial_and_batch_bundle,
-        "actual_qty": piece_qty,
-        "incoming_rate": sle_doc.incoming_rate,
-        "company": sle_doc.company,
-        "unit_of_measure": "Piece",
-        "is_cancelled": sle_doc.is_cancelled,
-        "batch_no": batch_no,
-        "docstatus": sle_doc.docstatus,
-    })
-    piece_doc.insert(ignore_permissions=True)
+	piece_doc = frappe.new_doc("Piece Stock Ledger Entry")
+	piece_doc.update(
+		{
+			"posting_date": sle_doc.posting_date,
+			"posting_time": sle_doc.posting_time,
+			"item_code": sle_doc.item_code,
+			"warehouse": sle_doc.warehouse,
+			"voucher_type": sle_doc.voucher_type,
+			"voucher_no": sle_doc.voucher_no,
+			"serial_and_batch_bundle": sle_doc.serial_and_batch_bundle,
+			"actual_qty": piece_qty,
+			"incoming_rate": sle_doc.incoming_rate,
+			"company": sle_doc.company,
+			"unit_of_measure": "Piece",
+			"is_cancelled": sle_doc.is_cancelled,
+			"batch_no": batch_no,
+			"docstatus": sle_doc.docstatus,
+		}
+	)
+	piece_doc.insert(ignore_permissions=True)
 
 
 def recalculate_batch_pieces(batch_no):
-    """Recompute Batch.pieces as the sum of ALL currently-active Piece
-    Stock Ledger Entry rows for this batch, rather than incrementally
-    adding/subtracting a delta to whatever value is currently stored.
+	"""Recompute Batch.pieces from active Piece SLEs.
 
-    Must explicitly exclude is_cancelled=1 rows: a cancelled Piece SLE's
-    own docstatus stays 1 and its original actual_qty is left untouched
-    -- cancellation here is represented by the is_cancelled flag, not by
-    a fresh offsetting reversal row. Summing all docstatus=1 rows without
-    this filter double-counts every cancelled delivery's original
-    (negative) qty, producing a batch pieces value far below the true
-    figure (observed: -40 instead of 10 after a single cancelled +
-    single active 20-piece delivery on a 30-piece batch).
-    """
-    if not batch_no:
-        return
+	Never changes average_length (Length Size).
 
-    total = frappe.db.sql(
-        """
-        SELECT COALESCE(SUM(actual_qty), 0)
-        FROM `tabPiece Stock Ledger Entry`
-        WHERE batch_no = %s AND docstatus = 1 AND is_cancelled = 0
-        """,
-        batch_no,
-    )[0][0]
+	Includes:
+	  - rows with batch_no set, and
+	  - legacy null-batch rows whose Serial/Batch Bundle is single-batch
+	    for this batch (old DN/SE bug).
+	Excludes is_cancelled = 1 rows.
+	"""
+	if not batch_no:
+		return
 
-    frappe.db.set_value("Batch", batch_no, "pieces", flt(total), update_modified=False)
+	total = frappe.db.sql(
+		"""
+		SELECT COALESCE(SUM(psle.actual_qty), 0)
+		FROM `tabPiece Stock Ledger Entry` psle
+		WHERE psle.docstatus = 1
+		  AND psle.is_cancelled = 0
+		  AND (
+			psle.batch_no = %s
+			OR (
+				IFNULL(psle.batch_no, '') = ''
+				AND psle.serial_and_batch_bundle IS NOT NULL
+				AND EXISTS (
+					SELECT 1 FROM `tabSerial and Batch Entry` sbe
+					WHERE sbe.parent = psle.serial_and_batch_bundle
+					  AND sbe.batch_no = %s
+				)
+				AND (
+					SELECT COUNT(DISTINCT sbe2.batch_no)
+					FROM `tabSerial and Batch Entry` sbe2
+					WHERE sbe2.parent = psle.serial_and_batch_bundle
+					  AND IFNULL(sbe2.batch_no, '') != ''
+				) = 1
+			)
+		  )
+		""",
+		(batch_no, batch_no),
+	)[0][0]
+
+	frappe.db.set_value("Batch", batch_no, "pieces", flt(total), update_modified=False)
 
 
 def get_piece_qty(sle_doc):
-    """Try to fetch piece count from the relevant child table row."""
-    voucher_type = sle_doc.voucher_type
-    detail_no = sle_doc.voucher_detail_no
-    if not voucher_type or not detail_no:
-        return None
+	"""Fetch pieces from the voucher item row linked to this SLE."""
+	voucher_type = sle_doc.voucher_type
+	detail_no = sle_doc.voucher_detail_no
+	if not voucher_type or not detail_no:
+		return None
 
-    mapping = {
-        "Purchase Receipt": "Purchase Receipt Item",
-        "Purchase Invoice": "Purchase Invoice Item",
-        "Sales Invoice": "Sales Invoice Item",
-        "Delivery Note": "Delivery Note Item",
-        "Stock Entry": "Stock Entry Detail",
-    }
+	mapping = {
+		"Purchase Receipt": "Purchase Receipt Item",
+		"Purchase Invoice": "Purchase Invoice Item",
+		"Sales Invoice": "Sales Invoice Item",
+		"Delivery Note": "Delivery Note Item",
+		"Stock Entry": "Stock Entry Detail",
+	}
 
-    child_doctype = mapping.get(voucher_type)
-    if not child_doctype:
-        return None
+	child_doctype = mapping.get(voucher_type)
+	if not child_doctype:
+		return None
 
-    return frappe.db.get_value(child_doctype, detail_no, "pieces")
+	return frappe.db.get_value(child_doctype, detail_no, "pieces")
 
 
 def adjust_piece_qty_sign(sle_doc, piece_qty):
-    """Make piece_qty negative for outgoing transactions."""
-    if sle_doc.voucher_type == "Delivery Note":
-        return -1 * abs(piece_qty)
+	"""Make piece_qty negative for outgoing transactions."""
+	if sle_doc.voucher_type == "Delivery Note":
+		return -1 * abs(piece_qty)
 
-    if sle_doc.voucher_type == "Sales Invoice":
-        return -1 * abs(piece_qty)
+	if sle_doc.voucher_type == "Sales Invoice":
+		return -1 * abs(piece_qty)
 
-    if sle_doc.voucher_type == "Purchase Receipt" and frappe.db.get_value(
-        "Purchase Receipt", sle_doc.voucher_no, "is_return"
-    ) == 1:
-        return -1 * abs(piece_qty)
+	if sle_doc.voucher_type == "Purchase Receipt" and frappe.db.get_value(
+		"Purchase Receipt", sle_doc.voucher_no, "is_return"
+	) == 1:
+		return -1 * abs(piece_qty)
 
-    if sle_doc.voucher_type == "Stock Entry":
-        purpose = frappe.db.get_value("Stock Entry", sle_doc.voucher_no, "purpose")
+	if sle_doc.voucher_type == "Stock Entry":
+		purpose = frappe.db.get_value("Stock Entry", sle_doc.voucher_no, "purpose")
 
-        if purpose in ["Material Issue", "Send to Subcontractor"]:
-            return -1 * abs(piece_qty)
-        elif purpose in ["Material Receipt", "Receive from Subcontractor"]:
-            return abs(piece_qty)
-        else:
-            return piece_qty if sle_doc.actual_qty > 0 else -1 * abs(piece_qty)
+		if purpose in ["Material Issue", "Send to Subcontractor"]:
+			return -1 * abs(piece_qty)
+		elif purpose in ["Material Receipt", "Receive from Subcontractor"]:
+			return abs(piece_qty)
+		else:
+			return piece_qty if sle_doc.actual_qty > 0 else -1 * abs(piece_qty)
 
-    # Default: assume incoming
-    return abs(piece_qty)
+	return abs(piece_qty)
+
+
+def update_batch_piece_on_sle(sle_doc, piece_qty):
+	"""Backward-compatible wrapper — prefer recalculate_batch_pieces."""
+	batch_no = sle_doc.batch_no
+	if not batch_no and sle_doc.serial_and_batch_bundle:
+		batch_no = frappe.db.get_value(
+			"Serial and Batch Entry",
+			{"parent": sle_doc.serial_and_batch_bundle},
+			"batch_no",
+		)
+	recalculate_batch_pieces(batch_no)

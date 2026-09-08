@@ -178,6 +178,8 @@ override_doctype_class = {
 doc_events = {
     "Stock Reconciliation": {
         "before_submit": "madhav.doc_events.stock_reconciliation.on_submit",
+        # Separate module so no_reload workers can import after_submit fresh.
+        "on_submit": "madhav.doc_events.stock_reconciliation_hooks.after_submit",
         "validate": "madhav.doc_events.stock_reconciliation.validate",
     },
 
