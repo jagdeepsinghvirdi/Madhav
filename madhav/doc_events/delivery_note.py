@@ -85,7 +85,7 @@ def before_insert(self, method):
     fix_group_cost_center(self)
     populate_missing_batch_bundle(self)
     change_qty_serial_and_batch(self)
-
+    populate_missing_batch_bundle_from_si(self)
 
 def before_validate(self, method):
     """
@@ -117,6 +117,28 @@ def before_validate(self, method):
         if bundle_warehouse and row.warehouse != bundle_warehouse:
             row.warehouse = bundle_warehouse
 
+def _validate_piece_availability(doc):
+    """
+    Pieces requested against a batch must never exceed the batch's
+    actual available pieces - unlike qty (which auto-corrects via
+    Stock Reconciliation on shortfall), an over-piece selection is
+    always a hard error, since pieces are discrete physical units that
+    can't be partially topped up the way weight/qty can.
+    """
+    pieces_needed = {}
+    for row in doc.items:
+        if not row.batch_no or not flt(row.get("pieces")):
+            continue
+        pieces_needed[row.batch_no] = pieces_needed.get(row.batch_no, 0) + flt(row.pieces)
+
+    for batch_no, needed in pieces_needed.items():
+        available_pieces = flt(frappe.db.get_value("Batch", batch_no, "pieces") or 0)
+        if needed > available_pieces + 0.0001:
+            frappe.throw(
+                _(
+                    "Batch {0}: total pieces requested ({1}) exceed available pieces ({2})."
+                ).format(frappe.bold(batch_no), needed, available_pieces)
+            )
 
 def fix_group_cost_center(self):
     """
@@ -152,6 +174,60 @@ def fix_group_cost_center(self):
 
         item.cost_center = so_cost_center
 
+def populate_missing_batch_bundle_from_si(self):
+    """
+    Delivery Notes made via the standard "Make > Delivery Note" button on a
+    Sales Invoice land here with item_code/qty/rate/si_detail/
+    against_sales_invoice set, but batch_no and warehouse are not
+    guaranteed to have been copied from the source Sales Invoice Item.
+    Without batch_no/warehouse on the row, get_available_qty_for_item()
+    has nothing to fall back on for SI-originated Deliver-as-Qty rows —
+    there is no Stock Reservation Entry for a plain Sales Invoice, and no
+    Serial and Batch Bundle exists yet at before_submit time (core only
+    builds one during its own on_submit stock ledger step) — so
+    difference_qty always came back as the full invoice_qty (a false
+    shortfall on every row, every time).
+
+    Copy batch_no/warehouse (and length/pieces/section_weight, where the
+    columns exist) straight from the Sales Invoice Item here, matching
+    what was already selected at invoicing time, so the SLE fallback in
+    get_available_qty_for_item has real data to work with.
+    """
+    for item in self.items:
+        if not item.against_sales_invoice or not item.si_detail:
+            continue
+        if item.serial_and_batch_bundle or item.batch_no:
+            continue
+        if not frappe.db.exists("Sales Invoice Item", item.si_detail):
+            continue
+
+        si_fields = ["batch_no", "warehouse"]
+        for optional in ("length", "section_weight", "pieces", "average_length"):
+            if frappe.db.has_column("Sales Invoice Item", optional):
+                si_fields.append(optional)
+
+        si_item = frappe.db.get_value(
+            "Sales Invoice Item", item.si_detail, si_fields, as_dict=True
+        )
+        if not si_item or not si_item.get("batch_no"):
+            continue
+
+        item.batch_no = si_item.batch_no
+        if hasattr(item, "use_serial_batch_fields"):
+            item.use_serial_batch_fields = 1
+        if si_item.get("warehouse") and not item.warehouse:
+            item.warehouse = si_item.warehouse
+
+        if si_item.get("length") and hasattr(item, "length") and not flt(item.get("length")):
+            item.length = si_item.length
+        if si_item.get("section_weight") and hasattr(item, "section_weight") and not flt(item.get("section_weight")):
+            item.section_weight = si_item.section_weight
+        if si_item.get("pieces") and hasattr(item, "pieces") and not flt(item.get("pieces")):
+            item.pieces = si_item.pieces
+        # SI's "average_length" maps to DN Item's "length_size" field
+        # (same concept, different fieldname).
+        if si_item.get("average_length") and hasattr(item, "length_size") and not flt(item.get("length_size")):
+            item.length_size = si_item.average_length
 
 def populate_missing_batch_bundle(self):
     """
@@ -375,31 +451,46 @@ def _build_merged_batch_bundle(item, sre_rows, warehouse):
     return new_bundle.name
 
 
-def validate(self, method):
+def _resolve_deliver_as_qty(row):
+    """
+    Deliver as Qty can come from either source doc a DN row descends
+    from:
+      - Sales Order (existing) — via row.against_sales_order
+      - Sales Invoice (new) — via row.against_sales_invoice
+    against_sales_order takes precedence if a row somehow has both.
+    Rows with neither get 0 — normal delivery, untouched.
+    """
+    if row.against_sales_order:
+        return frappe.db.get_value(
+            "Sales Order", row.against_sales_order, "deliver_as_qty"
+        )
+    if row.against_sales_invoice:
+        return frappe.db.get_value(
+            "Sales Invoice", row.against_sales_invoice, "deliver_as_qty"
+        )
+    return 0
 
+
+def validate(self, method):
     for row in self.items:
         # ERPNext rebuilds the bundle when both batch_no and
         # serial_and_batch_bundle are set on the same row.
         if row.serial_and_batch_bundle and row.batch_no:
             row.batch_no = None
 
-        if row.against_sales_order:
-            deliver_as_qty = frappe.db.get_value(
-                "Sales Order", row.against_sales_order, "deliver_as_qty"
-            )
+        deliver_as_qty = _resolve_deliver_as_qty(row)
+        if deliver_as_qty and not row.invoice_qty:
+            frappe.throw(f"Invoice Qty is mandatory for row {row.idx}")
+        if deliver_as_qty and not row.custom_deliver_as_qty:
+            row.custom_deliver_as_qty = deliver_as_qty
 
-            if deliver_as_qty and not row.invoice_qty:
-                frappe.throw(f"Invoice Qty is mandatory for row {row.idx}")
-            if deliver_as_qty and not row.custom_deliver_as_qty:
-                row.custom_deliver_as_qty = deliver_as_qty
-
-    if _has_deliver_as_qty_over_delivery(self):
-        for args in self.status_updater:
-            if (
-                args.get("target_dt") == "Sales Order Item"
-                and args.get("overflow_type") == "delivery"
-            ):
-                args["validate_qty"] = False
+        if _has_deliver_as_qty_over_delivery(self):
+            for args in self.status_updater:
+                if (
+                    args.get("target_dt") in ("Sales Order Item", "Sales Invoice Item")
+                    and args.get("overflow_type") == "delivery"
+                ):
+                    args["validate_qty"] = False
 
 
 def _has_deliver_as_qty_over_delivery(doc):
@@ -411,6 +502,10 @@ def _has_deliver_as_qty_over_delivery(doc):
         if row.so_detail:
             so_qty = flt(frappe.db.get_value("Sales Order Item", row.so_detail, "qty"))
             if flt(row.invoice_qty) > so_qty:
+                return True
+        if row.si_detail:
+            si_qty = flt(frappe.db.get_value("Sales Invoice Item", row.si_detail, "qty"))
+            if flt(row.invoice_qty) > si_qty:
                 return True
     return False
 
@@ -765,10 +860,63 @@ def change_qty_serial_and_batch(self):
             f"Entries={[{'batch': d.batch_no, 'qty': d.qty, 'pieces': d.pieces} for d in bundle.entries]}"
         )
 
+def get_batch_qty_from_sle(item_code, warehouse, batch_no):
+    """Real physical stock for a batch, from Stock Ledger Entry via the
+    Serial and Batch Entry join (batch_no is not reliably populated
+    directly on the SLE itself)."""
+    result = frappe.db.sql(
+        """
+        SELECT SUM(sle.actual_qty) as qty
+        FROM `tabStock Ledger Entry` sle
+        INNER JOIN `tabSerial and Batch Entry` sbe
+            ON sbe.parent = sle.serial_and_batch_bundle
+        WHERE sle.item_code = %s
+          AND sle.warehouse = %s
+          AND sbe.batch_no = %s
+          AND sle.is_cancelled = 0
+        """,
+        (item_code, warehouse, batch_no),
+        as_dict=True,
+    )
+    return flt(result[0].qty) if result and result[0].qty else 0
+
+
 def get_available_qty_for_item(row):
-    # Prefer this DN row's bundle. Multi-batch DNs use one SRE/bundle per row;
-    # summing all SO-line reservations would understate difference_qty on the
-    # over-invoiced row and can pull stock from sibling batches on submit.
+    """"Available" must always be live physical stock when it can be
+    resolved, never averaged/maxed against a bundle's reservation-time
+    snapshot. A max() with the snapshot fixes a stale-too-small
+    reservation causing a false shortfall, but just as easily hides a
+    genuine shortfall when the snapshot is stale-too-large (e.g. other
+    deliveries drew the batch down since this row was reserved). Live
+    stock is the only figure that can't go stale either direction.
+    """
+    warehouse = row.warehouse
+    if not warehouse and row.serial_and_batch_bundle:
+        warehouse = frappe.db.get_value(
+            "Serial and Batch Bundle", row.serial_and_batch_bundle, "warehouse"
+        )
+
+    batch_entries = []
+    if row.serial_and_batch_bundle:
+        batch_entries = frappe.get_all(
+            "Serial and Batch Entry",
+            filters={
+                "parent": row.serial_and_batch_bundle,
+                "parenttype": "Serial and Batch Bundle",
+            },
+            fields=["batch_no"],
+        )
+
+    batch_nos = {row.batch_no} if row.batch_no else set()
+    batch_nos.update(e.batch_no for e in batch_entries if e.batch_no)
+
+    if batch_nos and warehouse:
+        live_total = sum(
+            get_batch_qty_from_sle(row.item_code, warehouse, b) for b in batch_nos
+        )
+        if live_total:
+            return live_total
+
     if row.serial_and_batch_bundle:
         sbb = frappe.get_doc("Serial and Batch Bundle", row.serial_and_batch_bundle)
         bundle_qty = sum(abs(flt(e.qty)) for e in sbb.entries if e.batch_no)
@@ -923,6 +1071,8 @@ from frappe.utils import get_datetime, add_to_date, nowtime
 
 
 def before_submit(self, method):
+    _validate_piece_availability(self)
+
     for i in self.items:
         if not i.custom_deliver_as_qty:
             i.difference_qty = 0
@@ -935,15 +1085,25 @@ def before_submit(self, method):
         else:
             i.difference_qty = 0
 
-        if flt(i.difference_qty) <= 0 and flt(i.invoice_qty) > 0 and i.serial_and_batch_bundle and i.custom_deliver_as_qty:
+        no_shortfall = flt(i.difference_qty) <= 0 and flt(i.invoice_qty) > 0 and i.custom_deliver_as_qty
+
+        if no_shortfall and i.serial_and_batch_bundle:
             i.qty = flt(i.invoice_qty)
             i.stock_qty = flt(i.invoice_qty) * flt(i.conversion_factor or 1)
-            update_bundle_to_invoice_qty(i, flt(i.invoice_qty),flt(i.qty),flt(i.custom_deliver_as_qty))
+            update_bundle_to_invoice_qty(i, flt(i.invoice_qty), flt(i.qty), flt(i.custom_deliver_as_qty))
+        elif no_shortfall and i.batch_no:
+            # SI-originated rows: no bundle yet — core builds the Serial
+            # and Batch Bundle itself from batch_no + use_serial_batch_fields
+            # during its own on_submit stock ledger step, using this
+            # corrected qty. Nothing to proportionally rescale here.
+            i.qty = flt(i.invoice_qty)
+            i.stock_qty = flt(i.invoice_qty) * flt(i.conversion_factor or 1)
+            if hasattr(i, "use_serial_batch_fields"):
+                i.use_serial_batch_fields = 1
 
     cancel_stock_reservations_from_so(self)
     create_stock_reconciliation(self)
     self.calculate_taxes_and_totals()
-
 
 CANCELLED_SRE_COMMENT_PREFIX = "MADHAV_DN_CANCELLED_SRE::"
 
@@ -1852,12 +2012,62 @@ def create_stock_reconciliation(self):
 
     sr.submit()
 
+    # Snapshot each affected batch's pieces BEFORE applying this SR's
+    # updates, so pieces can be correctly decremented by what was taken
+    # rather than overwritten with the taken amount as if it were the
+    # batch's new total.
+    batch_nos_in_sr = list({sr_item.batch_no for sr_item in sr.items if sr_item.batch_no})
+    original_batch_pieces = {}
+    if batch_nos_in_sr and frappe.db.has_column("Batch", "pieces"):
+        for b in frappe.db.get_all(
+            "Batch", filters={"name": ["in", batch_nos_in_sr]}, fields=["name", "pieces"]
+        ):
+            original_batch_pieces[b.name] = flt(b.pieces)
+
+    for sr_item in sr.items:
+        if not sr_item.batch_no:
+            continue
+        batch_update = {}
+        if frappe.db.has_column("Batch", "batch_qty"):
+            batch_update["batch_qty"] = flt(sr_item.qty)
+            piece_tracked = frappe.db.get_value(
+            "Item", sr_item.item_code, "required_stock_in_pieces"
+        )
+        if (
+            not piece_tracked
+            and frappe.db.has_column("Batch", "pieces")
+            and sr_item.get("pieces")
+        ):
+            # Only this branch ever writes Batch.pieces directly, and only
+            # for items where required_stock_in_pieces is OFF. For
+            # piece-tracked items, the generic Piece Stock Ledger
+            # mechanism (recalculate_batch_pieces, fired by the Stock
+            # Reconciliation's / DN's own SLEs) is the sole, exclusive
+            # authority — this guard guarantees the two mechanisms can
+            # never both write the same batch's pieces, instead of
+            # relying on write-ordering (and the SR-skip in
+            # adjust_piece_qty_sign / create_piece_stock_ledger_entry) to
+            # sort it out.
+            starting_pieces = original_batch_pieces.get(sr_item.batch_no, 0)
+            batch_update["pieces"] = max(starting_pieces - flt(sr_item.pieces), 0)
+        if batch_update:
+            frappe.db.set_value(
+                "Batch", sr_item.batch_no, batch_update, update_modified=False
+            )
+
     for dn_row in self.items:
         if flt(dn_row.difference_qty) <= 0:
             continue
 
         if dn_row.serial_and_batch_bundle:
-            update_bundle_to_invoice_qty(dn_row, flt(dn_row.invoice_qty),flt(dn_row.qty),flt(dn_row.custom_deliver_as_qty))
+            update_bundle_to_invoice_qty(
+                dn_row,
+                flt(dn_row.invoice_qty),
+                flt(dn_row.qty),
+                flt(dn_row.custom_deliver_as_qty),
+            )
+        elif dn_row.batch_no and hasattr(dn_row, "use_serial_batch_fields"):
+            dn_row.use_serial_batch_fields = 1
 
         dn_row.qty = flt(dn_row.invoice_qty)
         dn_row.stock_qty = flt(dn_row.invoice_qty) * flt(dn_row.conversion_factor or 1)
@@ -2005,7 +2215,6 @@ def make_delivery_note_custom(source_name, target_doc=None, kwargs=None):
 
             # qty from undelivered reserved stock for this SRE
             dn_item.qty = available_reserved / flt(dn_item.conversion_factor or 1)
-            dn_item.qty = flt(sre.reserved_qty) / flt(dn_item.conversion_factor or 1)
             dn_item.warehouse = sre.warehouse
             dn_item.custom_deliver_as_qty = so.deliver_as_qty
             _apply_reserved_dims_to_dn_item(dn_item, so_item, sre)
@@ -2038,6 +2247,61 @@ def make_delivery_note_custom(source_name, target_doc=None, kwargs=None):
 
     return target_doc
 
+@frappe.whitelist()
+def make_delivery_note_from_si(source_name, target_doc=None):
+    si = frappe.get_doc("Sales Invoice", source_name)
+
+    def set_missing_values(source, target):
+        target.run_method("set_missing_values")
+        target.run_method("calculate_taxes_and_totals")
+        target.run_method("set_use_serial_batch_fields")
+        make_packing_list(target)
+
+    def update_item(source, target, source_parent):
+        target.qty = flt(source.qty)
+        target.invoice_qty = flt(source.qty)
+        target.amount = target.qty * flt(source.rate)
+        target.custom_deliver_as_qty = cint(source_parent.deliver_as_qty)
+        # Deliberately leave batch_no / warehouse blank here.
+        # populate_missing_batch_bundle_from_si (existing logic) fills
+        # these in on save once si_detail/against_sales_invoice are set.
+        target.batch_no = None
+        target.warehouse = None
+
+        # Preserve SO linkage when this SI line itself originated from a
+        # Sales Order (core ERPNext stamps sales_order/so_detail on the
+        # Sales Invoice Item in that case) — without this, DN cancel and
+        # SO status/reservation sync (cancel_stock_reservations_from_so,
+        # update_sales_order_quantities_on_cancel) silently no-op since
+        # they key entirely off against_sales_order/so_detail.
+        if source.get("sales_order") and source.get("so_detail"):
+            target.against_sales_order = source.sales_order
+            target.so_detail = source.so_detail
+
+    target_doc = get_mapped_doc(
+        "Sales Invoice",
+        si.name,
+        {
+            "Sales Invoice": {
+                "doctype": "Delivery Note",
+                "validation": {"docstatus": ["=", 1]},
+            },
+            "Sales Invoice Item": {
+                "doctype": "Delivery Note Item",
+                "field_map": {
+                    "name": "si_detail",
+                    "parent": "against_sales_invoice",
+                    "rate": "rate",
+                },
+                "postprocess": update_item,
+            },
+        },
+        target_doc,
+        set_missing_values,
+    )
+
+    return target_doc
+    
 import frappe
 import json
 from frappe.utils import flt, cstr

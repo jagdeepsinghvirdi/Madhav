@@ -2,7 +2,6 @@ import frappe
 from frappe.utils import flt
 
 
-
 def create_piece_stock_ledger_entry(sle_doc, method):
 	"""Create Piece SLE(s) and keep Batch.pieces in sync.
 
@@ -50,10 +49,53 @@ def create_piece_stock_ledger_entry(sle_doc, method):
 	for batch_no, batch_piece_qty in batch_piece_map.items():
 		if not batch_piece_qty:
 			continue
+		# A batch whose current Batch.pieces predates the Piece Ledger (set
+		# via receipt/manual entry with no corresponding PSLE row) has no
+		# history to resum from — its very first delivery's own row would
+		# become the ENTIRE ledger, so a batch showing pieces=20 with zero
+		# ledger rows resums to -20 after a 20-piece delivery, and 0 after
+		# that delivery is cancelled, instead of correctly landing on 0 and
+		# reverting to 20. Seed a one-time anchor row equal to the batch's
+		# current pieces value before applying any delta.
+		_ensure_baseline_piece_sle(sle_doc.item_code, sle_doc.warehouse, batch_no, sle_doc.company)
 		_create_piece_sle_row(sle_doc, batch_no, batch_piece_qty)
 
 	for batch_no in batch_piece_map:
 		recalculate_batch_pieces(batch_no)
+
+
+def _ensure_baseline_piece_sle(item_code, warehouse, batch_no, company):
+	"""
+	recalculate_batch_pieces() resums from the Piece Stock Ledger alone.
+	Seed one anchor row equal to the batch's current pieces value before
+	applying any delta — only fires once per batch (checks for any
+	existing row first, cancelled or not, so it never re-seeds after the
+	batch has real history).
+	"""
+	if not batch_no:
+		return
+	if frappe.db.exists("Piece Stock Ledger Entry", {"batch_no": batch_no, "docstatus": 1}):
+		return
+
+	current_pieces = flt(frappe.db.get_value("Batch", batch_no, "pieces"))
+	if not current_pieces:
+		return
+
+	frappe.get_doc({
+		"doctype": "Piece Stock Ledger Entry",
+		"posting_date": frappe.utils.nowdate(),
+		"posting_time": "00:00:00",
+		"item_code": item_code,
+		"warehouse": warehouse,
+		"voucher_type": "Batch",
+		"voucher_no": batch_no,
+		"actual_qty": current_pieces,
+		"company": company,
+		"unit_of_measure": "Piece",
+		"is_cancelled": 0,
+		"batch_no": batch_no,
+		"docstatus": 1,
+	}).insert(ignore_permissions=True)
 
 
 def _batches_touched_by_voucher(voucher_type, voucher_no):
@@ -96,7 +138,6 @@ def _get_batch_piece_allocation(sle_doc, signed_piece_qty):
 			fields=["batch_no", "qty", "pieces"],
 			order_by="idx asc",
 		)
-		# Keep rows matching this SLE direction (outward vs inward).
 		sle_outward = flt(sle_doc.actual_qty) < 0
 		directional = []
 		for e in entries:
@@ -231,7 +272,6 @@ def get_piece_qty(sle_doc):
 		return None
 
 	return frappe.db.get_value(child_doctype, detail_no, "pieces")
-
 
 
 def adjust_piece_qty_sign(sle_doc, piece_qty):
