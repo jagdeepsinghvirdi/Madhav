@@ -539,7 +539,7 @@ def fetch_available_batches(item_code, warehouse, pending_qty=0, reserve_qty=0):
 
 	batch_details = frappe.db.get_all(
 		"Batch", filters={"name": ["in", batch_names], "disabled": 0},
-		fields=["name", "pieces", "average_length", "batch_qty"],
+		fields=["name", "pieces", "average_length", "section_weight", "batch_qty"],
 	)
 	batch_map = {d.name: d for d in batch_details}
 
@@ -581,7 +581,7 @@ def fetch_available_batches(item_code, warehouse, pending_qty=0, reserve_qty=0):
 			"item_name": frappe.db.get_value("Item", row.item_code, "item_name"),
 			"pieces": available_pieces,
 			"length": batch.average_length if batch else 0,
-			"section_weight": batch.average_length if batch else 0,
+			"section_weight": batch.section_weight if batch else 0,
 			"actual_qty": actual_qty,
 			"reserved_qty": reserved_qty,
 			"available_qty": available_qty,

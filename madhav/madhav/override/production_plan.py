@@ -25,34 +25,14 @@ def meters_to_inches(value):
 
 
 def get_already_reserved_qty(sales_order_item):
-	"""Qty still outstanding on Stock Reservation Entries for this SO
-	line - reserved minus delivered, so delivered stock isn't
-	subtracted twice (once via ERPNext's own pending_qty calc, and
-	again here)."""
-	return flt(
-		frappe.db.sql(
-			"""
-			select sum(reserved_qty - delivered_qty) from `tabStock Reservation Entry`
-			where voucher_type = 'Sales Order'
-				and voucher_detail_no = %s
-				and docstatus = 1
-			""",
-			sales_order_item,
-		)[0][0]
-		or 0
+	from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
+		get_base_reserved_qty,
 	)
+
+	return flt(get_base_reserved_qty(sales_order_item))
 
 
 def get_already_reserved_pieces(sales_order_item):
-	"""Pieces actually reserved via the Batch Wise Reservation Tool for
-	this SO line, scaled to the *actual* Stock Reservation Entry qty -
-	not the originally staged qty. The staged pieces figure
-	(Staged Batch Reservations Verification.reserved_pieces) reflects
-	what was requested at staging time, but create_fg_stock_reservation
-	can cap the actual reserved qty below that (limited stock,
-	item-level availability, etc). Without scaling, pieces would never
-	reach zero for a line that's genuinely fully qty-reserved but was
-	capped during submission."""
 	rows = frappe.db.sql(
 		"""
 		select sbr.name, sbr.reserved_qty as staged_qty, sbr.reserved_pieces as staged_pieces,
@@ -63,7 +43,9 @@ def get_already_reserved_pieces(sales_order_item):
 			on sre.from_voucher_type = 'Batch Wise Reservation Tool'
 			and sre.from_voucher_detail_no = sbr.name
 			and sre.docstatus = 1
+			and ifnull(sre.custom_is_tolerance, 0) = 0
 		where sbr.sales_order_item = %s and bwrt.docstatus = 1
+			and ifnull(sbr.is_tolerance, 0) = 0
 		""",
 		sales_order_item,
 		as_dict=True,
