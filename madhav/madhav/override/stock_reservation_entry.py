@@ -83,7 +83,7 @@ class StockReservationEntry(_StockReservationEntry):
             # which should still be capped by the normal allowance.
             # Only Available Qty at the warehouse still limits it.
             # ---------------------------------------------------------
-            if self.from_voucher_type == "Batch Wise Reservation Tool":
+            if self.from_voucher_type == "Batch Wise Reservation Tool" and cint(self.get("custom_is_tolerance")):
                 allowed_qty = self.available_qty
             else:
                 allowed_qty = min(
