@@ -38,7 +38,7 @@ class TestDNCancelSRERestoreHelpers(FrappeTestCase):
 			"madhav.doc_events.delivery_note._delivered_qty_excluding_dn",
 			return_value=0,
 		), patch(
-			"madhav.doc_events.delivery_note._get_active_reserved_stock_qty",
+			"madhav.doc_events.delivery_note._get_active_reserved_qty",
 			return_value=1.145,
 		), patch(
 			"madhav.doc_events.delivery_note.frappe.db.get_single_value",
@@ -52,7 +52,7 @@ class TestDNCancelSRERestoreHelpers(FrappeTestCase):
 			"madhav.doc_events.delivery_note._delivered_qty_excluding_dn",
 			return_value=0,
 		), patch(
-			"madhav.doc_events.delivery_note._get_active_reserved_stock_qty",
+			"madhav.doc_events.delivery_note._get_active_reserved_qty",
 			return_value=15.0,
 		), patch(
 			"madhav.doc_events.delivery_note.frappe.db.get_single_value",
@@ -60,3 +60,24 @@ class TestDNCancelSRERestoreHelpers(FrappeTestCase):
 		):
 			room = _voucher_reservation_headroom("SO-1", "soi-1", 15.0)
 			self.assertEqual(room, 0)
+
+	def test_voucher_headroom_does_not_count_other_dn_delivery_twice(self):
+		"""SO qty 10, DN-A delivered 4, DN-B delivered 6 and is cancelling.
+
+		DN-A's entry is fully delivered, so its undelivered reservation is
+		0 and the only claim on the line is DN-A's 4 delivered units. All
+		6 of DN-B's units must be restorable — counting the gross reserved
+		qty instead left just 2.
+		"""
+		with patch(
+			"madhav.doc_events.delivery_note._delivered_qty_excluding_dn",
+			return_value=4.0,
+		), patch(
+			"madhav.doc_events.delivery_note._get_active_reserved_qty",
+			return_value=0.0,
+		), patch(
+			"madhav.doc_events.delivery_note.frappe.db.get_single_value",
+			return_value=0,
+		):
+			room = _voucher_reservation_headroom("SO-1", "soi-1", 10.0, exclude_dn="DN-B")
+			self.assertAlmostEqual(flt(room), 6.0)
