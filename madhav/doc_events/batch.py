@@ -12,9 +12,11 @@ def autoname(doc, method):
     # Set company-based naming series
     if doc.reference_doctype and doc.reference_name:
         company = frappe.db.get_value(doc.reference_doctype, doc.reference_name, "company")
-        if company == "MADHAV UDYOG PRIVATE LIMITED":
+        company_key = " ".join((company or "").split()).upper()
+        is_stelco = company_key == "MADHAV STELCO PRIVATE LIMITED"
+        if company_key == "MADHAV UDYOG PRIVATE LIMITED":
             doc.naming_series = "MUBT.-"
-        elif company == "MADHAV STELCO PRIVATE LIMITED":
+        elif is_stelco:
             doc.naming_series = "MSBT.-"
 
         # Handle Stock Entry reference
@@ -25,7 +27,7 @@ def autoname(doc, method):
             if (
                 stock_entry.stock_entry_type
                 == "FG Free Length Transfer cum Cutting Entry"
-                and company == "MADHAV STELCO PRIVATE LIMITED"
+                and is_stelco
             ):
                 posting_date = getattr(stock_entry, "posting_date", None)
                 if posting_date:
@@ -52,7 +54,7 @@ def autoname(doc, method):
                     return
 
         # Fallback if not from cutting plan
-        doc.name = make_autoname(doc.naming_series)
+        doc.name = make_autoname(doc.naming_series or "BATCH-.#####")
         doc.batch_id = doc.name
 
     else:

@@ -17,6 +17,7 @@
   "source_warehouse",
   "reserved_qty",
   "reserved_pieces",
+  "is_tolerance",
   "length",
   "section_weight"
  ],
@@ -74,6 +75,13 @@
    "label": "Reserved Pieces"
   },
   {
+   "default": "0",
+   "fieldname": "is_tolerance",
+   "fieldtype": "Check",
+   "in_list_view": 1,
+   "label": "Is Tolerance"
+  },
+  {
    "fieldname": "length",
    "fieldtype": "Float",
    "in_list_view": 1,
@@ -104,7 +112,7 @@
  "index_web_pages_for_search": 1,
  "istable": 1,
  "links": [],
- "modified": "2026-08-07 17:58:28.738357",
+ "modified": "2026-09-10 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "Madhav",
  "name": "Staged Batch Reservations Verification",

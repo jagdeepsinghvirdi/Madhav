@@ -57,14 +57,28 @@ def create_piece_stock_ledger_entry(sle_doc, method):
 		# that delivery is cancelled, instead of correctly landing on 0 and
 		# reverting to 20. Seed a one-time anchor row equal to the batch's
 		# current pieces value before applying any delta.
-		_ensure_baseline_piece_sle(sle_doc.item_code, sle_doc.warehouse, batch_no, sle_doc.company)
+		_ensure_baseline_piece_sle(
+			sle_doc.item_code, sle_doc.warehouse, batch_no, sle_doc.company,
+			sle_doc.voucher_type, sle_doc.voucher_no,
+		)
 		_create_piece_sle_row(sle_doc, batch_no, batch_piece_qty)
 
 	for batch_no in batch_piece_map:
 		recalculate_batch_pieces(batch_no)
 
 
-def _ensure_baseline_piece_sle(item_code, warehouse, batch_no, company):
+def _batch_created_by_voucher(batch_no, voucher_type, voucher_no):
+	if not voucher_type or not voucher_no:
+		return False
+	ref = frappe.db.get_value(
+		"Batch", batch_no, ["reference_doctype", "reference_name"], as_dict=True
+	)
+	if not ref:
+		return False
+	return ref.reference_doctype == voucher_type and ref.reference_name == voucher_no
+
+
+def _ensure_baseline_piece_sle(item_code, warehouse, batch_no, company, voucher_type=None, voucher_no=None):
 	"""
 	recalculate_batch_pieces() resums from the Piece Stock Ledger alone.
 	Seed one anchor row equal to the batch's current pieces value before
@@ -75,6 +89,9 @@ def _ensure_baseline_piece_sle(item_code, warehouse, batch_no, company):
 	if not batch_no:
 		return
 	if frappe.db.exists("Piece Stock Ledger Entry", {"batch_no": batch_no, "docstatus": 1}):
+		return
+
+	if _batch_created_by_voucher(batch_no, voucher_type, voucher_no):
 		return
 
 	current_pieces = flt(frappe.db.get_value("Batch", batch_no, "pieces"))

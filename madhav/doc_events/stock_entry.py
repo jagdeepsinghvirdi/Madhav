@@ -240,10 +240,17 @@ def create_batch_group(doc):
     batch_group = frappe.new_doc("Batch Group")
     batch_group.reference_doctype = "Stock Entry"
     batch_group.reference_document_name = doc.name
-    batch_group.total_length_in_meter = doc.total_length_in_meter
-    weight_received_kg = doc.weight_received * 1000
-    batch_group.section_weight = round(weight_received_kg/doc.total_length_in_meter, 2)
-    batch_group.section_weight = round(batch_group.section_weight/39.37, 2)
+    total_length_in_meter = flt(doc.get("total_length_in_meter"))
+    weight_received_kg = flt(doc.get("weight_received")) * 1000
+
+    batch_group.total_length_in_meter = total_length_in_meter
+    # Weight and length are only captured for measured stock, so a receipt
+    # can legitimately arrive without either. Section weight is left unset
+    # in that case rather than blocking the receipt from submitting.
+    if weight_received_kg and total_length_in_meter:
+        batch_group.section_weight = round(
+            round(weight_received_kg / total_length_in_meter, 2) / 39.37, 2
+        )
 
     for batch in batch_list:
         batch_group.append("batch_details", {

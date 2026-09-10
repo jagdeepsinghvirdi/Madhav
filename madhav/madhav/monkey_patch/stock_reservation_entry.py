@@ -30,8 +30,7 @@ def _get_batch_constraints(voucher_type, voucher_detail_no, item_code=None,from_
     if length_size <= 0:
         return constraints
 
-    default_min = length_size
-    default_max = length_size + 1.5
+    default_min, default_max = _default_length_window(length_size)
 
     # Check if dialog passed a custom max_length for this item
     flag_ranges = getattr(frappe.flags, "stock_reservation_item_ranges", {}) or {}
@@ -40,18 +39,16 @@ def _get_batch_constraints(voucher_type, voucher_detail_no, item_code=None,from_
     raw_max = flag_data.get("max_length")
     raw_min = flag_data.get("min_length")
 
-    max_length = flt(raw_max) if raw_max not in (None, "", 0) else default_max
-    min_length = flt(raw_min) if raw_min not in (None, "", 0) else default_min
+    max_length = flt(raw_max) if raw_max not in (None, "") else default_max
+    min_length = flt(raw_min) if raw_min not in (None, "") else default_min
 
-    # Never compare or filter with None (Update Items / auto re-reserve paths).
-    min_length = flt(min_length) or default_min
-    max_length = flt(max_length) or default_max
-
-    if min_length > max_length:
-        min_length, max_length = max_length, min_length
-
-    constraints.update({"min_length": min_length, "max_length": max_length})
-    return constraints
+    # REMOVED: previously "min_length = flt(min_length) or default_min" -
+    # `or` treats 0 as falsy, so an explicit min_length of 0 was silently
+    # replaced with default_min. Only fall back when genuinely unset.
+    if min_length is None:
+        min_length = default_min
+    if max_length is None:
+        max_length = default_max
 
 
 def _default_length_window(length_size):

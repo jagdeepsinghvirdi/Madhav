@@ -10,6 +10,7 @@ frappe.ui.form.on("Batch Wise Reservation Tool", {
 			}
 			return { filters: filters };
 		});
+		madhav_load_tolerance_warehouse(frm);
 	},
 	refresh(frm) {
 		if (frm.doc.docstatus == 1) {
@@ -341,7 +342,7 @@ frappe.ui.form.on("Sales Order Pending Line Items", {
 });
 
 frappe.ui.form.on("Available Stock Batches", {
-	reserve(frm, cdt, cdn) {
+	async reserve(frm, cdt, cdn) {
 		let batch = locals[cdt][cdn];
 
 		if (!frm.doc.pending_line_items || !frm.doc.pending_line_items.length) {
@@ -366,6 +367,8 @@ frappe.ui.form.on("Available Stock Batches", {
 			return;
 		}
 
+		const tolerance_warehouse = await madhav_load_tolerance_warehouse(frm);
+
 		frappe.call({
 			method: "madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool.add_to_reservation_batches",
 			args: {
@@ -385,6 +388,10 @@ frappe.ui.form.on("Available Stock Batches", {
 				// from form header
 				warehouse: frm.doc.warehouse,
 				posting_date: frm.doc.posting_date,
+				is_tolerance:
+					tolerance_warehouse && frm.doc.warehouse === tolerance_warehouse
+						? 1
+						: 0,
 			},
 			freeze: true,
 			freeze_message: __("Adding batch to reservations..."),
@@ -400,3 +407,16 @@ frappe.ui.form.on("Available Stock Batches", {
 		});
 	}
 });
+
+function madhav_load_tolerance_warehouse(frm) {
+	if (frm.__tolerance_warehouse_promise) {
+		return frm.__tolerance_warehouse_promise;
+	}
+	frm.__tolerance_warehouse_promise = frappe
+		.call({
+			method:
+				"madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool.get_tolerance_warehouse_api",
+		})
+		.then((r) => r.message || null);
+	return frm.__tolerance_warehouse_promise;
+}
