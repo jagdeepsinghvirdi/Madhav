@@ -78,6 +78,46 @@ def on_submit(doc, method=None):
         # Removed the throw block here.
         # If invoice_qty <= batch_qty, we don't cancel SRE, so qty will naturally be < reserved_qty which is valid.
 
+    stamp_bundle_pieces_from_rows(doc)
+
+
+def stamp_bundle_pieces_from_rows(doc):
+    from madhav.madhav.utils.stock_piece_utils import distribute_integer_pieces
+
+    for row in doc.items:
+        if not row.serial_and_batch_bundle:
+            continue
+
+        row_pieces = cint(flt(row.get("pieces")))
+        if row_pieces <= 0:
+            continue
+
+        entries = frappe.get_all(
+            "Serial and Batch Entry",
+            filters={
+                "parent": row.serial_and_batch_bundle,
+                "parenttype": "Serial and Batch Bundle",
+            },
+            fields=["name", "batch_no", "qty", "pieces"],
+            order_by="idx asc",
+        )
+        entries = [e for e in entries if e.batch_no]
+        if not entries:
+            continue
+
+        if any(cint(flt(e.pieces)) > 0 for e in entries):
+            continue
+
+        allocation = distribute_integer_pieces(
+            row_pieces, [abs(flt(e.qty)) for e in entries]
+        )
+        for entry, pieces in zip(entries, allocation):
+            frappe.db.set_value(
+                "Serial and Batch Entry", entry.name, "pieces", pieces,
+                update_modified=False,
+            )
+
+
 from frappe.utils import flt, get_datetime, add_to_date, nowtime
 
 
@@ -234,7 +274,7 @@ def populate_missing_batch_bundle_from_si(self):
         ):
             continue
 
-        if si_item.get("warehouse") and not item.warehouse:
+        if si_item.get("warehouse"):
             item.warehouse = si_item.warehouse
 
         if si_item.get("length") and hasattr(item, "length") and not flt(item.get("length")):
@@ -1562,12 +1602,18 @@ def reverse_sre_delivery_for_dn(doc):
 				sales_order=sales_order,
 				qty=0,
 				dn_items=[],
+				sre_names=set(),
 			),
 		)
 		dn_qty_by_detail[item.so_detail].qty += flt(item.stock_qty)
 		dn_qty_by_detail[item.so_detail].dn_items.append(item)
+		dn_qty_by_detail[item.so_detail].sre_names.update(
+			_sres_used_by_dn_row(item, sales_order)
+		)
 
 	for so_detail, info in dn_qty_by_detail.items():
+		if not info.sre_names:
+			continue
 		other_delivered = _delivered_qty_excluding_dn(so_detail, doc.name)
 		sre_names = frappe.get_all(
 			"Stock Reservation Entry",
@@ -1577,6 +1623,7 @@ def reverse_sre_delivery_for_dn(doc):
 				"voucher_no": info.sales_order,
 				"voucher_detail_no": so_detail,
 				"status": ["in", ["Partially Delivered", "Delivered"]],
+				"name": ["in", sorted(info.sre_names)],
 			},
 			pluck="name",
 			order_by="creation desc",
@@ -1585,19 +1632,24 @@ def reverse_sre_delivery_for_dn(doc):
 			continue
 
 		sres = [frappe.get_doc("Stock Reservation Entry", n) for n in sre_names]
-		current_delivered = sum(flt(s.delivered_qty) for s in sres)
-		excess = current_delivered - other_delivered
-		if excess <= 0:
-			continue
-
-		qty_to_undeliver = min(excess, flt(info.qty))
-		if qty_to_undeliver <= 0:
-			continue
 
 		batch_qty = {}
 		for item in info.dn_items:
 			for batch_no, qty in _dn_item_batch_qty_map(item).items():
 				batch_qty[batch_no] = batch_qty.get(batch_no, 0) + qty
+
+		if batch_qty:
+			qty_to_undeliver = min(
+				flt(info.qty), _reversible_delivered_qty(sres, batch_qty)
+			)
+		else:
+			current_delivered = sum(flt(s.delivered_qty) for s in sres)
+			qty_to_undeliver = min(
+				max(current_delivered - other_delivered, 0), flt(info.qty)
+			)
+
+		if qty_to_undeliver <= 0:
+			continue
 
 		for sre in sres:
 			if qty_to_undeliver <= 0:
@@ -1618,6 +1670,8 @@ def reverse_sre_delivery_for_dn(doc):
 def _dn_item_batch_qty_map(item):
 	batch_qty = {}
 	if not item.serial_and_batch_bundle:
+		if item.batch_no:
+			batch_qty[item.batch_no] = abs(flt(item.stock_qty))
 		return batch_qty
 	try:
 		sbb = frappe.get_doc("Serial and Batch Bundle", item.serial_and_batch_bundle)
@@ -1627,6 +1681,25 @@ def _dn_item_batch_qty_map(item):
 		if entry.batch_no:
 			batch_qty[entry.batch_no] = batch_qty.get(entry.batch_no, 0) + abs(flt(entry.qty))
 	return batch_qty
+
+
+def _reversible_delivered_qty(sres, batch_qty):
+	remaining_cap = dict(batch_qty)
+	reversible = 0.0
+	for sre in sres:
+		if sre.reservation_based_on != "Serial and Batch":
+			reversible += flt(sre.delivered_qty)
+			continue
+		for entry in sre.get("sb_entries") or []:
+			cap = remaining_cap.get(entry.batch_no, 0)
+			if cap <= 0:
+				continue
+			take = min(flt(entry.delivered_qty), cap)
+			if take <= 0:
+				continue
+			reversible += take
+			remaining_cap[entry.batch_no] = cap - take
+	return reversible
 
 
 def _undeliver_sre_qty(sre, qty, batch_qty=None):
@@ -1658,7 +1731,7 @@ def _undeliver_sre_qty(sre, qty, batch_qty=None):
 
 	if batch_qty:
 		_undo_from_entries(prefer_batches=True)
-	if remaining > 0:
+	else:
 		_undo_from_entries(prefer_batches=False)
 
 	return qty - remaining
@@ -1695,10 +1768,6 @@ def _distribute_delivered_across_snapshots(snapshots, exclude_dn):
 	for so_detail, group in by_detail.items():
 		if not so_detail:
 			continue
-		other_dn_delivered = _delivered_qty_excluding_dn(so_detail, exclude_dn)
-		own_total = sum(flt(s.get("delivered_qty")) for s in group)
-		extra = max(other_dn_delivered - own_total, 0)
-
 		for snap in group:
 			own = flt(snap.get("delivered_qty"))
 			reserved = flt(snap.get("reserved_qty"))
@@ -1708,30 +1777,6 @@ def _distribute_delivered_across_snapshots(snapshots, exclude_dn):
 					flt(entry.get("delivered_qty")),
 					flt(entry.get("qty")),
 				)
-
-		if extra <= 0:
-			continue
-
-		for snap in group:
-			if extra <= 0:
-				break
-			reserved = flt(snap.get("reserved_qty"))
-			room = max(reserved - flt(snap.get("delivered_qty")), 0)
-			if room <= 0:
-				continue
-			add = min(room, extra)
-			snap["delivered_qty"] = flt(snap.get("delivered_qty")) + add
-			extra -= add
-			remaining_add = add
-			for entry in snap.get("sb_entries") or []:
-				if remaining_add <= 0:
-					break
-				entry_room = max(flt(entry.get("qty")) - flt(entry.get("delivered_qty")), 0)
-				if entry_room <= 0:
-					continue
-				entry_add = min(entry_room, remaining_add)
-				entry["delivered_qty"] = flt(entry.get("delivered_qty")) + entry_add
-				remaining_add -= entry_add
 
 	return prepared
 
