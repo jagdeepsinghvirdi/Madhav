@@ -10,7 +10,7 @@ from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry impor
 )
 
 
-def resolve_sre_sb_dimensions(pieces=None, length=None, section_weight=None, batch_vals=None):
+def resolve_sre_sb_dimensions(qty=0, pieces=None, length=None, section_weight=None, batch_vals=None):
 	"""Pick Pcs/Length/section_weight for SRE sb_entries from transfer row, else Batch.
 
 	Transfer tonne qty is reserved separately — never derive reserved_qty from
@@ -21,12 +21,17 @@ def resolve_sre_sb_dimensions(pieces=None, length=None, section_weight=None, bat
 	entry_length = flt(length)
 	entry_section_weight = flt(section_weight)
 
-	if not entry_pieces:
-		entry_pieces = flt(batch_vals.get("pieces") or 0)
 	if not entry_length:
 		entry_length = flt(batch_vals.get("average_length") or batch_vals.get("length") or 0)
 	if not entry_section_weight:
 		entry_section_weight = flt(batch_vals.get("section_weight") or 0)
+	# The SRE must carry the pieces for this transferred quantity, never
+	# the complete Batch.pieces value.
+	if flt(qty) > 0 and entry_length and entry_section_weight:
+		from madhav.madhav.utils.stock_piece_utils import int_pieces_from_qty
+		entry_pieces = int_pieces_from_qty(qty, entry_length, entry_section_weight)
+	elif not entry_pieces:
+		entry_pieces = 0
 
 	return entry_pieces, entry_length, entry_section_weight
 
@@ -45,6 +50,41 @@ def _cancel_psles_for_voucher(voucher_no):
 		psle.flags.ignore_permissions = True
 		psle.flags.ignore_links = True
 		psle.cancel()
+
+
+def get_live_batch_qty(item_code, warehouse, batch_no):
+	"""Physical batch quantity in one warehouse; never read Batch.batch_qty."""
+	if not item_code or not warehouse or not batch_no:
+		return 0
+	return flt(frappe.db.sql(
+		"""
+		SELECT COALESCE(SUM(sle.actual_qty), 0)
+		FROM `tabStock Ledger Entry` sle
+		INNER JOIN `tabSerial and Batch Entry` sbe
+			ON sbe.parent = sle.serial_and_batch_bundle
+		WHERE sle.item_code = %s AND sle.warehouse = %s
+		  AND sbe.batch_no = %s AND sle.is_cancelled = 0
+		""",
+		(item_code, warehouse, batch_no),
+	)[0][0])
+
+
+def get_live_batch_pieces(item_code, warehouse, batch_no):
+	"""Physical pieces in one warehouse, when piece ledger history exists."""
+	if not item_code or not warehouse or not batch_no:
+		return None
+	rows = frappe.db.sql(
+		"""
+		SELECT COUNT(psle.name), COALESCE(SUM(psle.actual_qty), 0)
+		FROM `tabPiece Stock Ledger Entry` psle
+		INNER JOIN `tabSerial and Batch Entry` sbe
+			ON sbe.parent = psle.serial_and_batch_bundle
+		WHERE psle.item_code = %s AND psle.warehouse = %s
+		  AND sbe.batch_no = %s AND psle.is_cancelled = 0
+		""",
+		(item_code, warehouse, batch_no),
+	)
+	return flt(rows[0][1]) if rows and rows[0][0] else None
 
 
 class StockTransfer(Document):
@@ -405,19 +445,13 @@ class StockTransfer(Document):
             if not item.batch:
                 continue
 
-            batch_values = frappe.db.get_value(
-                "Batch", item.batch, ["pieces", "batch_qty"], as_dict=True
-            )
-
-            if not batch_values:
-                continue
-
-            batch_pieces = flt(batch_values.pieces)
-            batch_qty = flt(batch_values.batch_qty)
+            warehouse = item.source_warehouse or self.source_warehouse
+            batch_qty = get_live_batch_qty(item.item_code, warehouse, item.batch)
+            batch_pieces = get_live_batch_pieces(item.item_code, warehouse, item.batch)
             item_pieces = flt(item.pieces)
             item_qty = flt(item.qty)
 
-            if item_pieces > batch_pieces:
+            if batch_pieces is not None and item_pieces > batch_pieces:
                 frappe.throw(
                     f"Row #{item.idx}: Pieces {item_pieces} cannot exceed Batch Pieces {batch_pieces} for Batch {item.batch}."
                 )
@@ -541,29 +575,21 @@ class StockTransfer(Document):
         item = so_items[0]
         so_detail = item.name
 
-        over_reservation_allowance = flt(
-            frappe.db.get_single_value("Stock Settings", "over_reservation_allowance") or 0
+        from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
+            get_base_reserved_qty,
         )
-
-        already_reserved_qty = (
-            frappe.db.sql(
-                """
-                SELECT COALESCE(SUM(reserved_qty), 0)
-                FROM `tabStock Reservation Entry`
-                WHERE
-                    voucher_type = 'Sales Order'
-                    AND voucher_no = %s
-                    AND voucher_detail_no = %s
-                    AND docstatus = 1
-                    AND item_code = %s
-                """,
-                (sales_order, so_detail, item_code),
-            )[0][0]
-            or 0
+        so_values = frappe.db.get_value(
+            "Sales Order Item", so_detail,
+            ["stock_qty", "qty", "conversion_factor", "delivered_qty"], as_dict=True,
+        ) or frappe._dict()
+        conversion_factor = flt(so_values.conversion_factor) or 1
+        pending_stock_qty = (
+            (flt(so_values.stock_qty) or flt(so_values.qty) * conversion_factor)
+            - flt(so_values.delivered_qty) * conversion_factor
         )
-
-        allowed_qty = flt(so_qty) * (1 + over_reservation_allowance / 100)
-        available_qty_to_reserve = max(0, flt(allowed_qty) - flt(already_reserved_qty))
+        available_qty_to_reserve = max(
+            0, pending_stock_qty - get_base_reserved_qty(so_detail)
+        )
 
         if available_qty_to_reserve <= 0:
             return
@@ -626,6 +652,7 @@ class StockTransfer(Document):
             ) or frappe._dict()
 
             entry_pieces, entry_length, entry_section_weight = resolve_sre_sb_dimensions(
+                qty=reserve_qty,
                 pieces=pieces,
                 length=length,
                 section_weight=section_weight,
