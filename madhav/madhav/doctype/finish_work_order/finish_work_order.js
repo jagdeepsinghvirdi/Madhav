@@ -162,6 +162,7 @@ frappe.ui.form.on("Finish Work Order", {
 
                     frm.refresh_field("pending_work_orders");
                     frm.dirty();
+                    fetch_raw_materials_from_bom(frm);  
 
                     frappe.msgprint(
                         __("Fetched {0} Work Orders", [r.message.length])
@@ -171,6 +172,31 @@ frappe.ui.form.on("Finish Work Order", {
         });
     }
 });
+
+function fetch_raw_materials_from_bom(frm) {
+    let items = (frm.doc.pending_work_orders || [])
+        .filter(row => row.item && row.ready_qty)
+        .map(row => ({ item_code: row.item, qty: row.ready_qty }));
+
+    if (!items.length) return;
+
+    frappe.call({
+        method: "madhav.madhav.doctype.finish_work_order.finish_work_order.get_bom_raw_materials_for_items",
+        args: { items: items },
+        callback(r) {
+            if (!r.exc && r.message) {
+                frm.clear_table("raw_materials");
+                r.message.forEach(rm => {
+                    let row = frm.add_child("raw_materials");
+                    row.item_code = rm.item_code;
+                    row.qty = rm.qty;
+                });
+                frm.refresh_field("raw_materials");
+                frm.dirty();
+            }
+        }
+    });
+}
 
 frappe.ui.form.on('Raw Material Items', {
     item_code: function(frm, cdt, cdn) {
