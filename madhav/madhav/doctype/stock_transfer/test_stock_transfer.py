@@ -143,14 +143,14 @@ class TestStockTransferReservationDimensions(FrappeTestCase):
 		self.assertEqual(length, 9.5)
 		self.assertAlmostEqual(sw, 15.037594, places=5)
 
-	def test_resolve_falls_back_to_batch_when_transfer_blank(self):
+	def test_resolve_does_not_copy_all_batch_pieces_when_transfer_blank(self):
 		pieces, length, sw = resolve_sre_sb_dimensions(
 			pieces=0,
 			length=0,
 			section_weight=0,
 			batch_vals={"pieces": 20, "average_length": 9.5, "section_weight": 11.85},
 		)
-		self.assertEqual(pieces, 20)
+		self.assertEqual(pieces, 0)
 		self.assertEqual(length, 9.5)
 		self.assertAlmostEqual(sw, 11.85, places=5)
 
