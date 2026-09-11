@@ -23,7 +23,7 @@ def after_submit(self, method=None):
 
 		if row.get("delivery_note_ref"):
 			dn_batches.add(row.batch_no)
-			_restore_batch_length_if_wiped(row.batch_no, row)
+			_restore_batch_dimensions_if_wiped(row.batch_no, row)
 			continue
 
 		updates = {}
@@ -48,15 +48,26 @@ def after_submit(self, method=None):
 
 
 def _restore_batch_length_if_wiped(batch_no, sr_row=None):
+	return _restore_batch_dimensions_if_wiped(batch_no, sr_row)
+
+
+def _restore_batch_dimensions_if_wiped(batch_no, sr_row=None):
 	"""If Batch.average_length was zeroed, restore from SR/bundle/Batch history."""
-	if flt(frappe.db.get_value("Batch", batch_no, "average_length")):
+	batch = frappe.db.get_value(
+		"Batch", batch_no, ["average_length", "section_weight"], as_dict=True
+	) or frappe._dict()
+	need_length = not flt(batch.average_length)
+	need_weight = not flt(batch.section_weight)
+	if not need_length and not need_weight:
 		return
 
 	length = 0
+	section_weight = 0
 	if sr_row:
 		length = flt(getattr(sr_row, "length", 0)) or flt(
 			getattr(sr_row, "average_length", 0)
 		)
+		section_weight = flt(getattr(sr_row, "section_weight", 0))
 
 	if not length:
 		row = frappe.db.sql(
@@ -80,7 +91,21 @@ def _restore_batch_length_if_wiped(batch_no, sr_row=None):
 		)
 		length = flt(row[0][0]) if row else 0
 
-	if length:
-		frappe.db.set_value(
-			"Batch", batch_no, "average_length", length, update_modified=False
+	if not section_weight:
+		row = frappe.db.sql(
+			"""
+			SELECT section_weight FROM `tabSerial and Batch Entry`
+			WHERE batch_no = %s AND IFNULL(section_weight, 0) > 0
+			ORDER BY modified DESC LIMIT 1
+			""",
+			batch_no,
 		)
+		section_weight = flt(row[0][0]) if row else 0
+
+	updates = {}
+	if need_length and length:
+		updates["average_length"] = length
+	if need_weight and section_weight:
+		updates["section_weight"] = section_weight
+	if updates:
+		frappe.db.set_value("Batch", batch_no, updates, update_modified=False)

@@ -568,7 +568,14 @@ class FinishWorkOrder(Document):
                     title=f"Stock Entry Failed for WO {pwo.work_order}",
                     message=frappe.get_traceback()
                 )
-                # frappe.throw(str(e))
+                # A submitted FWO without its corresponding manufacture
+                # stock/SRE leaves the SO reservation state unknowable.
+                # Do not log and continue with a partially completed FWO.
+                frappe.throw(
+                    frappe._("Could not create finished stock for Work Order {0}: {1}").format(
+                        pwo.work_order, str(e)
+                    )
+                )
 
             # ==============================
             # UPDATE WORK ORDER PCS

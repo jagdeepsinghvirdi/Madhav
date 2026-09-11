@@ -61,6 +61,32 @@ def get_already_reserved_pieces(sales_order_item):
 	return total_pieces
 
 
+def get_remaining_unreserved_stock_qty(sales_order_item):
+	"""SO demand left after delivery and active *base* reservations.
+
+	Production Plan used ERPNext's work-order pending quantity and then
+	subtracted SREs.  An FWO/Stock Transfer reservation represents output of
+	that same work order, so that double-subtracted it.  BWRT, FWO and Stock
+	Transfer all converge on the active SRE quantity here.
+	"""
+	from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
+		get_base_reserved_qty,
+	)
+
+	so_item = frappe.db.get_value(
+		"Sales Order Item", sales_order_item,
+		["stock_qty", "qty", "conversion_factor", "delivered_qty"], as_dict=True,
+	)
+	if not so_item:
+		return 0
+	conversion_factor = flt(so_item.conversion_factor) or 1
+	pending_stock_qty = (
+		(flt(so_item.stock_qty) or flt(so_item.qty) * conversion_factor)
+		- flt(so_item.delivered_qty) * conversion_factor
+	)
+	return max(0, pending_stock_qty - get_base_reserved_qty(sales_order_item))
+
+
 class CustomProductionPlan(ERPNextProductionPlan):
 
 	def validate(self):
@@ -274,8 +300,13 @@ class CustomProductionPlan(ERPNextProductionPlan):
 						row.length = meters_to_inches(so_item_row.length_size)
 						row.length_size_m = so_item_row.length_size or 0.0
 
-					already_reserved_qty = get_already_reserved_qty(row.sales_order_item)
-					row.planned_qty = max(0, flt(row.planned_qty or 0) - already_reserved_qty)
+					# Do not start from core's work_order-adjusted planned qty and
+					# subtract the SRE again: FWO/Stock Transfer reservations are
+					# generated from those work orders.  Active base reservations
+					# are the shared source of truth for BWRT and production output.
+					row.planned_qty = get_remaining_unreserved_stock_qty(
+						row.sales_order_item
+					)
 
 			if row.sales_order:
 				so_details = frappe.db.get_value(
