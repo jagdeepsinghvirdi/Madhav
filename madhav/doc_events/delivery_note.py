@@ -25,6 +25,8 @@ def on_submit(doc, method=None):
     }
 
     if not keys:
+        stamp_bundle_pieces_from_rows(doc)
+        sync_batch_master_qty_from_delivery(doc)
         return
 
     item_codes = list({k[0] for k in keys})
@@ -79,6 +81,7 @@ def on_submit(doc, method=None):
         # If invoice_qty <= batch_qty, we don't cancel SRE, so qty will naturally be < reserved_qty which is valid.
 
     stamp_bundle_pieces_from_rows(doc)
+    sync_batch_master_qty_from_delivery(doc)
 
 
 def stamp_bundle_pieces_from_rows(doc):
@@ -1006,6 +1009,55 @@ def get_batch_qty_from_sle(item_code, warehouse, batch_no):
     return flt(result[0].qty) if result and result[0].qty else 0
 
 
+def _has_live_batch_ledger(item_code, warehouse, batch_no):
+    """Whether a batch/warehouse lookup is resolvable in the stock ledger.
+
+    Zero is a valid, conclusive stock value.  It must not be replaced with a
+    stale bundle or reservation snapshot; only a genuinely unresolved lookup
+    may use that compatibility fallback.
+    """
+    return bool(frappe.db.sql(
+        """
+        SELECT 1
+        FROM `tabStock Ledger Entry` sle
+        INNER JOIN `tabSerial and Batch Entry` sbe
+            ON sbe.parent = sle.serial_and_batch_bundle
+        WHERE sle.item_code = %s AND sle.warehouse = %s AND sbe.batch_no = %s
+        LIMIT 1
+        """,
+        (item_code, warehouse, batch_no),
+    ))
+
+
+def sync_batch_master_qty_from_delivery(doc):
+    """Mirror live ledger quantity to Batch.batch_qty for batches this DN moved.
+
+    This is display/master synchronization only.  Reservation and allocation
+    logic deliberately reads the live warehouse ledger instead of this field.
+    Calling it after both submit and cancel makes each DN independent and
+    naturally idempotent.
+    """
+    if not frappe.db.has_column("Batch", "batch_qty"):
+        return
+
+    batches = set()
+    for row in doc.items:
+        batches.update(_dn_row_batch_nos(row))
+
+    for batch_no in batches:
+        qty = frappe.db.sql(
+            """
+            SELECT COALESCE(SUM(sle.actual_qty), 0)
+            FROM `tabStock Ledger Entry` sle
+            INNER JOIN `tabSerial and Batch Entry` sbe
+                ON sbe.parent = sle.serial_and_batch_bundle
+            WHERE sbe.batch_no = %s AND sle.is_cancelled = 0
+            """,
+            batch_no,
+        )[0][0]
+        frappe.db.set_value("Batch", batch_no, "batch_qty", flt(qty), update_modified=False)
+
+
 def get_available_qty_for_item(row):
     """"Available" must always be live physical stock when it can be
     resolved, never averaged/maxed against a bundle's reservation-time
@@ -1039,7 +1091,7 @@ def get_available_qty_for_item(row):
         live_total = sum(
             get_batch_qty_from_sle(row.item_code, warehouse, b) for b in batch_nos
         )
-        if live_total:
+        if any(_has_live_batch_ledger(row.item_code, warehouse, b) for b in batch_nos):
             return live_total
 
     if row.serial_and_batch_bundle:
@@ -1104,7 +1156,16 @@ def _expand_entries_within_live_stock(item, batch_entries, originals, target_qty
             if warehouse and entry.batch_no
             else 0
         )
-        caps.append(max(flt(live), originals[i]))
+        # A resolved live ledger quantity (including zero) is authoritative.
+        # Preserve the existing bundle only when this legacy batch lookup is
+        # genuinely unresolved; treating zero as its old allocation allowed a
+        # second DN to over-allocate an empty batch.
+        if warehouse and entry.batch_no and _has_live_batch_ledger(
+            item.item_code, warehouse, entry.batch_no
+        ):
+            caps.append(max(0, flt(live)))
+        else:
+            caps.append(originals[i])
 
     total_original = sum(originals)
     desired = [
@@ -1177,6 +1238,20 @@ def update_bundle_to_invoice_qty(item, invoice_qty, qty, deliver_as_qty):
     )
 
     item_pieces = cint(flt(getattr(item, "pieces", 0)))
+    original_bundle_pieces = sum(
+        cint(flt(getattr(entry, "pieces", 0))) for entry in batch_entries
+    )
+    # A mapped SI/DN row commonly carries the pieces for the complete
+    # selected batch.  Scale that physical count when Deliver as Qty shrinks
+    # the bundle; otherwise a 20-PC partial delivery posts all 30 PCs.
+    if (
+        item_pieces > 0
+        and original_bundle_pieces > 0
+        and abs(target_qty - total_original_qty) > 0.0001
+    ):
+        item_pieces = int(round(
+            original_bundle_pieces * target_qty / total_original_qty
+        ))
     n_entries = len(batch_entries)
 
     if item_pieces > 0 and target_qty > 0:
@@ -1267,6 +1342,25 @@ def _batch_info_unresolved(row):
     return bool(frappe.get_cached_value("Item", row.item_code, "has_batch_no"))
 
 
+def _apply_direct_batch_delivery_dimensions(row):
+    """Set fixed batch dimensions and partial pieces on a no-bundle row."""
+    if not row.batch_no:
+        return
+    batch = frappe.db.get_value(
+        "Batch", row.batch_no, ["average_length", "section_weight"], as_dict=True
+    ) or frappe._dict()
+    length = flt(batch.average_length) or flt(row.get("length_size")) or flt(row.get("average_length"))
+    section_weight = flt(batch.section_weight) or flt(row.get("section_weight"))
+    if length and hasattr(row, "length_size"):
+        row.length_size = length
+    if length and hasattr(row, "average_length"):
+        row.average_length = length
+    if section_weight and hasattr(row, "section_weight"):
+        row.section_weight = section_weight
+    if length and section_weight and hasattr(row, "pieces"):
+        row.pieces = int_pieces_from_qty(row.qty, length, section_weight)
+
+
 from frappe.utils import get_datetime, add_to_date, nowtime
 
 
@@ -1307,6 +1401,7 @@ def before_submit(self, method):
             i.stock_qty = flt(i.invoice_qty) * flt(i.conversion_factor or 1)
             if hasattr(i, "use_serial_batch_fields"):
                 i.use_serial_batch_fields = 1
+            _apply_direct_batch_delivery_dimensions(i)
 
     cancel_stock_reservations_from_so(self)
     create_stock_reconciliation(self)
@@ -1363,6 +1458,15 @@ def _sres_used_by_dn_row(row, sales_order, docstatus=1):
     ship. A qty-based reservation carries no batch to match on, so the
     Sales Order line stays the finest link available for those.
     """
+    # Custom mapper writes this exact source SRE.  Prefer it over a batch
+    # overlap: multiple DNs can legitimately ship the same batch from
+    # different reservations, and an overlap is not ownership.
+    explicit_sre = row.get("custom_sre") if hasattr(row, "get") else None
+    if explicit_sre and frappe.db.exists(
+        "Stock Reservation Entry", {"name": explicit_sre, "docstatus": docstatus}
+    ):
+        return [explicit_sre]
+
     sre_rows = frappe.get_all(
         "Stock Reservation Entry",
         filters={
@@ -1574,6 +1678,7 @@ def on_cancel(doc, method=None):
 	reverse_sre_delivery_for_dn(doc)
 	restore_stock_reservations_after_cancel(doc)
 	update_sales_order_quantities_on_cancel(doc)
+	sync_batch_master_qty_from_delivery(doc)
 
 
 def release_stock_used_by_delivery_note(doc):
@@ -2378,9 +2483,7 @@ def create_stock_reconciliation(self):
         if not sr_item.batch_no:
             continue
         batch_update = {}
-        if frappe.db.has_column("Batch", "batch_qty"):
-            batch_update["batch_qty"] = flt(sr_item.qty)
-            piece_tracked = frappe.db.get_value(
+        piece_tracked = frappe.db.get_value(
             "Item", sr_item.item_code, "required_stock_in_pieces"
         )
         if (
@@ -2418,6 +2521,7 @@ def create_stock_reconciliation(self):
 
         dn_row.qty = flt(dn_row.invoice_qty)
         dn_row.stock_qty = flt(dn_row.invoice_qty) * flt(dn_row.conversion_factor or 1)
+        _apply_direct_batch_delivery_dimensions(dn_row)
 
     for row in self.items:
         row.amount = 0
