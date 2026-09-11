@@ -827,7 +827,9 @@ def get_sre_reserved_qty_for_items_and_warehouses(
             sre.item_code,
             sre.warehouse,
             srei.batch_no,
-            Sum(sre.reserved_qty - sre.delivered_qty).as_("reserved_qty"),
+			# The header contains all batches on the SRE.  Using it here for
+			# every child batch over-reserves multi-batch rows.
+            Sum(srei.qty - srei.delivered_qty).as_("reserved_qty"),
         )
         .where(
             (sre.docstatus == 1)
@@ -839,6 +841,9 @@ def get_sre_reserved_qty_for_items_and_warehouses(
 
     if warehouse_list:
         query = query.where(sre.warehouse.isin(warehouse_list))
+
+    if batch_list:
+        query = query.where(srei.batch_no.isin(batch_list))
 
     data = query.run(as_dict=True)
 
