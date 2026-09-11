@@ -87,8 +87,7 @@
    "fieldtype": "Link",
    "in_list_view": 1,
    "label": "Batch No",
-   "options": "Batch",
-   "reqd": 1
+   "options": "Batch"
   },
   {
    "fieldname": "column_break_izxi",

@@ -479,7 +479,9 @@ def add_to_reservation_batches(
 		already_staged_qty=already_staged_qty, already_staged_tolerance_qty=already_staged_tolerance_qty,
 	)
 
-	if flt(reserved_qty) > limits.allowed_qty:
+	reserved_qty = flt(reserved_qty, 3)
+
+	if reserved_qty > limits.allowed_qty:
 		frappe.throw(
 			frappe._(
 				"Cannot reserve {0} from Batch {1} for Sales Order Item {2}: only {3} qty is "
@@ -501,7 +503,7 @@ def add_to_reservation_batches(
 		"item_name": item_name,
 		"batch_no": batch_no,
 		"source_warehouse": target_warehouse,
-		"reserved_qty": flt(reserved_qty),
+		"reserved_qty": flt(reserved_qty, 3),
 		"reserved_pieces": final_pieces,
 		"length": flt(length),
 		"section_weight": flt(section_weight),
