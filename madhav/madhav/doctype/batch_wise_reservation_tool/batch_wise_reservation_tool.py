@@ -107,7 +107,7 @@ def get_batch_available_qty(item_code, warehouse, batch_no, exclude_sre=None):
 	reserved_qty = flt(
 		frappe.db.sql(
 			"""
-			select sum(sbe.qty)
+			select sum(sbe.qty - ifnull(sbe.delivered_qty, 0))
 			from `tabStock Reservation Entry` sre
 			inner join `tabSerial and Batch Entry` sbe on sbe.parent = sre.name
 			where sre.docstatus=1
@@ -125,13 +125,22 @@ def get_batch_available_qty(item_code, warehouse, batch_no, exclude_sre=None):
 
 
 def calc_proportional_pieces(reserve_qty, batch_no):
-	"""Pieces derived from the FINAL reserved qty, not copied verbatim
-	from Batch.pieces (Phase 6)."""
-	batch = frappe.db.get_value("Batch", batch_no, ["pieces", "batch_qty"], as_dict=True)
-	if not batch or not flt(batch.batch_qty):
+	"""Whole pieces for the quantity actually reserved.
+
+	``Batch.pieces`` and ``Batch.batch_qty`` are mutable master values and
+	cannot be used as a ratio for a partial reservation.  The reservation
+	row must instead use the physical batch dimensions.
+	"""
+	from madhav.madhav.utils.stock_piece_utils import int_pieces_from_qty
+
+	batch = frappe.db.get_value(
+		"Batch", batch_no, ["average_length", "section_weight"], as_dict=True
+	)
+	if not batch:
 		return 0
-	ratio = flt(batch.pieces) / flt(batch.batch_qty)
-	return int(round(flt(reserve_qty) * ratio))
+	return int_pieces_from_qty(
+		reserve_qty, batch.average_length, batch.section_weight
+	)
 
 
 def get_reservation_ceiling(
@@ -548,7 +557,7 @@ def fetch_available_batches(item_code, warehouse, pending_qty=0, reserve_qty=0):
 	# reduce a batch's apparent availability in THIS warehouse.
 	reserved_qty_map = frappe.db.sql(
 		"""
-		SELECT sbe.batch_no, SUM(sbe.qty) AS reserved_qty
+		SELECT sbe.batch_no, SUM(sbe.qty - IFNULL(sbe.delivered_qty, 0)) AS reserved_qty
 		FROM `tabStock Reservation Entry` sre
 		INNER JOIN `tabSerial and Batch Entry` sbe ON sbe.parent = sre.name
 		WHERE sre.docstatus=1
