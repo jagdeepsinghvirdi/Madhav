@@ -641,21 +641,44 @@ def _has_deliver_as_qty_over_delivery(doc):
 def get_batch_available_pieces(item_code, warehouse, batch_no):
     """
     Current available pieces for a batch, derived from Piece Stock Ledger
-    Entry. batch_no on the PSLE itself isn't reliably populated, so we join
-    through the Serial and Batch Bundle's entries (which do carry batch_no).
+    Entry.
+
+    Piece SLEs are written one row per batch and do carry batch_no, so the
+    batch is matched on the row itself. Matching instead through the
+    bundle's entries pulled in the SIBLING batches' piece rows as well
+    (every row of a multi-batch bundle joins to every batch in it), which
+    over-reported a batch's pieces and let piece allocation hand out
+    pieces another batch was holding. Legacy rows written before PSLE
+    carried batch_no are still matched through a single-batch bundle, the
+    same way recalculate_batch_pieces() does it.
     """
     result = frappe.db.sql(
         """
         SELECT SUM(psle.actual_qty) as total_pieces
         FROM `tabPiece Stock Ledger Entry` psle
-        INNER JOIN `tabSerial and Batch Entry` sbe
-            ON sbe.parent = psle.serial_and_batch_bundle
-        WHERE psle.item_code = %s
-          AND psle.warehouse = %s
-          AND sbe.batch_no = %s
+        WHERE psle.item_code = %(item_code)s
+          AND psle.warehouse = %(warehouse)s
           AND psle.is_cancelled = 0
+          AND (
+            psle.batch_no = %(batch_no)s
+            OR (
+                IFNULL(psle.batch_no, '') = ''
+                AND psle.serial_and_batch_bundle IS NOT NULL
+                AND EXISTS (
+                    SELECT 1 FROM `tabSerial and Batch Entry` sbe
+                    WHERE sbe.parent = psle.serial_and_batch_bundle
+                      AND sbe.batch_no = %(batch_no)s
+                )
+                AND (
+                    SELECT COUNT(DISTINCT sbe2.batch_no)
+                    FROM `tabSerial and Batch Entry` sbe2
+                    WHERE sbe2.parent = psle.serial_and_batch_bundle
+                      AND IFNULL(sbe2.batch_no, '') != ''
+                ) = 1
+            )
+          )
         """,
-        (item_code, warehouse, batch_no),
+        {"item_code": item_code, "warehouse": warehouse, "batch_no": batch_no},
         as_dict=True,
     )
     return flt(result[0].total_pieces) if result and result[0].total_pieces else 0
@@ -991,10 +1014,20 @@ def change_qty_serial_and_batch(self):
 def get_batch_qty_from_sle(item_code, warehouse, batch_no):
     """Real physical stock for a batch, from Stock Ledger Entry via the
     Serial and Batch Entry join (batch_no is not reliably populated
-    directly on the SLE itself)."""
+    directly on the SLE itself).
+
+    The quantity has to come from the matched Serial and Batch Entry, not
+    from sle.actual_qty: one SLE covers the WHOLE bundle, so on a
+    multi-batch bundle (a Purchase Receipt of several batches, a merged
+    delivery) charging every batch the bundle total reports each batch as
+    holding the other batches' stock too. That over-reported availability
+    is what let a Delivery Note post more than a batch physically held
+    and drive it negative. Direction still comes from the SLE, so bundles
+    whose entries were stored unsigned stay correct.
+    """
     result = frappe.db.sql(
         """
-        SELECT SUM(sle.actual_qty) as qty
+        SELECT SUM(SIGN(sle.actual_qty) * ABS(sbe.qty)) as qty
         FROM `tabStock Ledger Entry` sle
         INNER JOIN `tabSerial and Batch Entry` sbe
             ON sbe.parent = sle.serial_and_batch_bundle
@@ -1045,9 +1078,11 @@ def sync_batch_master_qty_from_delivery(doc):
         batches.update(_dn_row_batch_nos(row))
 
     for batch_no in batches:
+        # Per-batch qty from the matched entry, not the bundle-wide
+        # sle.actual_qty — see get_batch_qty_from_sle().
         qty = frappe.db.sql(
             """
-            SELECT COALESCE(SUM(sle.actual_qty), 0)
+            SELECT COALESCE(SUM(SIGN(sle.actual_qty) * ABS(sbe.qty)), 0)
             FROM `tabStock Ledger Entry` sle
             INNER JOIN `tabSerial and Batch Entry` sbe
                 ON sbe.parent = sle.serial_and_batch_bundle
@@ -2263,6 +2298,66 @@ def create_sr_from_dn(delivery_note):
     return "done"
 
 
+def _post_reconciliation_piece_delta(sr, sr_item, starting_pieces, target_qty):
+    """Post the piece movement matching a Delivery Note auto-reconciliation.
+
+    The reconciliation writes an absolute target QUANTITY for the batch.
+    The piece equivalent of that target is derived from the batch's physical
+    dimensions, and only the difference against what the batch already held
+    is posted, so the Piece Stock Ledger stays the single source of truth
+    and cancelling the Stock Reconciliation reverses this row too (the
+    is_cancelled branch of create_piece_stock_ledger_entry cancels Piece
+    SLEs by voucher, before its Stock Reconciliation early-return).
+    """
+    from madhav.madhav.utils.stock_piece_utils import int_pieces_from_qty
+
+    length = flt(sr_item.get("average_length")) or flt(sr_item.get("length"))
+    section_weight = flt(sr_item.get("section_weight"))
+    if not length or not section_weight:
+        batch_dims = frappe.db.get_value(
+            "Batch", sr_item.batch_no, ["average_length", "section_weight"], as_dict=True
+        ) or frappe._dict()
+        length = length or flt(batch_dims.get("average_length"))
+        section_weight = section_weight or flt(batch_dims.get("section_weight"))
+
+    if not length or not section_weight:
+        # Without dimensions the piece equivalent is unknowable; leaving the
+        # ledger untouched is safer than writing a fabricated count.
+        return
+
+    # target_qty is the ABSOLUTE quantity this reconciliation establishes for
+    # the batch, captured when the row was built: ERPNext rewrites
+    # sr_item.qty to the difference during submit, so reading it back here
+    # would size the piece movement against the wrong number.
+    target_pieces = int_pieces_from_qty(flt(target_qty), length, section_weight)
+    delta = cint(target_pieces) - cint(flt(starting_pieces))
+    if not delta:
+        return
+
+    piece_doc = frappe.new_doc("Piece Stock Ledger Entry")
+    piece_doc.update({
+        "posting_date": sr.posting_date,
+        "posting_time": sr.posting_time,
+        "item_code": sr_item.item_code,
+        "warehouse": sr_item.warehouse,
+        "voucher_type": "Stock Reconciliation",
+        "voucher_no": sr.name,
+        "actual_qty": delta,
+        "incoming_rate": flt(sr_item.valuation_rate),
+        "company": sr.company,
+        "unit_of_measure": "Piece",
+        "is_cancelled": 0,
+        "batch_no": sr_item.batch_no,
+        "docstatus": 1,
+    })
+    piece_doc.flags.ignore_permissions = True
+    piece_doc.insert()
+
+    from madhav.doc_events.stock_ledger_entry import recalculate_batch_pieces
+
+    recalculate_batch_pieces(sr_item.batch_no)
+
+
 def create_stock_reconciliation(self):
     import frappe
     from frappe.utils import flt, nowtime, get_datetime, add_to_date
@@ -2309,6 +2404,10 @@ def create_stock_reconciliation(self):
 
     if self.set_warehouse:
         sr.set_warehouse = self.set_warehouse
+
+    # Absolute post-reconciliation qty per batch, kept because ERPNext
+    # rewrites Stock Reconciliation Item.qty to the difference on submit.
+    sr_targets = {}
 
     for row in items_with_invoice_qty:
         total_qty = flt(row.qty) + flt(row.difference_qty)
@@ -2375,6 +2474,9 @@ def create_stock_reconciliation(self):
                         or (flt(row.get("pieces")) * ratio if row.get("pieces") else 0)
                     )
 
+                    sr_targets[entry.batch_no] = (
+                        flt(sr_targets.get(entry.batch_no, 0)) + flt(entry_invoice_qty)
+                    )
                     sr.append(
                         "items",
                         {
@@ -2398,6 +2500,37 @@ def create_stock_reconciliation(self):
                     )
                 continue
 
+        # Same dimension fallback the bundle branch above uses.  A Delivery
+        # Note Item has NO "average_length" field - its Length Size lives in
+        # "length_size" (fetched from Batch.average_length), and "length" is
+        # a separate Int that is usually blank - so reading average_length /
+        # length here always produced 0.  The site Server Script "Update
+        # Batch details" then copied that 0 onto Batch.average_length, which
+        # is what cleared the batch Length on every SI-originated (no
+        # bundle) Deliver-as-Qty delivery.  Resolving the real value means
+        # the reconciliation can no longer carry a zero to copy across.
+        batch_dims = frappe._dict()
+        if row.batch_no:
+            batch_dims = frappe.db.get_value(
+                "Batch", row.batch_no, ["average_length", "section_weight"], as_dict=True
+            ) or frappe._dict()
+
+        row_length = (
+            flt(row.get("length_size"))
+            or flt(row.get("average_length"))
+            or flt(row.get("length"))
+            or flt(batch_dims.get("average_length"))
+        )
+        row_section_weight = (
+            flt(row.get("section_weight"))
+            or flt(batch_dims.get("section_weight"))
+        )
+
+        if row.batch_no:
+            sr_targets[row.batch_no] = (
+                flt(sr_targets.get(row.batch_no, 0)) + flt(row.invoice_qty)
+            )
+
         sr.append(
             "items",
             {
@@ -2413,9 +2546,9 @@ def create_stock_reconciliation(self):
                 "valuation_rate": valuation_rate,
                 "current_rate": flt(row.incoming_rate),
                 "pieces": flt(row.get("pieces")),
-                "length": flt(row.get("length")),
-                "average_length": flt(row.get("average_length")),
-                "section_weight": flt(row.get("section_weight")),
+                "length": row_length,
+                "average_length": row_length,
+                "section_weight": row_section_weight,
                 "delivery_note_ref": self.name,
                 "serial_and_batch_bundle": None,
             },
@@ -2503,6 +2636,22 @@ def create_stock_reconciliation(self):
             # sort it out.
             starting_pieces = original_batch_pieces.get(sr_item.batch_no, 0)
             batch_update["pieces"] = max(starting_pieces - flt(sr_item.pieces), 0)
+        elif piece_tracked:
+            # A piece-tracked batch gets its pieces exclusively from the
+            # Piece Stock Ledger, and create_piece_stock_ledger_entry
+            # deliberately posts nothing for a Stock Reconciliation. So when
+            # this reconciliation tops a batch's QUANTITY up to the invoice
+            # qty, the matching PIECES were never added, and the delivery
+            # that follows then took the batch's piece count negative
+            # (5 PC batch, invoice 6 -> reconcile qty to 6, deliver 6 PC,
+            # ledger lands on -1). Post the piece side of the same
+            # adjustment so quantity and pieces stay in step.
+            target_qty = sr_targets.get(sr_item.batch_no)
+            if target_qty is not None:
+                _post_reconciliation_piece_delta(
+                    sr, sr_item, original_batch_pieces.get(sr_item.batch_no, 0),
+                    target_qty,
+                )
         if batch_update:
             frappe.db.set_value(
                 "Batch", sr_item.batch_no, batch_update, update_modified=False

@@ -66,22 +66,20 @@ class StockReservationEntry(_StockReservationEntry):
                     ignore_sre=self.name,
                 )
                 if self.voucher_type == "Sales Order":
+                    # Same shared SO-level allowance BWRT/FWO/Stock Transfer
+                    # use: the line's own remaining base qty plus whatever is
+                    # left of the SO-wide tolerance pool, capped by
+                    # (pending SO qty + tolerance - already reserved).  A
+                    # submitted FWO consumes the line's base qty only, so it
+                    # must not make the leftover tolerance unreservable here.
                     from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
-                        get_base_reserved_qty,
+                        get_so_line_allowance,
                     )
-                    so_item = frappe.db.get_value(
-                        "Sales Order Item", self.voucher_detail_no,
-                        ["stock_qty", "qty", "conversion_factor", "delivered_qty"],
-                        as_dict=True,
-                    ) or frappe._dict()
-                    pending_qty = (
-                        flt(so_item.stock_qty)
-                        or flt(so_item.qty) * (flt(so_item.conversion_factor) or 1)
-                    ) - flt(so_item.delivered_qty) * (flt(so_item.conversion_factor) or 1)
-                    so_available_qty = max(
-                        0, pending_qty - get_base_reserved_qty(
-                            self.voucher_detail_no, exclude_sre=self.name
-                        )
+                    so_available_qty = get_so_line_allowance(
+                        self.voucher_no,
+                        self.voucher_detail_no,
+                        is_tolerance=cint(self.get("custom_is_tolerance")),
+                        exclude_sre=self.name,
                     )
                     allowed_qty = min(self.available_qty, so_available_qty)
                 else:

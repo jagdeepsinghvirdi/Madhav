@@ -86,14 +86,110 @@ def get_base_reserved_qty(sales_order_item, exclude_sre=None):
 	)
 
 
+def get_so_base_reserved_qty(sales_order, exclude_sre=None):
+	"""SO-wide base (non-tolerance) reserved qty, same definition as
+	get_base_reserved_qty() but for every line of the Sales Order."""
+	return flt(
+		frappe.db.sql(
+			"""
+			select sum(reserved_qty - delivered_qty) from `tabStock Reservation Entry`
+			where voucher_type='Sales Order' and voucher_no=%(so)s
+				and docstatus=1
+				and ifnull(custom_is_tolerance,0)=0
+				and (%(exclude)s is null or name != %(exclude)s)
+			""",
+			{"so": sales_order, "exclude": exclude_sre},
+		)[0][0]
+		or 0
+	)
+
+
+def get_so_pending_stock_qty(sales_order):
+	"""SO-wide undelivered qty in stock UOM."""
+	return flt(
+		frappe.db.sql(
+			"""
+			select sum(stock_qty - ifnull(delivered_qty,0) * ifnull(nullif(conversion_factor,0),1))
+			from `tabSales Order Item` where parent=%s and docstatus=1
+			""",
+			sales_order,
+		)[0][0]
+		or 0
+	)
+
+
+def get_remaining_allowable_qty(sales_order, exclude_sre=None, already_staged_total_qty=0):
+	"""The shared Sales Order level pool (CLAUDE.md section 10):
+
+		remaining allowable = pending SO qty + tolerance pool
+		                      - everything already reserved/produced
+
+	Every active reservation counts, whatever created it (BWRT, FWO,
+	Stock Transfer, Production) and whichever pool it was booked against,
+	so an FWO can never silently eat the tolerance twice.
+	"""
+	total = get_so_pending_stock_qty(sales_order) + get_tolerance_pool(sales_order)
+	used = (
+		get_so_base_reserved_qty(sales_order, exclude_sre=exclude_sre)
+		+ get_used_tolerance_qty(sales_order, exclude_sre=exclude_sre)
+	)
+	return max(0, floor_qty(total - used - flt(already_staged_total_qty), 3))
+
+
+def get_remaining_tolerance_qty(sales_order, exclude_sre=None, already_staged_tolerance_qty=0):
+	"""Tolerance still unused in the shared SO-level pool.
+
+	Tolerance is consumed either by an explicitly flagged tolerance SRE or
+	by a base reservation that pushed its own SO line past the line's
+	pending qty (older records, and base BWRT rows that legitimately dip
+	into the shared pool).  Both are counted here so the pool cannot be
+	spent twice.
+	"""
+	pool = get_tolerance_pool(sales_order)
+	used = get_used_tolerance_qty(sales_order, exclude_sre=exclude_sre)
+
+	lines = frappe.db.sql(
+		"""
+		select name, stock_qty - ifnull(delivered_qty,0) * ifnull(nullif(conversion_factor,0),1) as pending
+		from `tabSales Order Item` where parent=%s and docstatus=1
+		""",
+		sales_order,
+		as_dict=True,
+	)
+	reserved_by_line = dict(
+		frappe.db.sql(
+			"""
+			select voucher_detail_no, sum(reserved_qty - delivered_qty)
+			from `tabStock Reservation Entry`
+			where voucher_type='Sales Order' and voucher_no=%(so)s
+				and docstatus=1
+				and ifnull(custom_is_tolerance,0)=0
+				and (%(exclude)s is null or name != %(exclude)s)
+			group by voucher_detail_no
+			""",
+			{"so": sales_order, "exclude": exclude_sre},
+		)
+		or []
+	)
+	for line in lines:
+		overflow = flt(reserved_by_line.get(line.name)) - flt(line.pending)
+		if overflow > 0:
+			used += overflow
+
+	return max(0, floor_qty(pool - used - flt(already_staged_tolerance_qty), 3))
+
+
 def get_batch_available_qty(item_code, warehouse, batch_no, exclude_sre=None):
 	"""Batch stock, filtered by warehouse on BOTH the actual-qty side and
 	the reserved-qty side (Phase 1, point 4 - previously only the actual
 	side was warehouse-filtered in some callers)."""
+	# Per-batch qty from the matched entry: sle.actual_qty is the whole
+	# bundle, so a multi-batch receipt otherwise credits every batch in it
+	# with the other batches' stock.  Direction still comes from the SLE.
 	actual_qty = flt(
 		frappe.db.sql(
 			"""
-			select sum(sle.actual_qty)
+			select sum(sign(sle.actual_qty) * abs(sbe.qty))
 			from `tabStock Ledger Entry` sle
 			inner join `tabSerial and Batch Entry` sbe on sbe.parent = sle.serial_and_batch_bundle
 			where sle.item_code=%(item_code)s and sle.warehouse=%(warehouse)s
@@ -143,9 +239,66 @@ def calc_proportional_pieces(reserve_qty, batch_no):
 	)
 
 
+def get_so_line_allowance(
+	sales_order, sales_order_item, is_tolerance=0, exclude_sre=None,
+	already_staged_qty=0, already_staged_tolerance_qty=0, already_staged_total_qty=0,
+	so_cache=None,
+):
+	"""How much may still be reserved against one SO line, shared-pool aware.
+
+	A base reservation may use what is left of its own line PLUS whatever is
+	left of the SO-wide tolerance pool, and is then capped by the SO-wide
+	remaining allowable qty so the pool can never be spent twice:
+
+		remaining allowable = pending SO qty + tolerance - already reserved
+
+	This is what keeps BWRT usable after an FWO: the FWO consumes the line's
+	own base qty, but the shared tolerance it did not touch stays available.
+	"""
+	# so_cache lets a caller that walks many lines of the same Sales Order
+	# (the BWRT item fetch) resolve the SO-wide figures once instead of once
+	# per line.  Only valid while nothing changes, i.e. within one read.
+	cache_key = (sales_order, exclude_sre, flt(already_staged_tolerance_qty), flt(already_staged_total_qty))
+	if so_cache is not None and cache_key in so_cache:
+		tolerance_remaining, so_remaining = so_cache[cache_key]
+	else:
+		tolerance_remaining = get_remaining_tolerance_qty(
+			sales_order, exclude_sre=exclude_sre,
+			already_staged_tolerance_qty=already_staged_tolerance_qty,
+		)
+		so_remaining = get_remaining_allowable_qty(
+			sales_order, exclude_sre=exclude_sre,
+			already_staged_total_qty=already_staged_total_qty,
+		)
+		if so_cache is not None:
+			so_cache[cache_key] = (tolerance_remaining, so_remaining)
+
+	if cint(is_tolerance):
+		return max(0, floor_qty(min(tolerance_remaining, so_remaining), 3))
+
+	so_item = frappe.db.get_value(
+		"Sales Order Item", sales_order_item,
+		["stock_qty", "qty", "conversion_factor", "delivered_qty"], as_dict=True,
+	) or frappe._dict()
+	conversion_factor = flt(so_item.conversion_factor) or 1
+	pending_stock_qty = (
+		(flt(so_item.stock_qty) or flt(so_item.qty) * conversion_factor)
+		- flt(so_item.delivered_qty) * conversion_factor
+	)
+	line_remaining = max(0, floor_qty(
+		pending_stock_qty
+		- get_base_reserved_qty(sales_order_item, exclude_sre=exclude_sre)
+		- flt(already_staged_qty),
+		3,
+	))
+
+	return max(0, floor_qty(min(line_remaining + tolerance_remaining, so_remaining), 3))
+
+
 def get_reservation_ceiling(
 	item_code, warehouse, sales_order, sales_order_item, is_tolerance,
 	batch_no=None, exclude_sre=None, already_staged_qty=0, already_staged_tolerance_qty=0,
+	already_staged_total_qty=0,
 ):
 	"""Single source of truth: min(SO-line availability, batch+warehouse
 	availability, item+warehouse availability). Used by fetch, stage,
@@ -168,13 +321,12 @@ def get_reservation_ceiling(
 
 	is_tolerance = cint(is_tolerance)
 
-	if is_tolerance:
-		pool = get_tolerance_pool(sales_order)
-		used = get_used_tolerance_qty(sales_order, exclude_sre=exclude_sre)
-		so_available_qty = max(0, floor_qty(pool - used - flt(already_staged_tolerance_qty), 3))
-	else:
-		base_reserved = get_base_reserved_qty(sales_order_item, exclude_sre=exclude_sre)
-		so_available_qty = max(0, floor_qty(pending_stock_qty - base_reserved - flt(already_staged_qty), 3))
+	so_available_qty = get_so_line_allowance(
+		sales_order, sales_order_item, is_tolerance=is_tolerance, exclude_sre=exclude_sre,
+		already_staged_qty=already_staged_qty,
+		already_staged_tolerance_qty=already_staged_tolerance_qty,
+		already_staged_total_qty=already_staged_total_qty,
+	)
 
 	batch_available_qty = None
 	if batch_no:
@@ -413,6 +565,7 @@ def fetch_sales_order_items(filters):
 	weight_map = {d.name: flt(d.weight_per_meter) for d in item_details}
 
 	rows = []
+	so_allowance_cache = {}
 	for row in items:
 		conversion_factor = flt(row.conversion_factor) or 1
 		delivered_stock_qty = flt(row.delivered_qty) * conversion_factor
@@ -421,11 +574,11 @@ def fetch_sales_order_items(filters):
 		if pending_stock_qty <= 0:
 			continue
 
-		# Uses the SAME base-reserved calc as staging/submit, so the
+		# Uses the SAME shared SO-level allowance as staging/submit, so the
 		# suggested reserve_qty here won't disagree with what BWRT will
-		# actually allow later (Phase 1).
-		base_reserved = get_base_reserved_qty(row.name)
-		remaining = max(0, flt(pending_stock_qty) - flt(base_reserved))
+		# actually allow later (Phase 1).  After an FWO the line's own base
+		# qty is gone but the shared tolerance may still be reservable.
+		remaining = get_so_line_allowance(row.parent, row.name, so_cache=so_allowance_cache)
 
 		rows.append({
 			"sales_order": row.parent,
@@ -470,13 +623,20 @@ def add_to_reservation_batches(
 	))
 	already_staged_tolerance_qty = flt(sum(
 		flt(r.reserved_qty) for r in doc.get("reservation_batches")
-		if cint(r.get("is_tolerance"))
+		if r.sales_order == sales_order and cint(r.get("is_tolerance"))
+	))
+	# Everything already staged against THIS Sales Order, whichever pool it
+	# was staged against - the shared SO-level allowance covers both.
+	already_staged_total_qty = flt(sum(
+		flt(r.reserved_qty) for r in doc.get("reservation_batches")
+		if r.sales_order == sales_order
 	))
 
 	limits = get_reservation_ceiling(
 		item_code=item_code, warehouse=target_warehouse, sales_order=sales_order,
 		sales_order_item=sales_order_item, is_tolerance=is_tolerance, batch_no=batch_no,
 		already_staged_qty=already_staged_qty, already_staged_tolerance_qty=already_staged_tolerance_qty,
+		already_staged_total_qty=already_staged_total_qty,
 	)
 
 	reserved_qty = flt(reserved_qty, 3)
@@ -533,13 +693,14 @@ def add_to_reservation_batches(
 def fetch_available_batches(item_code, warehouse, pending_qty=0, reserve_qty=0):
 	batch_stock = frappe.db.sql(
 		"""
-		SELECT sbe.batch_no AS batch, sle.item_code, SUM(sle.actual_qty) AS actual_qty
+		SELECT sbe.batch_no AS batch, sle.item_code,
+			SUM(SIGN(sle.actual_qty) * ABS(sbe.qty)) AS actual_qty
 		FROM `tabStock Ledger Entry` sle
 		INNER JOIN `tabSerial and Batch Entry` sbe ON sbe.parent = sle.serial_and_batch_bundle
 		WHERE sle.item_code=%(item_code)s AND sle.warehouse=%(warehouse)s
 			AND sle.is_cancelled=0 AND sbe.batch_no IS NOT NULL
 		GROUP BY sbe.batch_no, sle.item_code
-		HAVING SUM(sle.actual_qty) > 0
+		HAVING SUM(SIGN(sle.actual_qty) * ABS(sbe.qty)) > 0
 		""",
 		{"item_code": item_code, "warehouse": warehouse}, as_dict=True,
 	)
