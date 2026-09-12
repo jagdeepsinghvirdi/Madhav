@@ -59,19 +59,33 @@ frappe.ui.form.on('Delivery Note Item', {
 		// Bundle rows carry batches on Serial/Batch Bundle entries only.
 		if (!d.batch_no || d.serial_and_batch_bundle) return;
 
-		// fetch pieces from Batch only once
+		// Pieces must describe the quantity THIS row delivers, not the
+		// whole batch. Copying Batch.pieces wholesale overstated a partial
+		// delivery's physical pieces, and — because setting pieces fires
+		// calculate_qty — rewrote an entered Qty of 4 as the full batch
+		// quantity of 5. Only an empty row falls back to the batch total.
 		frappe.db.get_value(
 			"Batch",
 			d.batch_no,
-			"pieces",
+			["pieces", "average_length", "section_weight"],
 			function (r) {
-				if (r && r.pieces != null) {
-					frappe.model.set_value(
-						cdt,
-						cdn,
-						"pieces",
-						r.pieces
-					);
+				if (!r) return;
+
+				let batch_pieces = cint(r.pieces);
+				let target_qty = flt(d.invoice_qty) || flt(d.qty);
+				let length = flt(r.average_length) || flt(d.average_length || d.length_size);
+				let section_weight = flt(r.section_weight) || flt(d.section_weight);
+
+				let pieces = batch_pieces;
+				if (target_qty > 0 && length > 0 && section_weight > 0) {
+					pieces = pieces_from_qty(target_qty, length, section_weight);
+					if (batch_pieces > 0 && pieces > batch_pieces) {
+						pieces = batch_pieces;
+					}
+				}
+
+				if (pieces != null) {
+					frappe.model.set_value(cdt, cdn, "pieces", pieces);
 				}
 			}
 		);
@@ -102,9 +116,17 @@ function calculate_qty(cdt, cdn) {
 	let row = locals[cdt][cdn];
 	// Reserved / Deliver-as-Qty rows: physical Qty comes from reservation weight.
 	// Do not rebuild Qty from pieces×length×section_weight (that drifts 0.445→0.443).
+	//
+	// invoice_qty counts as a Deliver-as-Qty signal in its own right:
+	// custom_deliver_as_qty is read-only and only stamped server side during
+	// validate, so on a Delivery Note mapped from a Sales Invoice it is still
+	// 0 in the browser while the user picks the batch. Relying on it alone let
+	// the freshly stamped batch pieces overwrite the Qty that was typed in.
 	if (
 		(row.against_sales_order || row.against_sales_invoice) &&
-		(cint(row.custom_deliver_as_qty) || row.serial_and_batch_bundle)
+		(cint(row.custom_deliver_as_qty) ||
+			flt(row.invoice_qty) > 0 ||
+			row.serial_and_batch_bundle)
 	) {
 		return;
 	}
@@ -118,6 +140,20 @@ function calculate_qty(cdt, cdn) {
 	if (qty > 0) {
 		frappe.model.set_value(cdt, cdn, "qty", flt(qty, 4));
 	}
+}
+
+// Mirrors madhav.madhav.utils.stock_piece_utils.int_pieces_from_qty so the
+// browser and the server agree on the piece count for a given weight.
+function pieces_from_qty(qty, length, section_weight) {
+	qty = flt(qty);
+	length = flt(length);
+	section_weight = flt(section_weight);
+	if (!length || !section_weight || qty <= 0) return 0;
+
+	let raw = (qty * 1000) / (length * section_weight);
+	let near = Math.round(raw);
+	if (Math.abs(raw - near) < 1e-6) return Math.max(0, near);
+	return Math.max(0, Math.ceil(raw - 1e-9));
 }
 
 function set_lengthpieces(frm) {
