@@ -78,6 +78,31 @@ def _batch_created_by_voucher(batch_no, voucher_type, voucher_no):
 	return ref.reference_doctype == voucher_type and ref.reference_name == voucher_no
 
 
+def _batch_had_stock_before_voucher(batch_no, voucher_type, voucher_no):
+	"""Did this batch hold any stock before the current voucher posted?
+
+	Per-batch quantity comes from the matched Serial and Batch Entry, not
+	from sle.actual_qty, which carries the whole bundle.
+	"""
+	if not voucher_type or not voucher_no:
+		return True
+
+	prior_qty = frappe.db.sql(
+		"""
+		SELECT COALESCE(SUM(SIGN(sle.actual_qty) * ABS(sbe.qty)), 0)
+		FROM `tabStock Ledger Entry` sle
+		INNER JOIN `tabSerial and Batch Entry` sbe
+			ON sbe.parent = sle.serial_and_batch_bundle
+		WHERE sbe.batch_no = %(batch_no)s
+		  AND sle.is_cancelled = 0
+		  AND NOT (sle.voucher_type = %(vt)s AND sle.voucher_no = %(vn)s)
+		""",
+		{"batch_no": batch_no, "vt": voucher_type, "vn": voucher_no},
+	)[0][0]
+
+	return flt(prior_qty) > 0
+
+
 def _ensure_baseline_piece_sle(item_code, warehouse, batch_no, company, voucher_type=None, voucher_no=None):
 	"""
 	recalculate_batch_pieces() resums from the Piece Stock Ledger alone.
@@ -92,6 +117,17 @@ def _ensure_baseline_piece_sle(item_code, warehouse, batch_no, company, voucher_
 		return
 
 	if _batch_created_by_voucher(batch_no, voucher_type, voucher_no):
+		return
+
+	# Only a batch that already held stock BEFORE this voucher has history to
+	# anchor. Seeding from Batch.pieces regardless meant a batch whose master
+	# already carried a piece count but had no ledger rows was credited with
+	# that count AND with the pieces of the very movement bringing the stock
+	# in - the ledger then reported more pieces than the batch physically
+	# holds (a 69 PC batch reading 77 after a movement). The anchor is still
+	# seeded for its real purpose: a legacy batch holding stock whose first
+	# ledger movement is outward, which would otherwise resum to a negative.
+	if not _batch_had_stock_before_voucher(batch_no, voucher_type, voucher_no):
 		return
 
 	current_pieces = flt(frappe.db.get_value("Batch", batch_no, "pieces"))

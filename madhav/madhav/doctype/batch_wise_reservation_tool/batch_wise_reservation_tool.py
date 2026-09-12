@@ -68,6 +68,29 @@ def get_used_tolerance_qty(sales_order, exclude_sre=None):
 	)
 
 
+def get_active_tolerance_qty(sales_order, exclude_sre=None):
+	"""SO-wide tolerance still RESERVED, net of what has been delivered.
+
+	The counterpart to get_used_tolerance_qty(): that one answers "how much
+	of the 20% pool has been spent" (gross), this one answers "how much
+	tolerance stock is still committed but not yet shipped" - the figure
+	that belongs next to a pending quantity.
+	"""
+	return flt(
+		frappe.db.sql(
+			"""
+			select sum(reserved_qty - delivered_qty) from `tabStock Reservation Entry`
+			where voucher_type='Sales Order' and voucher_no=%(so)s
+				and docstatus=1
+				and ifnull(custom_is_tolerance,0)=1
+				and (%(exclude)s is null or name != %(exclude)s)
+			""",
+			{"so": sales_order, "exclude": exclude_sre},
+		)[0][0]
+		or 0
+	)
+
+
 def get_base_reserved_qty(sales_order_item, exclude_sre=None):
 	"""Base (non-tolerance) qty already reserved against this SO line,
 	from ANY source, netted against each SRE's own delivered_qty."""
@@ -129,9 +152,16 @@ def get_remaining_allowable_qty(sales_order, exclude_sre=None, already_staged_to
 	so an FWO can never silently eat the tolerance twice.
 	"""
 	total = get_so_pending_stock_qty(sales_order) + get_tolerance_pool(sales_order)
+	# Both sides must be NET of delivered qty.  The pending figure above has
+	# already had the delivered quantity taken out of it, so subtracting the
+	# GROSS tolerance here charged every delivered tolerance unit twice: a
+	# Sales Order with 0.059 delivered against its tolerance reported 0.360
+	# remaining where the true figure is 0.419.  get_used_tolerance_qty stays
+	# gross for the tolerance-pool question in get_remaining_tolerance_qty,
+	# where consumed-and-delivered tolerance genuinely is spent.
 	used = (
 		get_so_base_reserved_qty(sales_order, exclude_sre=exclude_sre)
-		+ get_used_tolerance_qty(sales_order, exclude_sre=exclude_sre)
+		+ get_active_tolerance_qty(sales_order, exclude_sre=exclude_sre)
 	)
 	return max(0, floor_qty(total - used - flt(already_staged_total_qty), 3))
 
@@ -148,9 +178,15 @@ def get_remaining_tolerance_qty(sales_order, exclude_sre=None, already_staged_to
 	pool = get_tolerance_pool(sales_order)
 	used = get_used_tolerance_qty(sales_order, exclude_sre=exclude_sre)
 
+	# Overflow is measured GROSS against the line's ORDERED qty, never net
+	# against its pending qty.  A line's pending figure drops for EVERY
+	# delivery on that line - including one that shipped against a tolerance
+	# reservation - which made an exactly-reserved line look over-reserved by
+	# the delivered amount and wrongly burned that much tolerance a second
+	# time.  Ordered qty vs gross base reservation is delivery-independent.
 	lines = frappe.db.sql(
 		"""
-		select name, stock_qty - ifnull(delivered_qty,0) * ifnull(nullif(conversion_factor,0),1) as pending
+		select name, stock_qty as ordered
 		from `tabSales Order Item` where parent=%s and docstatus=1
 		""",
 		sales_order,
@@ -159,7 +195,7 @@ def get_remaining_tolerance_qty(sales_order, exclude_sre=None, already_staged_to
 	reserved_by_line = dict(
 		frappe.db.sql(
 			"""
-			select voucher_detail_no, sum(reserved_qty - delivered_qty)
+			select voucher_detail_no, sum(reserved_qty)
 			from `tabStock Reservation Entry`
 			where voucher_type='Sales Order' and voucher_no=%(so)s
 				and docstatus=1
@@ -172,7 +208,7 @@ def get_remaining_tolerance_qty(sales_order, exclude_sre=None, already_staged_to
 		or []
 	)
 	for line in lines:
-		overflow = flt(reserved_by_line.get(line.name)) - flt(line.pending)
+		overflow = flt(reserved_by_line.get(line.name)) - flt(line.ordered)
 		if overflow > 0:
 			used += overflow
 

@@ -1393,7 +1393,22 @@ def _apply_direct_batch_delivery_dimensions(row):
     if section_weight and hasattr(row, "section_weight"):
         row.section_weight = section_weight
     if length and section_weight and hasattr(row, "pieces"):
-        row.pieces = int_pieces_from_qty(row.qty, length, section_weight)
+        pieces = int_pieces_from_qty(row.qty, length, section_weight)
+        # int_pieces_from_qty() rounds a weight UP to whole pieces, so a row
+        # topped up by a reconciliation (6.000 Kg -> 6.010 Kg on 1.5 Kg pieces)
+        # asked for 5 pieces from a batch physically holding 4, and the piece
+        # ledger went negative. A delivery can never take more pieces than the
+        # batch has; the Sales Order path already caps this way, and the two
+        # flows have to agree. Availability comes from the piece ledger, with
+        # the Batch master only as a fallback for batches that predate it.
+        available = get_batch_available_pieces(
+            row.item_code, row.warehouse, row.batch_no
+        )
+        if not available:
+            available = flt(frappe.db.get_value("Batch", row.batch_no, "pieces") or 0)
+        if available and pieces > available:
+            pieces = cint(available)
+        row.pieces = pieces
 
 
 from frappe.utils import get_datetime, add_to_date, nowtime
@@ -2298,7 +2313,7 @@ def create_sr_from_dn(delivery_note):
     return "done"
 
 
-def _post_reconciliation_piece_delta(sr, sr_item, starting_pieces, target_qty):
+def _post_reconciliation_piece_delta(sr, sr_item, prior_qty, target_qty):
     """Post the piece movement matching a Delivery Note auto-reconciliation.
 
     The reconciliation writes an absolute target QUANTITY for the batch.
@@ -2325,12 +2340,18 @@ def _post_reconciliation_piece_delta(sr, sr_item, starting_pieces, target_qty):
         # ledger untouched is safer than writing a fabricated count.
         return
 
-    # target_qty is the ABSOLUTE quantity this reconciliation establishes for
-    # the batch, captured when the row was built: ERPNext rewrites
-    # sr_item.qty to the difference during submit, so reading it back here
-    # would size the piece movement against the wrong number.
-    target_pieces = int_pieces_from_qty(flt(target_qty), length, section_weight)
-    delta = cint(target_pieces) - cint(flt(starting_pieces))
+    # Size the piece movement from the QUANTITY DIFFERENCE this reconciliation
+    # applies, truncated to whole pieces.  Converting the absolute target with
+    # int_pieces_from_qty() instead used that helper's ceiling, so topping a
+    # 6.000 Kg / 4 PC batch up to 6.010 Kg - a weight adjustment far smaller
+    # than one 1.5 Kg piece - invented a whole extra piece, which the delivery
+    # then could not consume and left stranded on the batch.  A batch only
+    # gains or loses a piece when it gains or loses a whole piece's weight.
+    piece_weight = flt(length) * flt(section_weight) / 1000.0
+    if piece_weight <= 0:
+        return
+
+    delta = int(flt(flt(target_qty) - flt(prior_qty)) / piece_weight)
     if not delta:
         return
 
@@ -2442,7 +2463,18 @@ def create_stock_reconciliation(self):
                     )
 
                     entry_invoice_qty = flt(row.invoice_qty) * ratio
-                    entry_diff_qty = entry_invoice_qty - batch_qty
+                    # The shortfall is this row's real shortfall, shared out by
+                    # the same ratio - NOT (invoice qty - bundle entry qty).
+                    # change_qty_serial_and_batch() has already scaled the
+                    # bundle entries up to the invoice qty at before_insert, so
+                    # that subtraction was always 0 and every bundle-backed
+                    # reconciliation asked for no change at all.  Madhav's
+                    # Stock Reconciliation validate() then sets
+                    # qty = current_qty + difference_qty, which put the row back
+                    # to the quantity the batch already held: ERPNext dropped it
+                    # as unchanged and the Delivery Note's shortfall was never
+                    # reconciled, leaving qty and pieces stranded on the batch.
+                    entry_diff_qty = flt(row.difference_qty) * ratio
                     entry_dn_qty = batch_qty
 
                     # Prefer bundle/Batch length — DN.average_length is often 0
@@ -2589,6 +2621,16 @@ def create_stock_reconciliation(self):
 
     sr.save(ignore_permissions=True)
 
+    # Batch quantities as they stand BEFORE this reconciliation posts - the
+    # piece adjustment below is sized from the qty difference, not from a
+    # ceiling of the target.
+    original_batch_qty = {}
+    for sr_item in sr.items:
+        if sr_item.batch_no and sr_item.batch_no not in original_batch_qty:
+            original_batch_qty[sr_item.batch_no] = get_batch_qty_from_sle(
+                sr_item.item_code, sr_item.warehouse, sr_item.batch_no
+            )
+
     for sr_item in sr.items:
         if flt(sr_item.qty) and not flt(sr_item.valuation_rate):
             sr_item.valuation_rate = (
@@ -2649,7 +2691,7 @@ def create_stock_reconciliation(self):
             target_qty = sr_targets.get(sr_item.batch_no)
             if target_qty is not None:
                 _post_reconciliation_piece_delta(
-                    sr, sr_item, original_batch_pieces.get(sr_item.batch_no, 0),
+                    sr, sr_item, original_batch_qty.get(sr_item.batch_no, 0),
                     target_qty,
                 )
         if batch_update:
