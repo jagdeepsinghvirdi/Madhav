@@ -281,6 +281,12 @@ class TestStockTransferReservationDimensions(FrappeTestCase):
 		), patch(
 			"madhav.madhav.doctype.stock_transfer.stock_transfer.frappe.new_doc",
 			return_value=FakeSRE(),
+		), patch(
+			"madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool.get_auto_reserve_available_qty",
+			return_value=100.0,
+		), patch(
+			"madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool.validate_length_for_so_reservation",
+			return_value=None,
 		):
 			doc.create_fg_stock_reservation(
 				item_code="FG0001",
@@ -1399,6 +1405,80 @@ class TestStockTransferCancelRollbackE2E(FrappeTestCase):
 			reserved_after_first,
 			places=3,
 			msg="cancelling must release only the extra reservation",
+		)
+
+	def test_p4_over_allowance_reserves_beyond_so_qty(self):
+		"""SO 4T + transfer 4.5T within 20% → reserved must be 4.5, not 4.0."""
+		frappe.db.set_single_value("Stock Settings", "over_reservation_allowance", 20)
+
+		_, batch_no = self._receive_stock()
+		so_qty = 4.0
+		so = self._make_sales_order(qty=so_qty)
+		if frappe.db.has_column("Sales Order Item", "length_size"):
+			frappe.db.set_value(
+				"Sales Order Item",
+				so.items[0].name,
+				"length_size",
+				self.LENGTH,
+				update_modified=False,
+			)
+
+		# Single transfer above SO qty but within SO-total × 1.20.
+		st = self._make_transfer(batch_no, qty=4.5, pieces=9)
+		self._reserve_for(st, so, so_qty)
+		self.assertAlmostEqual(
+			self._total_reserved_on_so(so),
+			4.5,
+			places=3,
+			msg="extra 0.5 within SO-total 20% allowance must also be reserved",
+		)
+
+	def test_p4_stock_settings_allowance_caps_at_configured_percent(self):
+		"""Max reserved = Total SO Qty × (1 + Stock Settings over_reservation_allowance%)."""
+		from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
+			get_auto_reserve_available_qty,
+		)
+
+		frappe.db.set_single_value("Stock Settings", "over_reservation_allowance", 20)
+		so = self._make_sales_order(qty=100.0)
+		# No reservations yet → full 120 available (100 + 20%).
+		self.assertAlmostEqual(get_auto_reserve_available_qty(so.name), 120.0, places=3)
+
+		frappe.db.set_single_value("Stock Settings", "over_reservation_allowance", 10)
+		# 100 + 10% = 110
+		self.assertAlmostEqual(get_auto_reserve_available_qty(so.name), 110.0, places=3)
+
+		frappe.db.set_single_value("Stock Settings", "over_reservation_allowance", 0)
+		self.assertAlmostEqual(get_auto_reserve_available_qty(so.name), 100.0, places=3)
+
+		# Restore default used by other tests.
+		frappe.db.set_single_value("Stock Settings", "over_reservation_allowance", 20)
+
+	def test_p4_length_outside_so_window_blocks_reservation(self):
+		"""Length outside SO ±2 must throw and leave no reservation."""
+		frappe.db.set_single_value("Stock Settings", "over_reservation_allowance", 20)
+
+		_, batch_no = self._receive_stock()
+		so = self._make_sales_order(qty=2.0)
+		if not frappe.db.has_column("Sales Order Item", "length_size"):
+			self.skipTest("Sales Order Item.length_size not installed")
+
+		frappe.db.set_value(
+			"Sales Order Item",
+			so.items[0].name,
+			"length_size",
+			6,
+			update_modified=False,
+		)
+
+		st = self._make_transfer(batch_no, qty=1.0, pieces=2, length=9.0)
+		with self.assertRaises(frappe.ValidationError):
+			self._reserve_for(st, so, 2.0)
+
+		self.assertEqual(
+			self._sres_of(st),
+			[],
+			"out-of-window length must not create a Sales Order reservation",
 		)
 
 	def test_cancel_is_blocked_when_stock_entry_cannot_be_found(self):

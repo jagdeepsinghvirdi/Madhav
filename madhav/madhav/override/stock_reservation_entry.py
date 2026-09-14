@@ -66,21 +66,25 @@ class StockReservationEntry(_StockReservationEntry):
                     ignore_sre=self.name,
                 )
                 if self.voucher_type == "Sales Order":
-                    # Same shared SO-level allowance BWRT/FWO/Stock Transfer
-                    # use: the line's own remaining base qty plus whatever is
-                    # left of the SO-wide tolerance pool, capped by
-                    # (pending SO qty + tolerance - already reserved).  A
-                    # submitted FWO consumes the line's base qty only, so it
-                    # must not make the leftover tolerance unreservable here.
+                    # Finish Work Order / Stock Transfer must follow the
+                    # client-confirmed Stock Settings rule:
+                    #   Max Reserved = Total SO Qty + Over Reservation Allowance %
+                    # BWRT keeps its own shared-pool allowance helper.
                     from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
+                        get_auto_reserve_available_qty,
                         get_so_line_allowance,
                     )
-                    so_available_qty = get_so_line_allowance(
-                        self.voucher_no,
-                        self.voucher_detail_no,
-                        is_tolerance=cint(self.get("custom_is_tolerance")),
-                        exclude_sre=self.name,
-                    )
+                    if self.from_voucher_type in ("Finish Work Order", "Stock Transfer"):
+                        so_available_qty = get_auto_reserve_available_qty(
+                            self.voucher_no, exclude_sre=self.name
+                        )
+                    else:
+                        so_available_qty = get_so_line_allowance(
+                            self.voucher_no,
+                            self.voucher_detail_no,
+                            is_tolerance=cint(self.get("custom_is_tolerance")),
+                            exclude_sre=self.name,
+                        )
                     allowed_qty = min(self.available_qty, so_available_qty)
                 else:
                     over_reservation_allowance = flt(
