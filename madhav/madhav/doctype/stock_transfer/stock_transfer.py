@@ -308,9 +308,10 @@ class StockTransfer(Document):
     def before_submit(self):
         # Holds data collected while creating the Stock Entry so on_submit
         # can create the Stock Reservation Entries afterwards.
+        # Build + validate reservation candidates BEFORE creating the Stock
+        # Entry so a length-tolerance failure cannot leave an orphaned SE.
         self._fg_reservation_data = []
-
-        se = self.create_stock_entry()
+        skipped_warehouse = []
 
         for row in self.transfer_item:
             if not row.source_document_type:
@@ -341,15 +342,29 @@ class StockTransfer(Document):
 
                 if not so_qty:
                     continue
-                if wor.fg_warehouse == self.target_warehouse:
-                    self._fg_reservation_data.append(
-                        self._build_fg_reservation_payload(
-                            row,
-                            so_qty=so_qty,
-                            work_order=wo_name,
-                            sales_order=wor.sales_order,
-                            sales_order_item=wor.sales_order_item,
-                        )
+
+                # Auto-reserve only when Target Warehouse matches the SO
+                # item warehouse (Finished Goods / SO line warehouse).
+                # Do not key off Work Order.fg_warehouse — QI → FG transfers
+                # must still reserve when the target is the SO warehouse.
+                target_wh = row.target_warehouse or self.target_warehouse
+                so_wh = frappe.db.get_value(
+                    "Sales Order Item", wor.sales_order_item, "warehouse"
+                )
+                if so_wh and target_wh and so_wh == target_wh:
+                    payload = self._build_fg_reservation_payload(
+                        row,
+                        so_qty=so_qty,
+                        work_order=wo_name,
+                        sales_order=wor.sales_order,
+                        sales_order_item=wor.sales_order_item,
+                    )
+                    self._validate_payload_length_for_reservation(payload)
+                    self._fg_reservation_data.append(payload)
+                elif wor.sales_order:
+                    skipped_warehouse.append(
+                        f"Row #{row.idx}: {row.item_code} "
+                        f"(target {target_wh or '-'} ≠ SO warehouse {so_wh or '-'})"
                     )
             elif row.source_document_type == "Purchase Receipt":
                 pr_item = frappe.db.get_value(
@@ -374,15 +389,51 @@ class StockTransfer(Document):
                 if not so_qty:
                     continue
 
-                self._fg_reservation_data.append(
-                    self._build_fg_reservation_payload(
+                target_wh = row.target_warehouse or self.target_warehouse
+                so_wh = frappe.db.get_value(
+                    "Sales Order Item", pr_item.sales_order_item, "warehouse"
+                )
+                if so_wh and target_wh and so_wh == target_wh:
+                    payload = self._build_fg_reservation_payload(
                         row,
                         so_qty=so_qty,
                         work_order=None,
                         sales_order=pr_item.sales_order,
                         sales_order_item=pr_item.sales_order_item,
                     )
-                )
+                    self._validate_payload_length_for_reservation(payload)
+                    self._fg_reservation_data.append(payload)
+                else:
+                    skipped_warehouse.append(
+                        f"Row #{row.idx}: {row.item_code} "
+                        f"(target {target_wh or '-'} ≠ SO warehouse {so_wh or '-'})"
+                    )
+
+        if skipped_warehouse:
+            frappe.msgprint(
+                _(
+                    "Stock reservation was skipped because the Target Warehouse "
+                    "does not match the Sales Order item warehouse:<br><ul><li>{0}</li></ul>"
+                ).format("</li><li>".join(skipped_warehouse)),
+                title=_("Reservation Skipped"),
+                indicator="orange",
+            )
+
+        self.create_stock_entry()
+
+    def _validate_payload_length_for_reservation(self, payload):
+        """Fail early when length is outside SO ±2 (before Stock Entry submit)."""
+        from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
+            validate_length_for_so_reservation,
+        )
+
+        validate_length_for_so_reservation(
+            payload.get("sales_order_item"),
+            payload.get("length"),
+            sales_order=payload.get("sales_order"),
+            item_code=payload.get("item_code"),
+            batch_no=payload.get("batch_no"),
+        )
 
     def _build_fg_reservation_payload(
         self, row, so_qty, work_order, sales_order, sales_order_item
@@ -556,18 +607,17 @@ class StockTransfer(Document):
             },
             fields=["name", "qty", "stock_reserved_qty", "warehouse"],
         )
-        if (
-            frappe.db.get_value(
-                "Sales Order Item",
-                {
-                    "parent": sales_order,
-                    "item_code": item_code,
-                    "name": sales_order_item,
-                },
-                "warehouse",
-            )
-            != warehouse
-        ):
+        so_warehouse = frappe.db.get_value(
+            "Sales Order Item",
+            {
+                "parent": sales_order,
+                "item_code": item_code,
+                "name": sales_order_item,
+            },
+            "warehouse",
+        )
+        # Point 4: auto-reserve only when Target Warehouse = SO item warehouse.
+        if so_warehouse != warehouse:
             return
         if not so_items:
             frappe.throw(f"❌ SO Item not found for {item_code} in {sales_order}")
@@ -576,26 +626,48 @@ class StockTransfer(Document):
         so_detail = item.name
 
         from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
-            get_base_reserved_qty,
-        )
-        so_values = frappe.db.get_value(
-            "Sales Order Item", so_detail,
-            ["stock_qty", "qty", "conversion_factor", "delivered_qty"], as_dict=True,
-        ) or frappe._dict()
-        conversion_factor = flt(so_values.conversion_factor) or 1
-        pending_stock_qty = (
-            (flt(so_values.stock_qty) or flt(so_values.qty) * conversion_factor)
-            - flt(so_values.delivered_qty) * conversion_factor
-        )
-        available_qty_to_reserve = max(
-            0, pending_stock_qty - get_base_reserved_qty(so_detail)
+            get_auto_reserve_available_qty,
+            floor_qty,
+            validate_length_for_so_reservation,
         )
 
+        # Point 1: length must be within SO length_size ± 2.
+        validate_length_for_so_reservation(
+            so_detail,
+            length,
+            sales_order=sales_order,
+            item_code=item_code,
+            batch_no=batch_no,
+        )
+
+        # Client-confirmed: Max Reserved = Total SO Qty + Over Reservation
+        # Allowance % from Stock Settings (e.g. 20% → up to 120% of SO total).
+        over_pct = flt(
+            frappe.db.get_single_value("Stock Settings", "over_reservation_allowance") or 0
+        )
+        available_qty_to_reserve = get_auto_reserve_available_qty(sales_order)
+
         if available_qty_to_reserve <= 0:
+            frappe.msgprint(
+                _(
+                    "Stock reservation skipped for {0}: Sales Order {1} has no "
+                    "remaining quantity within the Over Reservation Allowance "
+                    "(Stock Settings allowance: {2}%). "
+                    "Max reserved = Total SO Qty + allowance %."
+                ).format(
+                    frappe.bold(item_code),
+                    frappe.bold(sales_order),
+                    frappe.bold(over_pct),
+                ),
+                title=_("Reservation Skipped"),
+                indicator="orange",
+                alert=True,
+            )
             return
 
         # Always reserve transferred tonne qty (not pcs×length×item weight).
-        reserve_qty = flt(min(flt(qty), available_qty_to_reserve), 3)
+        requested_qty = flt(qty)
+        reserve_qty = floor_qty(min(requested_qty, available_qty_to_reserve), 3)
         if reserve_qty <= 0:
             return
 
@@ -613,9 +685,27 @@ class StockTransfer(Document):
         if physical_available_qty <= 0:
             return
 
-        reserve_qty = flt(min(reserve_qty, physical_available_qty), 3)
+        reserve_qty = floor_qty(min(reserve_qty, physical_available_qty), 3)
         if reserve_qty <= 0:
             return
+
+        if reserve_qty + 0.0005 < requested_qty:
+            frappe.msgprint(
+                _(
+                    "Stock reservation for {0} capped at {1} (requested {2}) on "
+                    "Sales Order {3}. Remaining room under Over Reservation "
+                    "Allowance ({4}% in Stock Settings) was only {1}."
+                ).format(
+                    frappe.bold(item_code),
+                    frappe.bold(reserve_qty),
+                    frappe.bold(requested_qty),
+                    frappe.bold(sales_order),
+                    frappe.bold(over_pct),
+                ),
+                title=_("Partial Reservation"),
+                indicator="orange",
+                alert=True,
+            )
 
         sre = frappe.new_doc("Stock Reservation Entry")
 

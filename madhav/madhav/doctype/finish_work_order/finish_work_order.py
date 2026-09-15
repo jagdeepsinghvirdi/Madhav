@@ -4,7 +4,7 @@
 import frappe
 from frappe.model.document import Document
 from frappe.utils import now, nowdate, nowtime
-from frappe.utils import flt
+from frappe.utils import flt, cint
 from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import get_available_qty_to_reserve
 
 class FinishWorkOrder(Document):
@@ -173,13 +173,15 @@ class FinishWorkOrder(Document):
         quality_required=False,
         from_voucher_type = None,
         from_voucher_no = None,
-        from_voucher_detail_no = None
+        from_voucher_detail_no = None,
+        length=None,
     ):
         from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
-            get_base_reserved_qty,
+            get_auto_reserve_available_qty,
             get_batch_available_qty,
             floor_qty,
             calc_proportional_pieces,
+            validate_length_for_so_reservation,
         )
 
         if not sales_order:
@@ -190,7 +192,25 @@ class FinishWorkOrder(Document):
                 message=f"Skipping stock reservation for {item_code} in WO {work_order} linked to SO {sales_order} because quality inspection is required."
             )
             return
-        if frappe.db.get_value("Work Order",work_order,"fg_warehouse") != warehouse:
+
+        # Point 4: reserve only when FWO target warehouse matches SO item warehouse.
+        so_warehouse = frappe.db.get_value(
+            "Sales Order Item", sales_order_item, "warehouse"
+        ) if sales_order_item else None
+        if not so_warehouse or so_warehouse != warehouse:
+            frappe.msgprint(
+                frappe._(
+                    "Stock reservation skipped for {0}: Finish Work Order target "
+                    "warehouse {1} does not match Sales Order warehouse {2}."
+                ).format(
+                    frappe.bold(item_code),
+                    frappe.bold(warehouse or "-"),
+                    frappe.bold(so_warehouse or "-"),
+                ),
+                title=frappe._("Reservation Skipped"),
+                indicator="orange",
+                alert=True,
+            )
             return
 
         # GET SO ITEM
@@ -211,28 +231,41 @@ class FinishWorkOrder(Document):
         item = so_items[0]
         so_detail = item.name
 
-        conversion_factor = flt(item.conversion_factor) or 1
-        delivered_stock_qty = flt(item.delivered_qty) * conversion_factor
-        pending_stock_qty = flt(item.stock_qty) - delivered_stock_qty
+        # Point 1: length must be within SO length_size ± 2.
+        validate_length_for_so_reservation(
+            so_detail,
+            length,
+            sales_order=sales_order,
+            item_code=item_code,
+            batch_no=batch_no,
+        )
 
-        # FWO is a BASE reservation source, never tolerance - capped at
-        # 100% of the SO line's pending stock qty (not 120%), and uses
-        # the same "already reserved" calc as BWRT so the two agree.
-        already_reserved_base_qty = get_base_reserved_qty(so_detail)
-        so_available_qty = max(0, floor_qty(pending_stock_qty - already_reserved_base_qty, 3))
+        # Client-confirmed: Max Reserved = Total SO Qty + Over Reservation
+        # Allowance % from Stock Settings (e.g. 20% → up to 120% of SO total).
+        over_pct = flt(
+            frappe.db.get_single_value("Stock Settings", "over_reservation_allowance") or 0
+        )
+        so_available_qty = get_auto_reserve_available_qty(sales_order)
 
         if so_available_qty <= 0:
-            frappe.log_error(
-                title="Stock Reservation Debug",
-                message=(
-                    f"SO: {sales_order}, Item: {item_code}, SO Item: {so_detail}, "
-                    f"Pending Stock Qty: {pending_stock_qty}, Already Reserved (base): "
-                    f"{already_reserved_base_qty}, Available: 0 - skipping FWO reservation."
+            frappe.msgprint(
+                frappe._(
+                    "Stock reservation skipped for {0}: Sales Order {1} has no "
+                    "remaining quantity within the Over Reservation Allowance "
+                    "(Stock Settings allowance: {2}%)."
+                ).format(
+                    frappe.bold(item_code),
+                    frappe.bold(sales_order),
+                    frappe.bold(over_pct),
                 ),
+                title=frappe._("Reservation Skipped"),
+                indicator="orange",
+                alert=True,
             )
             return
 
-        reserve_qty = min(flt(qty), so_available_qty)
+        requested_qty = flt(qty)
+        reserve_qty = min(requested_qty, so_available_qty)
 
         # BATCH / ITEM AVAILABILITY - warehouse-scoped, same helper as BWRT
         has_batch_no = frappe.get_cached_value("Item", item_code, "has_batch_no")
@@ -257,9 +290,27 @@ class FinishWorkOrder(Document):
             flt(reserve_qty),
             actual_available_qty,
         )
+        reserve_qty = floor_qty(reserve_qty, 3)
 
         if reserve_qty <= 0:
             return
+
+        if reserve_qty + 0.0005 < requested_qty:
+            frappe.msgprint(
+                frappe._(
+                    "Stock reservation for {0} capped at {1} (requested {2}) on "
+                    "Sales Order {3}. Over Reservation Allowance in Stock Settings is {4}%."
+                ).format(
+                    frappe.bold(item_code),
+                    frappe.bold(reserve_qty),
+                    frappe.bold(requested_qty),
+                    frappe.bold(sales_order),
+                    frappe.bold(over_pct),
+                ),
+                title=frappe._("Partial Reservation"),
+                indicator="orange",
+                alert=True,
+            )
 
         # CREATE STOCK RESERVATION ENTRY
         sre = frappe.new_doc("Stock Reservation Entry")
@@ -276,8 +327,11 @@ class FinishWorkOrder(Document):
         sre.from_voucher_no = from_voucher_no
         sre.from_voucher_detail_no = from_voucher_detail_no
 
-        # FWO reservations are always base, never tolerance - explicit flag.
-        sre.custom_is_tolerance = 0
+        # FWO books against the shared SO allowance (base + over-allowance).
+        # Overflow past the line's ordered qty is tracked as tolerance usage
+        # by get_remaining_tolerance_qty — same model as Stock Transfer.
+        if frappe.db.has_column("Stock Reservation Entry", "custom_is_tolerance"):
+            sre.custom_is_tolerance = 0
 
         sre.reserved_qty = reserve_qty
         sre.voucher_qty = flt(so_qty)
@@ -291,16 +345,15 @@ class FinishWorkOrder(Document):
             sre.reservation_based_on = "Serial and Batch"
             sre.use_serial_batch_fields = 1
 
+            entry_length = flt(length) or flt(
+                frappe.db.get_value("Batch", batch_no, "average_length") or 0
+            )
             sre.append("sb_entries", {
                 "batch_no": batch_no,
                 "qty": reserve_qty,
                 "warehouse": warehouse,
                 "pieces": calc_proportional_pieces(reserve_qty, batch_no),
-                "length": frappe.db.get_value(
-                    "Batch",
-                    batch_no,
-                    "average_length"
-                ) or 0,
+                "length": entry_length,
                 "section_weight": frappe.db.get_value(
                     "Batch",
                     batch_no,
@@ -324,7 +377,7 @@ class FinishWorkOrder(Document):
         if sre:
             frappe.log_error(
                 title="Stock Reserved",
-                message=f"Reserved {reserve_qty} of {item_code} in {warehouse} for SO {sales_order} (Batch: {batch_no}, tolerance: 0, source: FWO)"
+                message=f"Reserved {reserve_qty} of {item_code} in {warehouse} for SO {sales_order} (Batch: {batch_no}, source: FWO)"
             )
 
     def update_remarks_from_so(self):
@@ -391,6 +444,28 @@ class FinishWorkOrder(Document):
                 frappe.throw(
                     f"Row {pwo.idx}: Work Order is not set for item <b>{pwo.item}</b>."
                 )
+
+            # Validate length before manufacture SE when this FWO row will
+            # auto-reserve against the Sales Order (target WH = SO WH).
+            so_item = frappe.db.get_value(
+                "Work Order", pwo.work_order, "sales_order_item"
+            )
+            if (
+                pwo.sales_order
+                and so_item
+                and not cint(pwo.quality_required)
+            ):
+                so_wh = frappe.db.get_value("Sales Order Item", so_item, "warehouse")
+                if so_wh and pwo.target_warehouse == so_wh:
+                    from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
+                        validate_length_for_so_reservation,
+                    )
+                    validate_length_for_so_reservation(
+                        so_item,
+                        pwo.length_size,
+                        sales_order=pwo.sales_order,
+                        item_code=pwo.item,
+                    )
 
             try:
                 # ==============================
@@ -568,7 +643,8 @@ class FinishWorkOrder(Document):
                     "quality_required": pwo.quality_required,
                     "from_voucher_type": self.doctype,
                     "from_voucher_no": self.name,
-                    "from_voucher_detail_no": pwo.name
+                    "from_voucher_detail_no": pwo.name,
+                    "length": flt(pwo.length_size),
                 })
 
             except Exception as e:
@@ -621,7 +697,8 @@ class FinishWorkOrder(Document):
                 quality_required=data["quality_required"],
                 from_voucher_type=data["from_voucher_type"],
                 from_voucher_no=data["from_voucher_no"],
-                from_voucher_detail_no=data["from_voucher_detail_no"]
+                from_voucher_detail_no=data["from_voucher_detail_no"],
+                length=data.get("length"),
             )
 
 @frappe.whitelist()

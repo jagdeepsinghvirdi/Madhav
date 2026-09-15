@@ -33,8 +33,20 @@ def get_already_reserved_qty(sales_order_item):
 
 
 def get_already_reserved_pieces(sales_order_item):
+	# Tolerance flags may be missing until migrate/sync; don't break Get Items.
+	sbr_tolerance_filter = (
+		"and ifnull(sbr.is_tolerance, 0) = 0"
+		if frappe.db.has_column("Staged Batch Reservations Verification", "is_tolerance")
+		else ""
+	)
+	sre_tolerance_filter = (
+		"and ifnull(sre.custom_is_tolerance, 0) = 0"
+		if frappe.db.has_column("Stock Reservation Entry", "custom_is_tolerance")
+		else ""
+	)
+
 	rows = frappe.db.sql(
-		"""
+		f"""
 		select sbr.name, sbr.reserved_qty as staged_qty, sbr.reserved_pieces as staged_pieces,
 			sre.reserved_qty as actual_qty
 		from `tabStaged Batch Reservations Verification` sbr
@@ -43,9 +55,9 @@ def get_already_reserved_pieces(sales_order_item):
 			on sre.from_voucher_type = 'Batch Wise Reservation Tool'
 			and sre.from_voucher_detail_no = sbr.name
 			and sre.docstatus = 1
-			and ifnull(sre.custom_is_tolerance, 0) = 0
+			{sre_tolerance_filter}
 		where sbr.sales_order_item = %s and bwrt.docstatus = 1
-			and ifnull(sbr.is_tolerance, 0) = 0
+			{sbr_tolerance_filter}
 		""",
 		sales_order_item,
 		as_dict=True,

@@ -53,6 +53,8 @@ def get_used_tolerance_qty(sales_order, exclude_sre=None):
 	"""SO-wide tolerance already used, identified by custom_is_tolerance flag
 	(NOT warehouse). Delivered tolerance SREs still count as used - the
 	tolerance was already consumed, so we do NOT net delivered_qty here."""
+	if not frappe.db.has_column("Stock Reservation Entry", "custom_is_tolerance"):
+		return 0
 	return flt(
 		frappe.db.sql(
 			"""
@@ -76,6 +78,8 @@ def get_active_tolerance_qty(sales_order, exclude_sre=None):
 	tolerance stock is still committed but not yet shipped" - the figure
 	that belongs next to a pending quantity.
 	"""
+	if not frappe.db.has_column("Stock Reservation Entry", "custom_is_tolerance"):
+		return 0
 	return flt(
 		frappe.db.sql(
 			"""
@@ -94,13 +98,18 @@ def get_active_tolerance_qty(sales_order, exclude_sre=None):
 def get_base_reserved_qty(sales_order_item, exclude_sre=None):
 	"""Base (non-tolerance) qty already reserved against this SO line,
 	from ANY source, netted against each SRE's own delivered_qty."""
+	tolerance_filter = (
+		"and ifnull(custom_is_tolerance,0)=0"
+		if frappe.db.has_column("Stock Reservation Entry", "custom_is_tolerance")
+		else ""
+	)
 	return flt(
 		frappe.db.sql(
-			"""
+			f"""
 			select sum(reserved_qty - delivered_qty) from `tabStock Reservation Entry`
 			where voucher_type='Sales Order' and voucher_detail_no=%(sod)s
 				and docstatus=1
-				and ifnull(custom_is_tolerance,0)=0
+				{tolerance_filter}
 				and (%(exclude)s is null or name != %(exclude)s)
 			""",
 			{"sod": sales_order_item, "exclude": exclude_sre},
@@ -112,13 +121,18 @@ def get_base_reserved_qty(sales_order_item, exclude_sre=None):
 def get_so_base_reserved_qty(sales_order, exclude_sre=None):
 	"""SO-wide base (non-tolerance) reserved qty, same definition as
 	get_base_reserved_qty() but for every line of the Sales Order."""
+	tolerance_filter = (
+		"and ifnull(custom_is_tolerance,0)=0"
+		if frappe.db.has_column("Stock Reservation Entry", "custom_is_tolerance")
+		else ""
+	)
 	return flt(
 		frappe.db.sql(
-			"""
+			f"""
 			select sum(reserved_qty - delivered_qty) from `tabStock Reservation Entry`
 			where voucher_type='Sales Order' and voucher_no=%(so)s
 				and docstatus=1
-				and ifnull(custom_is_tolerance,0)=0
+				{tolerance_filter}
 				and (%(exclude)s is null or name != %(exclude)s)
 			""",
 			{"so": sales_order, "exclude": exclude_sre},
@@ -194,12 +208,12 @@ def get_remaining_tolerance_qty(sales_order, exclude_sre=None, already_staged_to
 	)
 	reserved_by_line = dict(
 		frappe.db.sql(
-			"""
+			f"""
 			select voucher_detail_no, sum(reserved_qty)
 			from `tabStock Reservation Entry`
 			where voucher_type='Sales Order' and voucher_no=%(so)s
 				and docstatus=1
-				and ifnull(custom_is_tolerance,0)=0
+				{"and ifnull(custom_is_tolerance,0)=0" if frappe.db.has_column("Stock Reservation Entry", "custom_is_tolerance") else ""}
 				and (%(exclude)s is null or name != %(exclude)s)
 			group by voucher_detail_no
 			""",
@@ -329,6 +343,132 @@ def get_so_line_allowance(
 	))
 
 	return max(0, floor_qty(min(line_remaining + tolerance_remaining, so_remaining), 3))
+
+
+# Sales Order length window used by Finish Work Order / Stock Transfer
+# auto-reservation (±2 on Sales Order Item.length_size).
+SO_LENGTH_TOLERANCE = 2
+
+
+def get_so_length_window(sales_order_item):
+	"""Return (min_length, max_length, so_length) for SO-line reservation checks.
+
+	When the Sales Order line has no length_size, returns (None, None, 0) so
+	callers can skip the check rather than block reservation.
+	"""
+	if not sales_order_item or not frappe.db.has_column("Sales Order Item", "length_size"):
+		return None, None, 0
+
+	so_length = flt(frappe.db.get_value("Sales Order Item", sales_order_item, "length_size") or 0)
+	if so_length <= 0:
+		return None, None, 0
+
+	return (
+		so_length - SO_LENGTH_TOLERANCE,
+		so_length + SO_LENGTH_TOLERANCE,
+		so_length,
+	)
+
+
+def resolve_reservation_length(length=None, batch_no=None):
+	"""Prefer the explicit row length, else Batch.average_length."""
+	resolved = flt(length)
+	if resolved > 0:
+		return resolved
+	if batch_no:
+		return flt(frappe.db.get_value("Batch", batch_no, "average_length") or 0)
+	return 0
+
+
+def validate_length_for_so_reservation(
+	sales_order_item,
+	length,
+	sales_order=None,
+	item_code=None,
+	batch_no=None,
+):
+	"""Block SO reservation when length is outside Sales Order length ±2.
+
+	Throws a clear ValidationError so Stock Transfer / FWO submit cannot
+	silently reserve the wrong length against the Sales Order.
+	"""
+	min_length, max_length, so_length = get_so_length_window(sales_order_item)
+	if min_length is None:
+		return
+
+	resolved_length = resolve_reservation_length(length=length, batch_no=batch_no)
+	if resolved_length <= 0:
+		frappe.throw(
+			frappe._(
+				"Cannot reserve against Sales Order {0}: length is missing for item {1}. "
+				"Sales Order length is {2} (allowed {3} to {4})."
+			).format(
+				frappe.bold(sales_order or ""),
+				frappe.bold(item_code or ""),
+				frappe.bold(so_length),
+				frappe.bold(min_length),
+				frappe.bold(max_length),
+			)
+		)
+
+	if resolved_length < min_length or resolved_length > max_length:
+		frappe.throw(
+			frappe._(
+				"Cannot reserve against Sales Order {0}: length {1} for item {2} "
+				"is outside the allowed range {3} to {4} "
+				"(Sales Order length {5} ± {6})."
+			).format(
+				frappe.bold(sales_order or ""),
+				frappe.bold(resolved_length),
+				frappe.bold(item_code or ""),
+				frappe.bold(min_length),
+				frappe.bold(max_length),
+				frappe.bold(so_length),
+				frappe.bold(SO_LENGTH_TOLERANCE),
+			)
+		)
+
+
+def get_auto_reserve_available_qty(sales_order, exclude_sre=None):
+	"""Qty still available for FWO / Stock Transfer auto-reservation.
+
+	Client-confirmed Stock Settings rule:
+
+		Maximum Total Reserved Qty
+		  = Total Sales Order Quantity
+		    + Over Reservation Allowance %
+		  = so_total × (1 + Stock Settings.over_reservation_allowance / 100)
+
+	Example (allowance = 20%): SO total 100 → max reserved 120.
+
+	Whatever value is configured under Stock Settings → Stock Reservation →
+	Over Reservation Allowance is applied. Already-reserved qty against the
+	Sales Order (all sources, net of delivered) is subtracted so the cap
+	cannot be exceeded.
+	"""
+	if not sales_order:
+		return 0
+
+	over_pct = flt(
+		frappe.db.get_single_value("Stock Settings", "over_reservation_allowance") or 0
+	)
+	so_total = get_so_total_qty(sales_order)
+	# Total SO Qty + configured Over Reservation Allowance %
+	max_reserved_qty = floor_qty(so_total * (1 + over_pct / 100), 3)
+	already_reserved = flt(
+		frappe.db.sql(
+			"""
+			select coalesce(sum(reserved_qty - ifnull(delivered_qty, 0)), 0)
+			from `tabStock Reservation Entry`
+			where voucher_type = 'Sales Order'
+				and voucher_no = %s
+				and docstatus = 1
+				and (%s is null or name != %s)
+			""",
+			(sales_order, exclude_sre, exclude_sre),
+		)[0][0]
+	)
+	return max(0, floor_qty(max_reserved_qty - already_reserved, 3))
 
 
 def get_reservation_ceiling(
@@ -514,7 +654,8 @@ class BatchWiseReservationTool(Document):
 		sre.from_voucher_type = from_voucher_type
 		sre.from_voucher_no = from_voucher_no
 		sre.from_voucher_detail_no = from_voucher_detail_no
-		sre.custom_is_tolerance = is_tolerance
+		if frappe.db.has_column("Stock Reservation Entry", "custom_is_tolerance"):
+			sre.custom_is_tolerance = is_tolerance
 		sre.reserved_qty = flt(reserve_qty, 3)
 		sre.voucher_qty = flt(so_qty, 3)
 		sre.available_qty = flt(limits.allowed_qty, 3)
@@ -801,19 +942,47 @@ def fetch_available_batches(item_code, warehouse, pending_qty=0, reserve_qty=0):
 
 @frappe.whitelist()
 def get_reserved_batches(docname):
+	# Never SELECT custom_is_tolerance via get_all — the Custom Field can exist
+	# in meta while the DB column is still missing on some sites, which makes
+	# has_column/meta disagree and crash this API. Load core fields only, then
+	# optionally read the flag with a guarded SQL.
 	stock_reservation_entries = frappe.get_all(
 		"Stock Reservation Entry",
-		filters={"from_voucher_type": "Batch Wise Reservation Tool", "from_voucher_no": docname, "docstatus": 1},
-		fields=["name", "item_code", "warehouse", "voucher_type", "voucher_no", "voucher_detail_no",
-				"reserved_qty", "status", "custom_is_tolerance"],
+		filters={
+			"from_voucher_type": "Batch Wise Reservation Tool",
+			"from_voucher_no": docname,
+			"docstatus": 1,
+		},
+		fields=[
+			"name", "item_code", "warehouse", "voucher_type", "voucher_no",
+			"voucher_detail_no", "reserved_qty", "status",
+		],
 		order_by="creation asc",
 	)
+
+	tolerance_by_name = {}
+	if stock_reservation_entries and frappe.db.has_column(
+		"Stock Reservation Entry", "custom_is_tolerance"
+	):
+		names = [sre.name for sre in stock_reservation_entries]
+		tolerance_by_name = dict(
+			frappe.db.sql(
+				"""
+				select name, ifnull(custom_is_tolerance, 0)
+				from `tabStock Reservation Entry`
+				where name in ({})
+				""".format(", ".join(["%s"] * len(names))),
+				names,
+			)
+		)
 
 	reserved_batches = []
 	for sre in stock_reservation_entries:
 		sb_entries = frappe.get_all(
-			"Serial and Batch Entry", filters={"parent": sre.name, "parenttype": "Stock Reservation Entry"},
-			fields=["batch_no", "qty", "warehouse"], order_by="idx asc",
+			"Serial and Batch Entry",
+			filters={"parent": sre.name, "parenttype": "Stock Reservation Entry"},
+			fields=["batch_no", "qty", "warehouse"],
+			order_by="idx asc",
 		)
 		for sb in sb_entries:
 			reserved_batches.append({
@@ -823,7 +992,7 @@ def get_reserved_batches(docname):
 				"reserved_qty": sb.qty,
 				"warehouse": sb.warehouse or sre.warehouse,
 				"status": sre.status,
-				"is_tolerance": cint(sre.custom_is_tolerance),
+				"is_tolerance": cint(tolerance_by_name.get(sre.name, 0)),
 			})
 
 	return reserved_batches
