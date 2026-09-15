@@ -654,7 +654,8 @@ class BatchWiseReservationTool(Document):
 		sre.from_voucher_type = from_voucher_type
 		sre.from_voucher_no = from_voucher_no
 		sre.from_voucher_detail_no = from_voucher_detail_no
-		sre.custom_is_tolerance = is_tolerance
+		if frappe.db.has_column("Stock Reservation Entry", "custom_is_tolerance"):
+			sre.custom_is_tolerance = is_tolerance
 		sre.reserved_qty = flt(reserve_qty, 3)
 		sre.voucher_qty = flt(so_qty, 3)
 		sre.available_qty = flt(limits.allowed_qty, 3)
@@ -941,19 +942,47 @@ def fetch_available_batches(item_code, warehouse, pending_qty=0, reserve_qty=0):
 
 @frappe.whitelist()
 def get_reserved_batches(docname):
+	# Never SELECT custom_is_tolerance via get_all — the Custom Field can exist
+	# in meta while the DB column is still missing on some sites, which makes
+	# has_column/meta disagree and crash this API. Load core fields only, then
+	# optionally read the flag with a guarded SQL.
 	stock_reservation_entries = frappe.get_all(
 		"Stock Reservation Entry",
-		filters={"from_voucher_type": "Batch Wise Reservation Tool", "from_voucher_no": docname, "docstatus": 1},
-		fields=["name", "item_code", "warehouse", "voucher_type", "voucher_no", "voucher_detail_no",
-				"reserved_qty", "status", "custom_is_tolerance"],
+		filters={
+			"from_voucher_type": "Batch Wise Reservation Tool",
+			"from_voucher_no": docname,
+			"docstatus": 1,
+		},
+		fields=[
+			"name", "item_code", "warehouse", "voucher_type", "voucher_no",
+			"voucher_detail_no", "reserved_qty", "status",
+		],
 		order_by="creation asc",
 	)
+
+	tolerance_by_name = {}
+	if stock_reservation_entries and frappe.db.has_column(
+		"Stock Reservation Entry", "custom_is_tolerance"
+	):
+		names = [sre.name for sre in stock_reservation_entries]
+		tolerance_by_name = dict(
+			frappe.db.sql(
+				"""
+				select name, ifnull(custom_is_tolerance, 0)
+				from `tabStock Reservation Entry`
+				where name in ({})
+				""".format(", ".join(["%s"] * len(names))),
+				names,
+			)
+		)
 
 	reserved_batches = []
 	for sre in stock_reservation_entries:
 		sb_entries = frappe.get_all(
-			"Serial and Batch Entry", filters={"parent": sre.name, "parenttype": "Stock Reservation Entry"},
-			fields=["batch_no", "qty", "warehouse"], order_by="idx asc",
+			"Serial and Batch Entry",
+			filters={"parent": sre.name, "parenttype": "Stock Reservation Entry"},
+			fields=["batch_no", "qty", "warehouse"],
+			order_by="idx asc",
 		)
 		for sb in sb_entries:
 			reserved_batches.append({
@@ -963,7 +992,7 @@ def get_reserved_batches(docname):
 				"reserved_qty": sb.qty,
 				"warehouse": sb.warehouse or sre.warehouse,
 				"status": sre.status,
-				"is_tolerance": cint(sre.custom_is_tolerance),
+				"is_tolerance": cint(tolerance_by_name.get(sre.name, 0)),
 			})
 
 	return reserved_batches

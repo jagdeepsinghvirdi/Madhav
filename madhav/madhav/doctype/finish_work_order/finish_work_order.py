@@ -242,6 +242,9 @@ class FinishWorkOrder(Document):
 
         # Client-confirmed: Max Reserved = Total SO Qty + Over Reservation
         # Allowance % from Stock Settings (e.g. 20% → up to 120% of SO total).
+        over_pct = flt(
+            frappe.db.get_single_value("Stock Settings", "over_reservation_allowance") or 0
+        )
         so_available_qty = get_auto_reserve_available_qty(sales_order)
 
         if so_available_qty <= 0:
@@ -249,15 +252,20 @@ class FinishWorkOrder(Document):
                 frappe._(
                     "Stock reservation skipped for {0}: Sales Order {1} has no "
                     "remaining quantity within the Over Reservation Allowance "
-                    "(max reserved = Total SO Qty + configured allowance %)."
-                ).format(frappe.bold(item_code), frappe.bold(sales_order)),
+                    "(Stock Settings allowance: {2}%)."
+                ).format(
+                    frappe.bold(item_code),
+                    frappe.bold(sales_order),
+                    frappe.bold(over_pct),
+                ),
                 title=frappe._("Reservation Skipped"),
                 indicator="orange",
                 alert=True,
             )
             return
 
-        reserve_qty = min(flt(qty), so_available_qty)
+        requested_qty = flt(qty)
+        reserve_qty = min(requested_qty, so_available_qty)
 
         # BATCH / ITEM AVAILABILITY - warehouse-scoped, same helper as BWRT
         has_batch_no = frappe.get_cached_value("Item", item_code, "has_batch_no")
@@ -287,6 +295,23 @@ class FinishWorkOrder(Document):
         if reserve_qty <= 0:
             return
 
+        if reserve_qty + 0.0005 < requested_qty:
+            frappe.msgprint(
+                frappe._(
+                    "Stock reservation for {0} capped at {1} (requested {2}) on "
+                    "Sales Order {3}. Over Reservation Allowance in Stock Settings is {4}%."
+                ).format(
+                    frappe.bold(item_code),
+                    frappe.bold(reserve_qty),
+                    frappe.bold(requested_qty),
+                    frappe.bold(sales_order),
+                    frappe.bold(over_pct),
+                ),
+                title=frappe._("Partial Reservation"),
+                indicator="orange",
+                alert=True,
+            )
+
         # CREATE STOCK RESERVATION ENTRY
         sre = frappe.new_doc("Stock Reservation Entry")
 
@@ -305,7 +330,8 @@ class FinishWorkOrder(Document):
         # FWO books against the shared SO allowance (base + over-allowance).
         # Overflow past the line's ordered qty is tracked as tolerance usage
         # by get_remaining_tolerance_qty — same model as Stock Transfer.
-        sre.custom_is_tolerance = 0
+        if frappe.db.has_column("Stock Reservation Entry", "custom_is_tolerance"):
+            sre.custom_is_tolerance = 0
 
         sre.reserved_qty = reserve_qty
         sre.voucher_qty = flt(so_qty)

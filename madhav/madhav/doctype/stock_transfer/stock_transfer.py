@@ -642,6 +642,9 @@ class StockTransfer(Document):
 
         # Client-confirmed: Max Reserved = Total SO Qty + Over Reservation
         # Allowance % from Stock Settings (e.g. 20% → up to 120% of SO total).
+        over_pct = flt(
+            frappe.db.get_single_value("Stock Settings", "over_reservation_allowance") or 0
+        )
         available_qty_to_reserve = get_auto_reserve_available_qty(sales_order)
 
         if available_qty_to_reserve <= 0:
@@ -649,8 +652,13 @@ class StockTransfer(Document):
                 _(
                     "Stock reservation skipped for {0}: Sales Order {1} has no "
                     "remaining quantity within the Over Reservation Allowance "
-                    "(max reserved = Total SO Qty + configured allowance %)."
-                ).format(frappe.bold(item_code), frappe.bold(sales_order)),
+                    "(Stock Settings allowance: {2}%). "
+                    "Max reserved = Total SO Qty + allowance %."
+                ).format(
+                    frappe.bold(item_code),
+                    frappe.bold(sales_order),
+                    frappe.bold(over_pct),
+                ),
                 title=_("Reservation Skipped"),
                 indicator="orange",
                 alert=True,
@@ -658,7 +666,8 @@ class StockTransfer(Document):
             return
 
         # Always reserve transferred tonne qty (not pcs×length×item weight).
-        reserve_qty = floor_qty(min(flt(qty), available_qty_to_reserve), 3)
+        requested_qty = flt(qty)
+        reserve_qty = floor_qty(min(requested_qty, available_qty_to_reserve), 3)
         if reserve_qty <= 0:
             return
 
@@ -679,6 +688,24 @@ class StockTransfer(Document):
         reserve_qty = floor_qty(min(reserve_qty, physical_available_qty), 3)
         if reserve_qty <= 0:
             return
+
+        if reserve_qty + 0.0005 < requested_qty:
+            frappe.msgprint(
+                _(
+                    "Stock reservation for {0} capped at {1} (requested {2}) on "
+                    "Sales Order {3}. Remaining room under Over Reservation "
+                    "Allowance ({4}% in Stock Settings) was only {1}."
+                ).format(
+                    frappe.bold(item_code),
+                    frappe.bold(reserve_qty),
+                    frappe.bold(requested_qty),
+                    frappe.bold(sales_order),
+                    frappe.bold(over_pct),
+                ),
+                title=_("Partial Reservation"),
+                indicator="orange",
+                alert=True,
+            )
 
         sre = frappe.new_doc("Stock Reservation Entry")
 
