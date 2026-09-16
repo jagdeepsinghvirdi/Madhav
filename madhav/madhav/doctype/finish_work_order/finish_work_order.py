@@ -60,6 +60,16 @@ class FinishWorkOrder(Document):
     def validate(self):
         self.update_totals()
         for row in self.raw_materials:
+            if not row.item_code:
+                continue
+            if flt(row.qty) <= 0:
+                frappe.throw(
+                    frappe._(
+                        "Row #{0}: Quantity for Raw Material {1} cannot be zero. "
+                        "Enter the qty to consume (BOM fetch / batch selection must leave a positive qty)."
+                    ).format(row.idx, frappe.bold(row.item_code)),
+                    title=frappe._("Invalid Raw Material Qty"),
+                )
             has_batch_no = frappe.get_cached_value("Item", row.item_code, "has_batch_no")
             if has_batch_no and not row.batch_no:
                 frappe.throw(
@@ -67,6 +77,21 @@ class FinishWorkOrder(Document):
                         row.idx, row.item_code
                     )
                 )
+            if row.batch_no:
+                batch_item = frappe.db.get_value("Batch", row.batch_no, "item")
+                if batch_item and batch_item != row.item_code:
+                    frappe.throw(
+                        frappe._(
+                            "Row #{0}: Batch {1} belongs to Item {2}, not {3}. "
+                            "Use the same item code as on the batch, or pick a batch for {3}."
+                        ).format(
+                            row.idx,
+                            frappe.bold(row.batch_no),
+                            frappe.bold(batch_item),
+                            frappe.bold(row.item_code),
+                        ),
+                        title=frappe._("Batch / Item Mismatch"),
+                    )
         for row in self.pending_work_orders:
             if row.ready_qty and row.ready_pieces and row.length_size:
                 row.calculated_section_weight = (flt(row.ready_qty) * 1000)/(flt(row.ready_pieces) * flt(row.length_size))
@@ -402,14 +427,24 @@ class FinishWorkOrder(Document):
                 rm_pool.append({
                     "item_code": rm.item_code,
                     "warehouse": rm.source_warehouse,
-                    "remaining_qty": rm.qty,
+                    "remaining_qty": flt(rm.qty),
+                    "original_qty": flt(rm.qty),
                     "batch_no": rm.batch_no,
-                    "pieces": rm.pieces,
+                    "pieces": flt(rm.pieces),
                     "length": rm.length,
                     "section_weight": rm.section_weight,
-                    "cost_center": self.cost_center,  # ✅ FIXED: Removed extra colon
+                    "cost_center": self.cost_center,
                     "branch": self.branch
                 })
+
+        if self.raw_materials and not rm_pool:
+            frappe.throw(
+                frappe._(
+                    "Raw Materials rows exist but all have qty 0. "
+                    "Enter a positive qty for each raw material before submit."
+                ),
+                title=frappe._("Invalid Raw Material Qty"),
+            )
 
         rm_index = 0
 
@@ -471,11 +506,18 @@ class FinishWorkOrder(Document):
                 # ==============================
                 # CREATE STOCK ENTRY
                 # ==============================
+                # from_bom must stay 0: FWO already builds RM + FG rows from the
+                # Raw Materials table. from_bom=1 with site backflush =
+                # "Material Transferred for Manufacture" can pull/merge WO
+                # component rows (often qty 0) and surface as
+                # "Quantity for Item RMxxxx cannot be zero".
+                # CustomStockEntry keeps fg_completed_qty in sync when
+                # from_bom=0 so submit does not see For Quantity 0.0.
                 se = frappe.new_doc("Stock Entry")
                 se.stock_entry_type = "Manufacture"
                 se.company = self.company
                 se.work_order = pwo.work_order
-                se.from_bom = 1
+                se.from_bom = 0
                 se.finished_good = pwo.item
                 se.fg_completed_qty = pwo.ready_qty if pwo.deliver_as_qty else pwo.calculated_qty
                 se.finished_good_quantity = pwo.ready_qty if pwo.deliver_as_qty else pwo.calculated_qty
@@ -504,23 +546,53 @@ class FinishWorkOrder(Document):
 
                     consume = flt(min(remaining_fg_qty, rm_row["remaining_qty"]), precision)
 
+                    # Precision can round a dust remainder to 0; never post a
+                    # zero-qty Stock Entry row (ERPNext Invalid Quantity).
+                    if consume <= 0:
+                        if rm_row["remaining_qty"] <= 0.0001:
+                            rm_row["remaining_qty"] = 0
+                            rm_index += 1
+                            continue
+                        frappe.throw(
+                            frappe._(
+                                "Row {0}: Cannot consume Raw Material {1} — "
+                                "computed qty rounds to zero. Check Raw Material qty "
+                                "and Work Order ready qty."
+                            ).format(pwo.idx, frappe.bold(rm_row["item_code"]))
+                        )
+
                     is_last = consume >= rm_row["remaining_qty"] - 0.0001
+                    original_qty = flt(rm_row.get("original_qty") or 0)
+                    if is_last:
+                        piece_qty = flt(rm_row.get("pieces") or 0)
+                        avg_len = flt(rm_row.get("length") or 0)
+                    elif original_qty > 0 and flt(rm_row.get("pieces") or 0) > 0:
+                        piece_qty = max(
+                            0,
+                            int(round(flt(rm_row["pieces"]) * (consume / original_qty))),
+                        )
+                        avg_len = flt(rm_row.get("length") or 0)
+                    else:
+                        piece_qty = 0
+                        avg_len = flt(rm_row.get("length") or 0)
 
                     se.append("items", {
                         "item_code": rm_row["item_code"],
                         "s_warehouse": rm_row["warehouse"],
                         "qty": consume,
-                        "pieces": rm_row["pieces"] if is_last else 0,
-                        "average_length": rm_row["length"] if is_last else 0,
+                        "pieces": piece_qty,
+                        "average_length": avg_len,
                         "section_weight": rm_row["section_weight"],
                         "batch_no": rm_row["batch_no"],
                         "required_stock_in_pieces": 0,
                         "use_serial_batch_fields": 1,
-                        "cost_center": rm_row["cost_center"],  # ✅ FIXED: Removed extra colon
+                        "cost_center": rm_row["cost_center"],
                         "branch": rm_row["branch"]
                     })
 
                     rm_row["remaining_qty"] -= consume
+                    if piece_qty and flt(rm_row.get("pieces") or 0) > 0:
+                        rm_row["pieces"] = max(0, flt(rm_row["pieces"]) - piece_qty)
                     remaining_fg_qty -= consume
 
                     if rm_row["remaining_qty"] <= 0.0001:
@@ -545,6 +617,12 @@ class FinishWorkOrder(Document):
                         continue
 
                     consume_scrap = flt(min(remaining_scrap, sc_row["remaining_qty"]), precision)
+                    if consume_scrap <= 0:
+                        if sc_row["remaining_qty"] <= 0.0001:
+                            sc_row["remaining_qty"] = 0
+                            scrap_index += 1
+                            continue
+                        break
 
                     se.append("items", {
                         "item_code": sc_row["item_code"],
@@ -570,6 +648,13 @@ class FinishWorkOrder(Document):
                 fg_final_qty = round(
                     pwo.ready_qty if pwo.deliver_as_qty == 1 else pwo.calculated_qty, 3
                 )
+                if fg_final_qty <= 0:
+                    frappe.throw(
+                        frappe._(
+                            "Row {0}: Finished qty is zero for item {1}. "
+                            "Set Actual Ready Qty / Ready Pieces before submit."
+                        ).format(pwo.idx, frappe.bold(pwo.item))
+                    )
 
                 se.append("items", {
                     "item_code": pwo.item,
@@ -587,8 +672,26 @@ class FinishWorkOrder(Document):
 
                 se.fg_completed_qty = fg_final_qty
 
+                # Final guard: never hand ERPNext a zero-qty row (its message
+                # hides which FWO RM line caused it).
+                for row in list(se.items):
+                    if flt(row.qty) <= 0:
+                        frappe.throw(
+                            frappe._(
+                                "Work Order {0}: Stock Entry row for item {1} has "
+                                "qty 0. Fix Raw Materials qty/batch (item must match "
+                                "batch item) and try again."
+                            ).format(frappe.bold(pwo.work_order), frappe.bold(row.item_code))
+                        )
+
                 # Submit Stock Entry
+                # from_bom=0 makes ERPNext clear fg_completed_qty during
+                # insert validate; restore before submit so For Quantity
+                # still matches the finished row (7.56 vs 0.0 error).
                 se.insert()
+                se.fg_completed_qty = fg_final_qty
+                if hasattr(se, "finished_good_quantity"):
+                    se.finished_good_quantity = fg_final_qty
                 se.submit()
                 pwo.db_set("stock_entry_reference", se.name)
                 
@@ -625,6 +728,40 @@ class FinishWorkOrder(Document):
                                 )
                         
                         break  # Stop after finding the finished item
+
+                # Stamp Length / Section Weight onto Batch — auto-created
+                # batches otherwise stay at 0 and Stock Transfer Fetch
+                # Details shows blank Length / Section Weight.
+                if fg_batch_no:
+                    batch_updates = {}
+                    if flt(pwo.length_size):
+                        batch_updates["average_length"] = flt(pwo.length_size)
+                    sw = flt(getattr(pwo, "calculated_section_weight", 0)) or flt(
+                        pwo.standard_weight
+                    )
+                    if sw:
+                        batch_updates["section_weight"] = sw
+                    if batch_updates:
+                        # Only fill blanks — never wipe an existing Length Size.
+                        cur = frappe.db.get_value(
+                            "Batch",
+                            fg_batch_no,
+                            ["average_length", "section_weight"],
+                            as_dict=True,
+                        ) or {}
+                        final = {}
+                        if batch_updates.get("average_length") and not flt(
+                            cur.get("average_length")
+                        ):
+                            final["average_length"] = batch_updates["average_length"]
+                        if batch_updates.get("section_weight") and not flt(
+                            cur.get("section_weight")
+                        ):
+                            final["section_weight"] = batch_updates["section_weight"]
+                        if final:
+                            frappe.db.set_value(
+                                "Batch", fg_batch_no, final, update_modified=False
+                            )
 
                 # ==============================
                 # QUEUE STOCK RESERVATION DATA
@@ -737,6 +874,7 @@ def get_available_batches(doctype, txt, searchfield, start, page_len, filters):
         INNER JOIN
             `tabBatch` b
             ON b.name = sbe.batch_no
+            AND b.item = %(item_code)s
 
         LEFT JOIN
             `tabPurchase Receipt` pr

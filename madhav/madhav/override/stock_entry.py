@@ -13,9 +13,28 @@ from frappe.utils import (
 	nowdate,
 )
 class CustomStockEntry(_StockEntry):
+    def validate(self):
+        # FWO builds Manufacture SE with from_bom=0 (to avoid BOM backflush
+        # injecting zero-qty RM rows). Core ERPNext then clears
+        # fg_completed_qty when from_bom is 0 — after insert that leaves
+        # For Quantity at 0, so submit fails with:
+        # "finished product qty X and For Quantity 0.0 cannot be different".
+        self._restore_fg_completed_qty_for_manual_manufacture()
+        super().validate()
+        self._restore_fg_completed_qty_for_manual_manufacture()
+
+    def _restore_fg_completed_qty_for_manual_manufacture(self):
+        if self.purpose != "Manufacture" or cint(self.from_bom):
+            return
+        fg_qty = sum(
+            flt(d.qty) for d in (self.get("items") or []) if cint(d.is_finished_item)
+        )
+        if fg_qty:
+            self.fg_completed_qty = fg_qty
+
     def validate_work_order(self):
         if self.purpose in (
-            "Manufacture"
+            "Manufacture",
             "Material Transfer for Manufacture",
             "Material Consumption for Manufacture",
             "Disassemble",

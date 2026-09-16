@@ -213,6 +213,7 @@ def calculate_multiple_repack_valuation(doc):
 
 def after_submit(doc,method):
     set_custom_supplier_from_batch(doc)
+    stamp_batch_dimensions_from_stock_entry(doc)
 
     if doc.stock_entry_type == "Material Receipt":
         create_batch_group(doc)
@@ -220,6 +221,55 @@ def after_submit(doc,method):
     if doc.stock_entry_type == "Material Transfer" and doc.get('cutting_plan_reference'):
         update_cutting_plan_workflow(doc.cutting_plan_reference, doc.name)
         update_source_warehouse(doc.cutting_plan_reference, doc.name)
+
+
+def stamp_batch_dimensions_from_stock_entry(doc):
+	"""Copy Length / Section Weight from Stock Entry rows onto Batch master.
+
+	ERPNext auto-creates the Batch on Manufacture submit but does not copy
+	custom average_length / section_weight. Stock Transfer Fetch Details reads
+	those Batch fields — if they stay 0, Length/Section Weight never appear.
+	Only fills blank Batch values so an already-set Length Size is not wiped.
+	"""
+	if not doc or doc.purpose not in ("Manufacture", "Repack", "Material Receipt"):
+		return
+
+	for item in doc.items:
+		length = flt(item.get("average_length"))
+		section_weight = flt(item.get("section_weight"))
+		if not length and not section_weight:
+			continue
+
+		batch_nos = set()
+		if item.get("batch_no"):
+			batch_nos.add(item.batch_no)
+		if item.get("serial_and_batch_bundle"):
+			batch_nos.update(
+				frappe.get_all(
+					"Serial and Batch Entry",
+					filters={
+						"parent": item.serial_and_batch_bundle,
+						"parenttype": "Serial and Batch Bundle",
+					},
+					pluck="batch_no",
+				)
+			)
+		batch_nos.discard(None)
+		batch_nos.discard("")
+
+		for batch_no in batch_nos:
+			cur = frappe.db.get_value(
+				"Batch", batch_no, ["average_length", "section_weight"], as_dict=True
+			)
+			if not cur:
+				continue
+			updates = {}
+			if length and not flt(cur.average_length):
+				updates["average_length"] = length
+			if section_weight and not flt(cur.section_weight):
+				updates["section_weight"] = section_weight
+			if updates:
+				frappe.db.set_value("Batch", batch_no, updates, update_modified=False)
         
 def create_batch_group(doc):
     # Find all batches linked to this PR

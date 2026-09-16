@@ -495,8 +495,21 @@ function fetch_batch_qty(frm, cdt, cdn) {
                 item_code: row.item_code
             },
             callback: function(r) {
-                if (r.message) {
-                    frappe.model.set_value(cdt, cdn, 'qty', r.message);
+                let available = flt(r.message);
+                // Only fill qty when empty — never overwrite BOM/required qty
+                // with full batch stock, and never overwrite with 0 (that
+                // produced Manufacture SE "qty cannot be zero" on FWO submit).
+                if (available > 0 && !flt(row.qty)) {
+                    frappe.model.set_value(cdt, cdn, 'qty', available);
+                } else if (available <= 0) {
+                    frappe.msgprint({
+                        title: __('No Batch Stock'),
+                        indicator: 'orange',
+                        message: __(
+                            'Batch {0} has 0 qty for item {1} in {2}. Keep a positive Raw Material qty, or pick another batch that matches this item.',
+                            [row.batch_no, row.item_code, row.source_warehouse]
+                        )
+                    });
                 }
             }
         });

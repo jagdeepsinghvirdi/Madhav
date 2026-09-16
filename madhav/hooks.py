@@ -327,6 +327,13 @@ sre.get_sre_reserved_qty_for_items_and_warehouses = custom_func
 # from madhav.madhav.monkey_patch.selling_controller import update_stock_ledger
 # SellingController.update_stock_ledger = update_stock_ledger
 
+from erpnext.controllers.selling_controller import SellingController
+from madhav.madhav.monkey_patch.selling_controller import (
+	update_stock_reservation_entries as madhav_update_stock_reservation_entries,
+)
+
+SellingController.update_stock_reservation_entries = madhav_update_stock_reservation_entries
+
 # from erpnext.controllers.selling_controller import SellingController
 # from madhav.madhav.monkey_patch.selling_controller import get_sle_for_source_warehouse
 # SellingController.get_sle_for_source_warehouse = get_sle_for_source_warehouse
