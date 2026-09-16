@@ -651,7 +651,16 @@ def get_batch_available_pieces(item_code, warehouse, batch_no):
     pieces another batch was holding. Legacy rows written before PSLE
     carried batch_no are still matched through a single-batch bundle, the
     same way recalculate_batch_pieces() does it.
+
+    Batch-voucher baselines that duplicate legacy null-batch history are
+    ignored here too (see stock_ledger_entry._cancel_duplicate_baselines…).
     """
+    from madhav.doc_events.stock_ledger_entry import (
+        _cancel_duplicate_baselines_when_legacy_exists,
+    )
+
+    _cancel_duplicate_baselines_when_legacy_exists(batch_no)
+
     result = frappe.db.sql(
         """
         SELECT SUM(psle.actual_qty) as total_pieces
@@ -1062,6 +1071,58 @@ def _has_live_batch_ledger(item_code, warehouse, batch_no):
     ))
 
 
+def _batches_touched_by_delivery_note(doc):
+    """Batches this DN moved — including after cancel clears row SABB/batch_no.
+
+    On cancel, ERPNext blanks Delivery Note Item.batch_no and
+    serial_and_batch_bundle, so reading only the item table misses every
+    batch (For Mill EXTRA included). Piece Stock Ledger rows for this
+    voucher still carry batch_no and are the reliable source.
+    """
+    batches = set()
+    for row in doc.items:
+        batches.update(_dn_row_batch_nos(row))
+
+    if not doc.name:
+        return {b for b in batches if b}
+
+    from_psle = frappe.db.sql(
+        """
+        SELECT DISTINCT batch_no
+        FROM `tabPiece Stock Ledger Entry`
+        WHERE voucher_type = %s AND voucher_no = %s
+          AND IFNULL(batch_no, '') != ''
+        """,
+        (doc.doctype, doc.name),
+    )
+    batches.update(r[0] for r in from_psle if r and r[0])
+
+    # Legacy null-batch manufacture PSLEs are not tagged; recover those
+    # batches from Serial and Batch Entry on any SLE/PSLE bundle for this DN.
+    from_bundle = frappe.db.sql(
+        """
+        SELECT DISTINCT sbe.batch_no
+        FROM `tabSerial and Batch Entry` sbe
+        WHERE sbe.parent IN (
+            SELECT serial_and_batch_bundle
+            FROM `tabStock Ledger Entry`
+            WHERE voucher_type = %s AND voucher_no = %s
+              AND IFNULL(serial_and_batch_bundle, '') != ''
+            UNION
+            SELECT serial_and_batch_bundle
+            FROM `tabPiece Stock Ledger Entry`
+            WHERE voucher_type = %s AND voucher_no = %s
+              AND IFNULL(serial_and_batch_bundle, '') != ''
+        )
+          AND IFNULL(sbe.batch_no, '') != ''
+        """,
+        (doc.doctype, doc.name, doc.doctype, doc.name),
+    )
+    batches.update(r[0] for r in from_bundle if r and r[0])
+
+    return {b for b in batches if b}
+
+
 def sync_batch_master_qty_from_delivery(doc):
     """Mirror live ledger quantity to Batch.batch_qty for batches this DN moved.
 
@@ -1069,28 +1130,39 @@ def sync_batch_master_qty_from_delivery(doc):
     logic deliberately reads the live warehouse ledger instead of this field.
     Calling it after both submit and cancel makes each DN independent and
     naturally idempotent.
+
+    Also recompute Batch.pieces from the Piece Stock Ledger so a DN against
+    legacy null-batch manufacture stock (common in For Mill EXTRA) cannot
+    leave qty at 0 while pieces stay inflated from a duplicate baseline.
+    On cancel this must still find batches after item SABB/batch_no are cleared.
     """
-    if not frappe.db.has_column("Batch", "batch_qty"):
+    if not frappe.db.has_column("Batch", "batch_qty") and not frappe.db.has_column(
+        "Batch", "pieces"
+    ):
         return
 
-    batches = set()
-    for row in doc.items:
-        batches.update(_dn_row_batch_nos(row))
+    from madhav.doc_events.stock_ledger_entry import recalculate_batch_pieces
+
+    batches = _batches_touched_by_delivery_note(doc)
 
     for batch_no in batches:
-        # Per-batch qty from the matched entry, not the bundle-wide
-        # sle.actual_qty — see get_batch_qty_from_sle().
-        qty = frappe.db.sql(
-            """
-            SELECT COALESCE(SUM(SIGN(sle.actual_qty) * ABS(sbe.qty)), 0)
-            FROM `tabStock Ledger Entry` sle
-            INNER JOIN `tabSerial and Batch Entry` sbe
-                ON sbe.parent = sle.serial_and_batch_bundle
-            WHERE sbe.batch_no = %s AND sle.is_cancelled = 0
-            """,
-            batch_no,
-        )[0][0]
-        frappe.db.set_value("Batch", batch_no, "batch_qty", flt(qty), update_modified=False)
+        if frappe.db.has_column("Batch", "batch_qty"):
+            # Per-batch qty from the matched entry, not the bundle-wide
+            # sle.actual_qty — see get_batch_qty_from_sle().
+            qty = frappe.db.sql(
+                """
+                SELECT COALESCE(SUM(SIGN(sle.actual_qty) * ABS(sbe.qty)), 0)
+                FROM `tabStock Ledger Entry` sle
+                INNER JOIN `tabSerial and Batch Entry` sbe
+                    ON sbe.parent = sle.serial_and_batch_bundle
+                WHERE sbe.batch_no = %s AND sle.is_cancelled = 0
+                """,
+                batch_no,
+            )[0][0]
+            frappe.db.set_value("Batch", batch_no, "batch_qty", flt(qty), update_modified=False)
+
+        if frappe.db.has_column("Batch", "pieces"):
+            recalculate_batch_pieces(batch_no)
 
 
 def get_available_qty_for_item(row):
@@ -1498,17 +1570,13 @@ def _dn_row_batch_nos(row):
 def _sres_used_by_dn_row(row, sales_order, docstatus=1):
     """The Stock Reservation Entries this DN row actually draws on.
 
-    One Sales Order line can be reserved across several entries, each
-    consumed by a different Delivery Note. Acting on every entry of the
-    line lets one Delivery Note cancel a reservation another one is
-    already delivering against, which is how a cancelled 6-unit delivery
-    ended up restoring only 2.
-
-    Batch-tracked rows are matched to entries through the batches they
-    ship. A qty-based reservation carries no batch to match on, so the
-    Sales Order line stays the finest link available for those.
+    One Sales Order line can be reserved across several entries (e.g. two
+    Stock Transfers of 4.1 — same batch or different batches). Only the
+    entries needed for THIS row's qty/batch must be touched. Matching every
+    SRE on the SO line would let one Delivery Note cancel/deliver a sibling
+    reservation the user left unused on the DN.
     """
-    # Custom mapper writes this exact source SRE.  Prefer it over a batch
+    # Custom mapper writes this exact source SRE. Prefer it over a batch
     # overlap: multiple DNs can legitimately ship the same batch from
     # different reservations, and an overlap is not ownership.
     explicit_sre = row.get("custom_sre") if hasattr(row, "get") else None
@@ -1525,48 +1593,86 @@ def _sres_used_by_dn_row(row, sales_order, docstatus=1):
             "voucher_detail_no": row.so_detail,
             "docstatus": docstatus,
         },
-        fields=["name", "reservation_based_on"],
+        fields=["name", "reservation_based_on", "reserved_qty", "delivered_qty"],
+        order_by="creation asc",
     )
 
-    row_batches = _dn_row_batch_nos(row)
-    if not row_batches:
-        return [d.name for d in sre_rows]
+    row_qty = flt(row.stock_qty)
+    if row_qty <= 0:
+        row_qty = flt(row.qty) * (flt(row.conversion_factor) or 1)
 
+    row_batches = _dn_row_batch_nos(row)
     used = []
+    remaining = row_qty if row_qty > 0 else None
+
     for sre in sre_rows:
-        if sre.reservation_based_on != "Serial and Batch":
-            used.append(sre.name)
-            continue
-        sre_batches = set(
-            frappe.get_all(
-                "Serial and Batch Entry",
-                filters={"parent": sre.name, "parenttype": "Stock Reservation Entry"},
-                pluck="batch_no",
+        if remaining is not None and remaining <= 0:
+            break
+
+        if row_batches and sre.reservation_based_on == "Serial and Batch":
+            sre_batches = set(
+                frappe.get_all(
+                    "Serial and Batch Entry",
+                    filters={
+                        "parent": sre.name,
+                        "parenttype": "Stock Reservation Entry",
+                    },
+                    pluck="batch_no",
+                )
             )
-        )
-        if sre_batches & row_batches:
+            if not (sre_batches & row_batches):
+                continue
+        elif row_batches and sre.reservation_based_on != "Serial and Batch":
+            # Qty-based SRE with no batch to match — only use when this DN
+            # row itself has no batch either (handled above when row_batches
+            # empty). Skip when the DN row is batch-specific.
+            continue
+
+        active = flt(sre.reserved_qty) - flt(sre.delivered_qty)
+        if docstatus == 2:
+            # Cancelled SREs: include for restore snapshots by creation order
+            # up to the DN row qty when known.
+            active = flt(sre.reserved_qty) or active
+        if active <= 0 and docstatus == 1:
+            continue
+
+        used.append(sre.name)
+        if remaining is not None:
+            remaining -= max(active, 0)
+
+    # No batch on DN row: fall back to SO-line SREs in creation order, still
+    # capped by the row qty so one DN line cannot claim every reservation.
+    if not used and not row_batches:
+        remaining = row_qty if row_qty > 0 else None
+        for sre in sre_rows:
+            if remaining is not None and remaining <= 0:
+                break
+            active = flt(sre.reserved_qty) - flt(sre.delivered_qty)
+            if docstatus == 1 and active <= 0:
+                continue
             used.append(sre.name)
+            if remaining is not None:
+                remaining -= max(active if docstatus == 1 else flt(sre.reserved_qty), 0)
+
     return used
 
 
 def cancel_stock_reservations_from_so(doc):
     """
     Snapshot active SO reservations linked to this DN, then cancel only those
-    needed for Deliver-as-Qty overage (difference_qty > 0).
+    needed for Deliver-as-Qty overage (difference_qty > 0) on THAT DN row.
+    Never cancel sibling SREs that share a batch but were not used by the row.
     """
     snapshots = []
     seen_sre = set()
     cancel_errors = []
-    so_details_needing_cancel = {
-        row.so_detail
-        for row in doc.items
-        if row.so_detail and flt(row.difference_qty) > 0
-    }
 
     for row in doc.items:
         sales_order = _row_sales_order(row)
         if not sales_order or not row.so_detail:
             continue
+
+        row_needs_cancel = flt(row.difference_qty) > 0
 
         for sre_name in _sres_used_by_dn_row(row, sales_order):
             if sre_name in seen_sre:
@@ -1582,10 +1688,9 @@ def cancel_stock_reservations_from_so(doc):
                 # qty already sitting on the entry belongs to an earlier
                 # Delivery Note. Cancelling it would destroy that DN's
                 # reservation, so the overage has to come from elsewhere.
-                if (
-                    row.so_detail in so_details_needing_cancel
-                    and flt(sre.delivered_qty) <= 0
-                ):
+                # Only cancel when THIS row has Deliver-as-Qty overage —
+                # a sibling row's difference_qty must not wipe unused SREs.
+                if row_needs_cancel and flt(sre.delivered_qty) <= 0:
                     sre.flags.ignore_permissions = True
                     sre.cancel()
             except Exception:

@@ -103,6 +103,70 @@ def _batch_had_stock_before_voucher(batch_no, voucher_type, voucher_no):
 	return flt(prior_qty) > 0
 
 
+def _has_legacy_null_batch_psle(batch_no):
+	"""True when older Piece SLEs exist for this batch with blank batch_no.
+
+	Pre-fix manufacture / stock-entry rows often left PSLE.batch_no empty and
+	only linked the batch through a single-batch Serial and Batch Bundle.
+	Those rows ARE the batch's piece history — a Batch-voucher baseline must
+	not be seeded on top of them (that double-counts, e.g. For Mill EXTRA
+	stock: 7 PC manufacture + 7 PC baseline - 4 PC DN = 10 instead of 3).
+	"""
+	if not batch_no:
+		return False
+	return bool(
+		frappe.db.sql(
+			"""
+			SELECT 1
+			FROM `tabPiece Stock Ledger Entry` psle
+			WHERE psle.docstatus = 1
+			  AND psle.is_cancelled = 0
+			  AND IFNULL(psle.batch_no, '') = ''
+			  AND psle.serial_and_batch_bundle IS NOT NULL
+			  AND EXISTS (
+				SELECT 1 FROM `tabSerial and Batch Entry` sbe
+				WHERE sbe.parent = psle.serial_and_batch_bundle
+				  AND sbe.batch_no = %s
+			  )
+			  AND (
+				SELECT COUNT(DISTINCT sbe2.batch_no)
+				FROM `tabSerial and Batch Entry` sbe2
+				WHERE sbe2.parent = psle.serial_and_batch_bundle
+				  AND IFNULL(sbe2.batch_no, '') != ''
+			  ) = 1
+			LIMIT 1
+			""",
+			batch_no,
+		)
+	)
+
+
+def _batch_has_piece_ledger_history(batch_no):
+	"""Any Piece SLE history for this batch (tagged or legacy null-batch)."""
+	if not batch_no:
+		return False
+	if frappe.db.exists("Piece Stock Ledger Entry", {"batch_no": batch_no, "docstatus": 1}):
+		return True
+	return _has_legacy_null_batch_psle(batch_no)
+
+
+def _cancel_duplicate_baselines_when_legacy_exists(batch_no):
+	"""Retire Batch-voucher anchors that double-count legacy null-batch rows."""
+	if not batch_no or not _has_legacy_null_batch_psle(batch_no):
+		return
+	frappe.db.sql(
+		"""
+		UPDATE `tabPiece Stock Ledger Entry`
+		SET is_cancelled = 1
+		WHERE batch_no = %s
+		  AND voucher_type = 'Batch'
+		  AND voucher_no = %s
+		  AND is_cancelled = 0
+		""",
+		(batch_no, batch_no),
+	)
+
+
 def _ensure_baseline_piece_sle(item_code, warehouse, batch_no, company, voucher_type=None, voucher_no=None):
 	"""
 	recalculate_batch_pieces() resums from the Piece Stock Ledger alone.
@@ -113,7 +177,13 @@ def _ensure_baseline_piece_sle(item_code, warehouse, batch_no, company, voucher_
 	"""
 	if not batch_no:
 		return
-	if frappe.db.exists("Piece Stock Ledger Entry", {"batch_no": batch_no, "docstatus": 1}):
+	# Retire bad Batch-voucher anchors that sit on top of legacy null-batch
+	# manufacture rows (For Mill EXTRA) before deciding whether to seed.
+	_cancel_duplicate_baselines_when_legacy_exists(batch_no)
+	# Include legacy null-batch PSLEs (blank batch_no, single-batch SABB).
+	# Checking only batch_no-tagged rows re-seeded a second +N anchor on
+	# For Mill EXTRA / older manufacture stock and inflated Batch.pieces.
+	if _batch_has_piece_ledger_history(batch_no):
 		return
 
 	if _batch_created_by_voucher(batch_no, voucher_type, voucher_no):
@@ -270,9 +340,15 @@ def recalculate_batch_pieces(batch_no):
 	  - legacy null-batch rows whose Serial/Batch Bundle is single-batch
 	    for this batch (old DN/SE bug).
 	Excludes is_cancelled = 1 rows.
+
+	Also retires Batch-voucher baselines that sit on top of legacy
+	null-batch history (double-count from DN submit on older Mill EXTRA
+	stock) before summing.
 	"""
 	if not batch_no:
 		return
+
+	_cancel_duplicate_baselines_when_legacy_exists(batch_no)
 
 	total = frappe.db.sql(
 		"""

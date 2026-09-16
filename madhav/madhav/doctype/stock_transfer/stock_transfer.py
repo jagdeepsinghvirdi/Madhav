@@ -864,4 +864,67 @@ def get_batch_stock(
         },
         as_dict=1,
     )
+    _fill_missing_batch_dimensions(data)
     return data
+
+
+def _fill_missing_batch_dimensions(rows):
+	"""When Batch.average_length / section_weight were never stamped (common
+	on FWO Manufacture batches), recover from the creating Stock Entry Detail
+	so Stock Transfer Fetch Details still shows Length / Section Weight.
+	Does not overwrite non-zero Batch values.
+	"""
+	missing = [
+		r
+		for r in (rows or [])
+		if r.get("batch_no")
+		and (not flt(r.get("average_length")) or not flt(r.get("section_weight")))
+	]
+	if not missing:
+		return
+
+	batch_nos = [r.batch_no for r in missing]
+	placeholders = ", ".join(["%s"] * len(batch_nos))
+	sed_rows = frappe.db.sql(
+		f"""
+		SELECT batch_no, average_length, section_weight, creation
+		FROM `tabStock Entry Detail`
+		WHERE batch_no IN ({placeholders})
+		  AND (
+			IFNULL(average_length, 0) > 0
+			OR IFNULL(section_weight, 0) > 0
+		  )
+		ORDER BY creation DESC
+		""",
+		tuple(batch_nos),
+		as_dict=1,
+	)
+	# First (latest) non-zero wins per batch.
+	by_batch = {}
+	for sed in sed_rows:
+		cur = by_batch.setdefault(
+			sed.batch_no, {"average_length": 0, "section_weight": 0}
+		)
+		if not cur["average_length"] and flt(sed.average_length):
+			cur["average_length"] = flt(sed.average_length)
+		if not cur["section_weight"] and flt(sed.section_weight):
+			cur["section_weight"] = flt(sed.section_weight)
+
+	for row in missing:
+		dims = by_batch.get(row.batch_no) or {}
+		if not flt(row.get("average_length")) and dims.get("average_length"):
+			row.average_length = dims["average_length"]
+		if not flt(row.get("section_weight")) and dims.get("section_weight"):
+			row.section_weight = dims["section_weight"]
+		# Heal Batch master only when blank — never overwrite existing Length /
+		# Section Weight (keeps old correctly-stamped batches unchanged).
+		cur = frappe.db.get_value(
+			"Batch", row.batch_no, ["average_length", "section_weight"], as_dict=True
+		) or {}
+		updates = {}
+		if dims.get("average_length") and not flt(cur.get("average_length")):
+			updates["average_length"] = dims["average_length"]
+		if dims.get("section_weight") and not flt(cur.get("section_weight")):
+			updates["section_weight"] = dims["section_weight"]
+		if updates:
+			frappe.db.set_value("Batch", row.batch_no, updates, update_modified=False)
