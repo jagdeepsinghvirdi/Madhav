@@ -132,33 +132,150 @@ def before_insert(self, method):
 
 def before_validate(self, method):
     """
-    Re-sync each SO-reserved row's warehouse from its Serial and Batch
-    Bundle before core stock validation runs.
+    Align each SO-linked DN row's warehouse with reserved stock before
+    core validate_against_stock_reservation_entries runs.
 
-    Something in the standard "Create > Delivery Note" mapper flow (core
-    ERPNext's set_missing_values, which runs between before_insert and
-    validate) can reset warehouse back to the Sales Order Item's nominal
-    warehouse, even though before_insert already set it correctly from
-    the SRE's actual reservation warehouse. Core's stock-bundle
-    consistency check runs as part of validate() before our own
-    "validate" hook fires, so this has to happen in before_validate to
-    actually take effect in time.
+    Two mapper paths can stamp the Sales Order Item's *nominal* warehouse
+    (e.g. Finished Goods) even when stock was reserved in For Mill (EXTRA):
+      1. Core set_missing_values between before_insert and validate
+      2. Bundle created against the SO warehouse while SRE sits elsewhere
 
-    Scoped to rows tied to a Sales Order reservation (against_sales_order
-    + so_detail) only — a row's bundle could exist for other reasons
-    (manual entry, non-SO stock movement), and resyncing its warehouse
-    from an unrelated bundle wouldn't be safe or correct there.
+    Sync order (first match wins), and only when the current warehouse is
+    missing or not in the reserved-warehouse list — never rewrite a row
+    that is already on a valid reserved warehouse (preserves existing flow).
     """
-    for row in self.items:
+    _sync_dn_item_warehouse_to_reservation(self)
+
+
+def _sync_dn_item_warehouse_to_reservation(doc):
+    from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
+        get_sre_reserved_warehouses_for_voucher,
+    )
+
+    for row in doc.get("items") or []:
         if not row.against_sales_order or not row.so_detail:
             continue
-        if not row.serial_and_batch_bundle:
-            continue
-        bundle_warehouse = frappe.db.get_value(
-            "Serial and Batch Bundle", row.serial_and_batch_bundle, "warehouse"
+
+        reserved_warehouses = get_sre_reserved_warehouses_for_voucher(
+            "Sales Order", row.against_sales_order, row.so_detail
         )
-        if bundle_warehouse and row.warehouse != bundle_warehouse:
-            row.warehouse = bundle_warehouse
+        if not reserved_warehouses:
+            # No active reservation — leave warehouse alone (unreserved DN).
+            continue
+
+        target_wh = None
+
+        # 1) Explicit SRE on the DN row
+        explicit_sre = row.get("custom_sre") if hasattr(row, "get") else None
+        if explicit_sre:
+            target_wh = frappe.db.get_value(
+                "Stock Reservation Entry", explicit_sre, "warehouse"
+            )
+
+        # 2) Batch matched on an SRE sb_entries row for this SO line
+        #    (before bundle — bundle may still carry the SO nominal WH)
+        batch_no = row.batch_no
+        if not batch_no and row.serial_and_batch_bundle:
+            batch_no = frappe.db.get_value(
+                "Serial and Batch Entry",
+                {
+                    "parent": row.serial_and_batch_bundle,
+                    "parenttype": "Serial and Batch Bundle",
+                },
+                "batch_no",
+                order_by="idx asc",
+            )
+        if not target_wh and batch_no:
+            target_wh = _sre_warehouse_for_batch(
+                row.against_sales_order, row.so_detail, batch_no
+            )
+
+        # 3) Serial and Batch Bundle warehouse (when it is a reserved WH)
+        if not target_wh and row.serial_and_batch_bundle:
+            bundle_wh = frappe.db.get_value(
+                "Serial and Batch Bundle",
+                row.serial_and_batch_bundle,
+                "warehouse",
+            )
+            if bundle_wh and bundle_wh in reserved_warehouses:
+                target_wh = bundle_wh
+
+        # Specific match (custom_sre / batch / reserved bundle) always wins —
+        # even when the row already sits on *another* reserved warehouse
+        # (e.g. SO nominal Finished Goods while this batch is on Mill EXTRA).
+        if target_wh:
+            if row.warehouse != target_wh:
+                row.warehouse = target_wh
+                if row.serial_and_batch_bundle:
+                    _align_bundle_warehouse(row.serial_and_batch_bundle, target_wh)
+            continue
+
+        # No specific match: only rewrite when current WH is missing / not
+        # reserved — preserves dual-warehouse flows that already pick a
+        # valid reserved warehouse.
+        if row.warehouse and row.warehouse in reserved_warehouses:
+            continue
+
+        target_wh = reserved_warehouses[0]
+        if not target_wh or row.warehouse == target_wh:
+            continue
+
+        row.warehouse = target_wh
+        if row.serial_and_batch_bundle:
+            _align_bundle_warehouse(row.serial_and_batch_bundle, target_wh)
+
+
+def _align_bundle_warehouse(bundle_name, warehouse):
+    if not bundle_name or not warehouse:
+        return
+    bundle_wh = frappe.db.get_value(
+        "Serial and Batch Bundle", bundle_name, "warehouse"
+    )
+    if bundle_wh == warehouse:
+        return
+    frappe.db.set_value(
+        "Serial and Batch Bundle",
+        bundle_name,
+        "warehouse",
+        warehouse,
+        update_modified=False,
+    )
+    frappe.db.sql(
+        """
+        UPDATE `tabSerial and Batch Entry`
+        SET warehouse = %s
+        WHERE parent = %s AND parenttype = 'Serial and Batch Bundle'
+          AND IFNULL(warehouse, '') != %s
+        """,
+        (warehouse, bundle_name, warehouse),
+    )
+
+
+def _sre_warehouse_for_batch(sales_order, so_detail, batch_no):
+    """Warehouse of the active SRE that still holds this batch for the SO line."""
+    if not batch_no:
+        return None
+    rows = frappe.db.sql(
+        """
+        SELECT sre.warehouse
+        FROM `tabStock Reservation Entry` sre
+        INNER JOIN `tabSerial and Batch Entry` sbe
+            ON sbe.parent = sre.name
+            AND sbe.parenttype = 'Stock Reservation Entry'
+        WHERE sre.docstatus = 1
+          AND sre.voucher_type = 'Sales Order'
+          AND sre.voucher_no = %s
+          AND sre.voucher_detail_no = %s
+          AND sre.status NOT IN ('Delivered', 'Cancelled')
+          AND sbe.batch_no = %s
+          AND (IFNULL(sbe.qty, 0) - IFNULL(sbe.delivered_qty, 0)) > 0
+        ORDER BY sre.creation
+        LIMIT 1
+        """,
+        (sales_order, so_detail, batch_no),
+    )
+    return rows[0][0] if rows else None
+
 
 def _validate_piece_availability(doc):
     """

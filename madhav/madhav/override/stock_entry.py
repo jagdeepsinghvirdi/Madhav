@@ -14,31 +14,15 @@ from frappe.utils import (
 )
 class CustomStockEntry(_StockEntry):
     def validate(self):
-        # Finish Work Order builds Manufacture SE manually (from_bom=0).
-        # Drop any zero-qty rows before core validate_qty_is_not_zero —
-        # demo sites with "Material Transferred for Manufacture" backflush
-        # can otherwise surface "Quantity for Item RMxxxx cannot be zero"
-        # even though FWO already posted the real consume qty.
-        self._drop_zero_qty_rows_for_fwo_manufacture()
+        # Only touches Manufacture entries built with from_bom=0.
+        # Normal Manufacture / Transfer SE paths are unchanged.
         self._restore_fg_completed_qty_for_manual_manufacture()
         super().validate()
         self._restore_fg_completed_qty_for_manual_manufacture()
 
-    def _drop_zero_qty_rows_for_fwo_manufacture(self):
-        if not self.flags.get("madhav_fwo_manufacture"):
-            return
-        if self.purpose != "Manufacture":
-            return
-        for row in list(self.get("items") or []):
-            if flt(row.qty) <= 0:
-                self.remove(row)
-
     def _restore_fg_completed_qty_for_manual_manufacture(self):
-        # FWO uses from_bom=0; core clears fg_completed_qty in that case.
-        # Also restore when flag is set even if from_bom was flipped.
-        if self.purpose != "Manufacture":
-            return
-        if cint(self.from_bom) and not self.flags.get("madhav_fwo_manufacture"):
+        # When from_bom=0, core clears fg_completed_qty during validate.
+        if self.purpose != "Manufacture" or cint(self.from_bom):
             return
         fg_qty = sum(
             flt(d.qty) for d in (self.get("items") or []) if cint(d.is_finished_item)

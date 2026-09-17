@@ -419,9 +419,28 @@ class FinishWorkOrder(Document):
         rm_pool = []
         for rm in self.raw_materials:
             if rm.qty and rm.qty > 0:
+                warehouse = rm.source_warehouse
+                # BOM / batch pick often leaves Source Warehouse blank even
+                # when the batch has live stock — resolve from ledger so the
+                # old submit path keeps working without forcing a UI field.
+                if not warehouse and rm.batch_no:
+                    warehouse = _warehouse_for_batch_stock(rm.item_code, rm.batch_no)
+                if not warehouse:
+                    frappe.throw(
+                        frappe._(
+                            "Row #{0}: Source Warehouse is missing for raw material {1}. "
+                            "Batch {2} has no live stock warehouse to auto-fill from — "
+                            "set Source Warehouse on the Raw Materials row."
+                        ).format(
+                            rm.idx,
+                            frappe.bold(rm.item_code),
+                            frappe.bold(rm.batch_no or "—"),
+                        ),
+                        title=frappe._("Missing Source Warehouse"),
+                    )
                 rm_pool.append({
                     "item_code": rm.item_code,
-                    "warehouse": rm.source_warehouse,
+                    "warehouse": warehouse,
                     "remaining_qty": flt(rm.qty),
                     "original_qty": flt(rm.qty),
                     "batch_no": rm.batch_no,
@@ -439,6 +458,23 @@ class FinishWorkOrder(Document):
                     "Enter a positive qty for each raw material before submit."
                 ),
                 title=frappe._("Invalid Raw Material Qty"),
+            )
+
+        # Manufacture SE is built from this pool (same as working SE
+        # MUST26-04799: RM row with Source Warehouse + qty). Without a pool
+        # ERPNext throws a confusing "raw material missing" on an FG-only SE.
+        has_wo_to_finish = any(
+            flt(p.consumption or 0) > 0 and p.work_order for p in self.pending_work_orders
+        )
+        if has_wo_to_finish and not rm_pool:
+            frappe.throw(
+                frappe._(
+                    "No Raw Materials to consume. Add rows on the Raw Materials "
+                    "table (Item, Qty, Batch, Source Warehouse) before submit — "
+                    "Finish Work Order creates the Manufacture Stock Entry from "
+                    "this table, it does not pull RM from the Work Order BOM."
+                ),
+                title=frappe._("Raw Materials Required"),
             )
 
         rm_index = 0
@@ -501,24 +537,22 @@ class FinishWorkOrder(Document):
                 # ==============================
                 # CREATE STOCK ENTRY
                 # ==============================
-                # from_bom must stay 0: FWO already builds RM + FG rows from the
-                # Raw Materials table. from_bom=1 with site backflush =
-                # "Material Transferred for Manufacture" can pull/merge WO
-                # component rows (often qty 0) and surface as
-                # "Quantity for Item RMxxxx cannot be zero".
-                # CustomStockEntry keeps fg_completed_qty in sync when
-                # from_bom=0 so submit does not see For Quantity 0.0.
+                # Keep from_bom=1 — this is the path that was stable on demo
+                # (client: working ~2 days ago). FWO still builds RM+FG rows
+                # itself; get_items() is never called. from_bom=0 + zero-row
+                # stripping recently caused "raw material missing" regressions.
                 se = frappe.new_doc("Stock Entry")
                 se.stock_entry_type = "Manufacture"
+                se.purpose = "Manufacture"
                 se.company = self.company
                 se.work_order = pwo.work_order
-                se.from_bom = 0
+                se.from_bom = 1
+                # Match Work Order BOM for from_bom=1 (display / costing only —
+                # rows still come from FWO Raw Materials FIFO below, not get_items).
+                se.bom_no = frappe.db.get_value("Work Order", pwo.work_order, "bom_no")
                 se.finished_good = pwo.item
                 se.fg_completed_qty = pwo.ready_qty if pwo.deliver_as_qty else pwo.calculated_qty
                 se.finished_good_quantity = pwo.ready_qty if pwo.deliver_as_qty else pwo.calculated_qty
-                # Marks this SE as FWO-built so CustomStockEntry can drop
-                # stray zero-qty rows without affecting normal Manufacture SE.
-                se.flags.madhav_fwo_manufacture = True
 
                 # ✅ FIXED: Set BOTH posting_date AND posting_time
                 se.set_posting_time = 1
@@ -597,9 +631,16 @@ class FinishWorkOrder(Document):
                         rm_row["remaining_qty"] = 0
                         rm_index += 1
 
-                if round(remaining_fg_qty, 2) > 0:
+                if flt(remaining_fg_qty, precision) > 0:
                     frappe.throw(
-                        f"Row {pwo.idx}: Raw material pool exhausted. Need {remaining_fg_qty}"
+                        frappe._(
+                            "Row {0}: Raw material pool exhausted for Work Order {1}. "
+                            "Still need {2}. Increase Raw Materials qty or reduce ready qty."
+                        ).format(
+                            pwo.idx,
+                            frappe.bold(pwo.work_order),
+                            flt(remaining_fg_qty, precision),
+                        )
                     )
 
                 # ==============================
@@ -670,7 +711,8 @@ class FinishWorkOrder(Document):
 
                 se.fg_completed_qty = fg_final_qty
 
-                # Drop any zero-qty rows before insert (ERPNext Invalid Quantity).
+                # Never post a zero-qty row (ERPNext Invalid Quantity), but do
+                # not strip real RM rows — that caused "raw material missing".
                 for row in list(se.items):
                     if flt(row.qty) <= 0:
                         se.remove(row)
@@ -680,27 +722,15 @@ class FinishWorkOrder(Document):
                             "Work Order {0}: Finished qty is missing on Stock Entry."
                         ).format(frappe.bold(pwo.work_order))
                     )
-                if not any(
-                    (not cint(row.is_finished_item) and not cint(row.is_scrap_item))
-                    for row in se.items
-                ):
+                if not any(row.s_warehouse and flt(row.qty) > 0 for row in se.items):
                     frappe.throw(
                         frappe._(
                             "Work Order {0}: No raw material qty to consume. "
-                            "Check Raw Materials table — at least one row needs qty > 0."
+                            "Check Raw Materials — need qty > 0, Batch, and stock warehouse."
                         ).format(frappe.bold(pwo.work_order))
                     )
 
-                # Submit Stock Entry
-                # from_bom=0 makes ERPNext clear fg_completed_qty during
-                # insert validate; restore before submit so For Quantity
-                # still matches the finished row (7.56 vs 0.0 error).
-                se.flags.madhav_fwo_manufacture = True
                 se.insert()
-                se.fg_completed_qty = fg_final_qty
-                if hasattr(se, "finished_good_quantity"):
-                    se.finished_good_quantity = fg_final_qty
-                se.flags.madhav_fwo_manufacture = True
                 se.submit()
                 pwo.db_set("stock_entry_reference", se.name)
                 
@@ -846,6 +876,56 @@ class FinishWorkOrder(Document):
                 from_voucher_detail_no=data["from_voucher_detail_no"],
                 length=data.get("length"),
             )
+
+
+def _warehouse_for_batch_stock(item_code, batch_no):
+    """Warehouse that currently holds live qty for this batch (highest first).
+
+    Used when Finish Work Order Raw Materials has Batch + Qty but Source
+    Warehouse was left blank (common after BOM auto-fetch). Does not invent
+    stock — only returns a warehouse that already has positive batch qty.
+    """
+    if not item_code or not batch_no:
+        return None
+
+    rows = frappe.db.sql(
+        """
+        SELECT sle.warehouse,
+               SUM(SIGN(sle.actual_qty) * ABS(sbe.qty)) AS bal
+        FROM `tabStock Ledger Entry` sle
+        INNER JOIN `tabSerial and Batch Entry` sbe
+            ON sbe.parent = sle.serial_and_batch_bundle
+        WHERE sle.is_cancelled = 0
+          AND sle.item_code = %s
+          AND sbe.batch_no = %s
+          AND IFNULL(sle.serial_and_batch_bundle, '') != ''
+        GROUP BY sle.warehouse
+        HAVING bal > 0.0001
+        ORDER BY bal DESC
+        LIMIT 1
+        """,
+        (item_code, batch_no),
+    )
+    if rows:
+        return rows[0][0]
+
+    # Legacy / non-bundle batch balance
+    rows = frappe.db.sql(
+        """
+        SELECT warehouse, SUM(actual_qty) AS bal
+        FROM `tabStock Ledger Entry`
+        WHERE is_cancelled = 0
+          AND item_code = %s
+          AND batch_no = %s
+        GROUP BY warehouse
+        HAVING bal > 0.0001
+        ORDER BY bal DESC
+        LIMIT 1
+        """,
+        (item_code, batch_no),
+    )
+    return rows[0][0] if rows else None
+
 
 @frappe.whitelist()
 @frappe.validate_and_sanitize_search_inputs
