@@ -21,12 +21,49 @@ class CustomStockEntry(_StockEntry):
             from madhav.madhav.doctype.finish_work_order.finish_work_order import (
                 _sanitize_fwo_manufacture_stock_entry,
             )
+            self._reapply_fwo_row_qty(stage="before core validate")
             _sanitize_fwo_manufacture_stock_entry(self, self.work_order or self.name)
 
         # from_bom=0 only: core clears fg_completed_qty during validate.
         self._restore_fg_completed_qty_for_manual_manufacture()
         super().validate()
         self._restore_fg_completed_qty_for_manual_manufacture()
+
+        if self.flags.get("madhav_fwo_manufacture") and self._reapply_fwo_row_qty(
+            stage="after core validate"
+        ):
+            # Keep derived values in step with the restored quantities.
+            self.set_transfer_qty()
+            self.calculate_rate_and_amount()
+
+    def _reapply_fwo_row_qty(self, stage):
+        """Put back the consume / scrap / FG quantities Finish Work Order built.
+
+        Returns True when any row had been changed. Matches rows by position and
+        item code; if the row layout no longer matches, nothing is touched.
+        """
+        intended = self.flags.get("madhav_fwo_row_qty")
+        rows = self.get("items") or []
+        if not intended or len(intended) != len(rows):
+            return False
+        if any(r.item_code != item for r, (item, _qty) in zip(rows, intended)):
+            return False
+
+        changed = []
+        for r, (item, qty) in zip(rows, intended):
+            if qty > 0 and abs(flt(r.qty) - qty) > 1e-9:
+                changed.append({"item_code": item, "was": flt(r.qty), "restored": qty})
+                r.qty = qty
+
+        if changed:
+            frappe.log_error(
+                title="FWO Stock Entry qty restored",
+                message=frappe.as_json(
+                    {"work_order": self.work_order, "stage": stage, "rows": changed},
+                    indent=2,
+                ),
+            )
+        return bool(changed)
 
     def _restore_fg_completed_qty_for_manual_manufacture(self):
         if self.purpose != "Manufacture" or cint(self.from_bom):

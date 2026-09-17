@@ -717,6 +717,14 @@ class FinishWorkOrder(Document):
                 # Positive RM + FG rows are left untouched.
                 se.flags.madhav_fwo_manufacture = True
                 _sanitize_fwo_manufacture_stock_entry(se, pwo.work_order)
+                # Quantities FWO computed for each row (FIFO consume, scrap, FG).
+                # CustomStockEntry re-applies them through ERPNext validate so a
+                # core recalculation cannot zero a real consume row between
+                # insert and submit (seen on site: RM positive when built, 0 by
+                # submit -> "Quantity for Item RMxxxx cannot be zero").
+                se.flags.madhav_fwo_row_qty = [
+                    (row.item_code, flt(row.qty)) for row in se.get("items")
+                ]
 
                 se.insert()
                 # Flag is not persisted on the doc; re-set before submit validate.
@@ -888,6 +896,24 @@ def _sanitize_fwo_manufacture_stock_entry(se, work_order):
     for row in list(se.get("items") or []):
         if flt(row.qty) <= 0:
             removed.append(row.item_code or "?")
+            frappe.log_error(
+                title="FWO zero-qty row removed",
+                message=frappe.as_json({
+                    "work_order": work_order,
+                    "removed_row": {
+                        "item_code": row.item_code, "qty": flt(row.qty),
+                        "s_warehouse": row.s_warehouse, "t_warehouse": row.t_warehouse,
+                        "batch_no": row.get("batch_no"),
+                        "is_finished_item": row.get("is_finished_item"),
+                        "is_scrap_item": row.get("is_scrap_item"),
+                    },
+                    "all_se_items_before_removal": [
+                        {"item_code": r.item_code, "qty": flt(r.qty),
+                         "s_warehouse": r.s_warehouse, "t_warehouse": r.t_warehouse}
+                        for r in (se.get("items") or [])
+                    ],
+                }, indent=2),
+            )
             se.remove(row)
 
     if not any(cint(row.is_finished_item) for row in (se.get("items") or [])):
