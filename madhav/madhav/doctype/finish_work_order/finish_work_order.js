@@ -186,13 +186,33 @@ function fetch_raw_materials_from_bom(frm) {
         callback(r) {
             if (!r.exc && r.message) {
                 frm.clear_table("raw_materials");
+                let skipped = [];
                 r.message.forEach(rm => {
+                    // A BOM component can compute to qty 0 (e.g. tiny BOM
+                    // ratio x small Ready Qty rounding to 0.000). Adding it
+                    // anyway left a silent zero-qty row that only surfaced
+                    // as a submit-time error naming the item; skip it here
+                    // instead and tell the user so they can enter it by hand.
+                    if (!flt(rm.qty)) {
+                        skipped.push(rm.item_code);
+                        return;
+                    }
                     let row = frm.add_child("raw_materials");
                     row.item_code = rm.item_code;
                     row.qty = rm.qty;
                 });
                 frm.refresh_field("raw_materials");
                 frm.dirty();
+                if (skipped.length) {
+                    frappe.msgprint({
+                        title: __("Zero BOM Quantity"),
+                        indicator: "orange",
+                        message: __(
+                            "Computed qty was 0 for: {0}. Not added — enter the row manually with the correct Qty, Batch, and Source Warehouse if this material is actually required.",
+                            [skipped.map(i => frappe.bold(i)).join(", ")]
+                        )
+                    });
+                }
             }
         }
     });
