@@ -31,8 +31,6 @@ class CustomStockEntry(_StockEntry):
     def _restore_fg_completed_qty_for_manual_manufacture(self):
         if self.purpose != "Manufacture" or cint(self.from_bom):
             return
-        if not self.flags.get("madhav_fwo_manufacture"):
-            return
         fg_qty = sum(
             flt(d.qty) for d in (self.get("items") or []) if cint(d.is_finished_item)
         )

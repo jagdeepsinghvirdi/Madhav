@@ -18,6 +18,8 @@ def on_submit(doc, method=None):
     if not doc.items:
         return
 
+    release_fully_delivered_so_reservations(doc)
+
     keys = {
         (d.item_code, d.warehouse, d.batch_no)
         for d in doc.items
@@ -1947,6 +1949,7 @@ def on_cancel(doc, method=None):
 		return
 
 	release_stock_used_by_delivery_note(doc)
+	restore_released_so_reservations(doc)
 	reverse_sre_delivery_for_dn(doc)
 	restore_stock_reservations_after_cancel(doc)
 	update_sales_order_quantities_on_cancel(doc)
@@ -3322,3 +3325,172 @@ def get_sales_order_items_for_selector(filters=None):
         )
 
     return rows
+
+
+RELEASED_SRE_COMMENT_PREFIX = "MADHAV_DN_RELEASED_SRE::"
+
+
+def _release_leftover_on_sre(sre_name):
+    """Trim one Partially Delivered SRE down to what was delivered.
+
+    Returns the pre-trim values so the change can be reversed exactly, or None
+    when nothing is left over."""
+    sre = frappe.db.get_value(
+        "Stock Reservation Entry", sre_name, ["reserved_qty", "delivered_qty"], as_dict=True
+    )
+    if not sre or flt(sre.reserved_qty) - flt(sre.delivered_qty) <= 1e-9:
+        return None
+
+    entries = []
+    for e in frappe.get_all(
+        "Serial and Batch Entry",
+        filters={"parent": sre_name, "parenttype": "Stock Reservation Entry"},
+        fields=["name", "qty", "delivered_qty"],
+    ):
+        if flt(e.qty) > flt(e.delivered_qty):
+            entries.append({"name": e.name, "qty": flt(e.qty)})
+            frappe.db.set_value(
+                "Serial and Batch Entry", e.name, "qty", flt(e.delivered_qty),
+                update_modified=False,
+            )
+
+    frappe.db.set_value(
+        "Stock Reservation Entry", sre_name, "reserved_qty", flt(sre.delivered_qty),
+        update_modified=False,
+    )
+    _refresh_sre_totals(sre_name)
+    return {"sre": sre_name, "reserved_qty": flt(sre.reserved_qty), "entries": entries}
+
+
+def _refresh_sre_totals(sre_name):
+    sre = frappe.get_doc("Stock Reservation Entry", sre_name)
+    sre.update_status()
+    sre.update_reserved_stock_in_bin()
+    sre.update_reserved_qty_in_voucher()
+
+
+def _stuck_sres_for_so_line(so_detail):
+    """Partially Delivered SREs on a Sales Order line that is already fully
+    delivered - their remainder can no longer be delivered through the SO."""
+    soi = frappe.db.get_value(
+        "Sales Order Item", so_detail,
+        ["parent", "stock_qty", "delivered_qty", "conversion_factor"], as_dict=True,
+    )
+    if not soi or frappe.db.get_value("Sales Order", soi.parent, "docstatus") != 1:
+        return []
+    delivered_stock = flt(soi.delivered_qty) * (flt(soi.conversion_factor) or 1)
+    if delivered_stock + 1e-6 < flt(soi.stock_qty):
+        return []
+    return frappe.get_all(
+        "Stock Reservation Entry",
+        filters={
+            "voucher_type": "Sales Order",
+            "voucher_no": soi.parent,
+            "voucher_detail_no": so_detail,
+            "docstatus": 1,
+            "status": "Partially Delivered",
+        },
+        pluck="name",
+    )
+
+
+def release_fully_delivered_so_reservations(doc):
+    """Free over-production reservation left on a fully delivered SO line.
+
+    FWO / Stock Transfer reserve the ACTUAL produced qty (e.g. 5.4 against an
+    SO line of 5). Once a Delivery Note delivers the SO line in full, the
+    remaining 0.4 stays "Partially Delivered" on the SRE: core
+    make_delivery_note only maps undelivered SO qty, so no later Delivery Note
+    can pick it up, and closing the Sales Order does not release a partially
+    delivered SRE either. The batch stock stayed locked as reserved for good.
+
+    Only lines that are fully delivered are touched, and what was released is
+    recorded on this Delivery Note so cancelling it restores the reservation
+    exactly.
+    """
+    if getattr(doc, "is_return", 0):
+        return
+
+    released = []
+    for so_detail in {r.so_detail for r in doc.items if r.so_detail}:
+        for sre_name in _stuck_sres_for_so_line(so_detail):
+            rec = _release_leftover_on_sre(sre_name)
+            if rec:
+                released.append(rec)
+
+    if released:
+        frappe.get_doc({
+            "doctype": "Comment",
+            "comment_type": "Info",
+            "reference_doctype": "Delivery Note",
+            "reference_name": doc.name,
+            "content": RELEASED_SRE_COMMENT_PREFIX + json.dumps(released),
+        }).insert(ignore_permissions=True)
+
+
+def restore_released_so_reservations(doc):
+    """Undo release_fully_delivered_so_reservations for a cancelled DN."""
+    comments = frappe.get_all(
+        "Comment",
+        filters={
+            "reference_doctype": "Delivery Note",
+            "reference_name": doc.name,
+            "content": ["like", RELEASED_SRE_COMMENT_PREFIX + "%"],
+        },
+        fields=["name", "content"],
+    )
+    for c in comments:
+        try:
+            records = json.loads(c.content[len(RELEASED_SRE_COMMENT_PREFIX):])
+        except Exception:
+            continue
+        for rec in records:
+            if not frappe.db.exists("Stock Reservation Entry", {"name": rec["sre"], "docstatus": 1}):
+                continue
+            for e in rec.get("entries") or []:
+                if frappe.db.exists("Serial and Batch Entry", e["name"]):
+                    frappe.db.set_value(
+                        "Serial and Batch Entry", e["name"], "qty", flt(e["qty"]),
+                        update_modified=False,
+                    )
+            frappe.db.set_value(
+                "Stock Reservation Entry", rec["sre"], "reserved_qty", flt(rec["reserved_qty"]),
+                update_modified=False,
+            )
+            _refresh_sre_totals(rec["sre"])
+        frappe.delete_doc("Comment", c.name, ignore_permissions=True, force=True)
+
+
+@frappe.whitelist()
+def release_stuck_reservations_on_delivered_so_lines(dry_run=1):
+    """One-off, opt-in cleanup for records created before this fix.
+
+    Lists (dry_run=1) or releases (dry_run=0) the undeliverable remainder of
+    Partially Delivered SREs whose Sales Order line is already fully delivered.
+    Not registered as a patch: it changes reservation data, so it runs only
+    when someone calls it deliberately.
+    """
+    frappe.only_for("System Manager")
+    dry_run = cint(dry_run)
+    lines = frappe.db.sql_list(
+        """
+        select distinct voucher_detail_no from `tabStock Reservation Entry`
+        where voucher_type = 'Sales Order' and docstatus = 1
+          and status = 'Partially Delivered'
+        """
+    )
+    out = []
+    for so_detail in lines:
+        for sre_name in _stuck_sres_for_so_line(so_detail):
+            v = frappe.db.get_value(
+                "Stock Reservation Entry", sre_name,
+                ["voucher_no", "reserved_qty", "delivered_qty"], as_dict=True,
+            )
+            row = {"sre": sre_name, "sales_order": v.voucher_no,
+                   "leftover": flt(v.reserved_qty) - flt(v.delivered_qty)}
+            if not dry_run:
+                _release_leftover_on_sre(sre_name)
+            out.append(row)
+    if not dry_run:
+        frappe.db.commit()
+    return out
