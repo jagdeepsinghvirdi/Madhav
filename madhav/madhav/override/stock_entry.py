@@ -14,15 +14,24 @@ from frappe.utils import (
 )
 class CustomStockEntry(_StockEntry):
     def validate(self):
-        # Only touches Manufacture entries built with from_bom=0.
-        # Normal Manufacture / Transfer SE paths are unchanged.
+        # FWO Manufacture SE only: drop stray zero-qty rows before core
+        # validate_qty_is_not_zero (P4: "Quantity for Item RMxxxx cannot be zero").
+        # Normal Manufacture / Transfer / Issue SE paths are unchanged.
+        if self.flags.get("madhav_fwo_manufacture"):
+            from madhav.madhav.doctype.finish_work_order.finish_work_order import (
+                _sanitize_fwo_manufacture_stock_entry,
+            )
+            _sanitize_fwo_manufacture_stock_entry(self, self.work_order or self.name)
+
+        # from_bom=0 only: core clears fg_completed_qty during validate.
         self._restore_fg_completed_qty_for_manual_manufacture()
         super().validate()
         self._restore_fg_completed_qty_for_manual_manufacture()
 
     def _restore_fg_completed_qty_for_manual_manufacture(self):
-        # When from_bom=0, core clears fg_completed_qty during validate.
         if self.purpose != "Manufacture" or cint(self.from_bom):
+            return
+        if not self.flags.get("madhav_fwo_manufacture"):
             return
         fg_qty = sum(
             flt(d.qty) for d in (self.get("items") or []) if cint(d.is_finished_item)

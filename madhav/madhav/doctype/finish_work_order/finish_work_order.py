@@ -711,26 +711,16 @@ class FinishWorkOrder(Document):
 
                 se.fg_completed_qty = fg_final_qty
 
-                # Never post a zero-qty row (ERPNext Invalid Quantity), but do
-                # not strip real RM rows — that caused "raw material missing".
-                for row in list(se.items):
-                    if flt(row.qty) <= 0:
-                        se.remove(row)
-                if not any(cint(row.is_finished_item) for row in se.items):
-                    frappe.throw(
-                        frappe._(
-                            "Work Order {0}: Finished qty is missing on Stock Entry."
-                        ).format(frappe.bold(pwo.work_order))
-                    )
-                if not any(row.s_warehouse and flt(row.qty) > 0 for row in se.items):
-                    frappe.throw(
-                        frappe._(
-                            "Work Order {0}: No raw material qty to consume. "
-                            "Check Raw Materials — need qty > 0, Batch, and stock warehouse."
-                        ).format(frappe.bold(pwo.work_order))
-                    )
+                # P4: single clear point before ERPNext Stock Entry validation.
+                # Zero-qty RM (stale FWO row / batch-qty overwrite / dust
+                # remainder) must never reach validate_qty_is_not_zero.
+                # Positive RM + FG rows are left untouched.
+                se.flags.madhav_fwo_manufacture = True
+                _sanitize_fwo_manufacture_stock_entry(se, pwo.work_order)
 
                 se.insert()
+                # Flag is not persisted on the doc; re-set before submit validate.
+                se.flags.madhav_fwo_manufacture = True
                 se.submit()
                 pwo.db_set("stock_entry_reference", se.name)
                 
@@ -876,6 +866,55 @@ class FinishWorkOrder(Document):
                 from_voucher_detail_no=data["from_voucher_detail_no"],
                 length=data.get("length"),
             )
+
+
+def _sanitize_fwo_manufacture_stock_entry(se, work_order):
+    """Drop zero-qty rows on an FWO-built Manufacture SE before ERPNext validate.
+
+    Diagnosis (P4 FWO Submission Issue): error
+      "Row #1: Quantity for Item RMxxxx cannot be zero"
+    happens when a zero-qty raw-material row reaches Stock Entry validation.
+    FWO does not intentionally post that row — sources include leftover FWO
+    Raw Material lines, precision dust, or batch-qty UI overwrite.
+
+    Rules (must not break normal FWO / other SE flows):
+      - Remove only rows with qty <= 0
+      - Keep every positive-qty RM / scrap / FG row
+      - After cleanup, require at least one consume row (s_warehouse + qty > 0)
+        and one finished row — else raise a clear FWO message instead of the
+        generic ERPNext Invalid Quantity / Raw Materials Missing errors
+    """
+    removed = []
+    for row in list(se.get("items") or []):
+        if flt(row.qty) <= 0:
+            removed.append(row.item_code or "?")
+            se.remove(row)
+
+    if not any(cint(row.is_finished_item) for row in (se.get("items") or [])):
+        frappe.throw(
+            frappe._(
+                "Work Order {0}: Finished qty is missing on Stock Entry."
+            ).format(frappe.bold(work_order)),
+            title=frappe._("Missing Finished Good"),
+        )
+
+    has_rm = any(
+        row.s_warehouse and flt(row.qty) > 0 for row in (se.get("items") or [])
+    )
+    if not has_rm:
+        extra = ""
+        if removed:
+            extra = " " + frappe._(
+                "Removed zero-qty row(s) for: {0}."
+            ).format(", ".join(frappe.bold(i) for i in removed))
+        frappe.throw(
+            frappe._(
+                "Work Order {0}: No raw material qty to consume on the Manufacture "
+                "Stock Entry.{1} Check Finish Work Order → Raw Materials — each "
+                "consume row needs qty > 0, Batch (if batch-tracked), and Source Warehouse."
+            ).format(frappe.bold(work_order), extra),
+            title=frappe._("Raw Materials Required"),
+        )
 
 
 def _warehouse_for_batch_stock(item_code, batch_no):
