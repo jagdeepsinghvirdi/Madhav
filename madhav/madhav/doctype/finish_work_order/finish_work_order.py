@@ -62,22 +62,17 @@ class FinishWorkOrder(Document):
         for row in self.raw_materials:
             if not row.item_code:
                 continue
-            if flt(row.qty) <= 0:
-                frappe.throw(
-                    frappe._(
-                        "Row #{0}: Quantity for Raw Material {1} cannot be zero. "
-                        "Enter the qty to consume (BOM fetch / batch selection must leave a positive qty)."
-                    ).format(row.idx, frappe.bold(row.item_code)),
-                    title=frappe._("Invalid Raw Material Qty"),
-                )
+            # Zero-qty RM rows are skipped in the consume pool (same as before).
+            # Do not hard-block the whole FWO — unused / extra BOM lines with
+            # qty 0 were previously allowed and must stay allowed on demo.
             has_batch_no = frappe.get_cached_value("Item", row.item_code, "has_batch_no")
-            if has_batch_no and not row.batch_no:
+            if has_batch_no and not row.batch_no and flt(row.qty) > 0:
                 frappe.throw(
                     frappe._("Row #{0}: Batch No is required for item {1} (batch-tracked item).").format(
                         row.idx, row.item_code
                     )
                 )
-            if row.batch_no:
+            if row.batch_no and flt(row.qty) > 0:
                 batch_item = frappe.db.get_value("Batch", row.batch_no, "item")
                 if batch_item and batch_item != row.item_code:
                     frappe.throw(
@@ -95,7 +90,7 @@ class FinishWorkOrder(Document):
         for row in self.pending_work_orders:
             if row.ready_qty and row.ready_pieces and row.length_size:
                 row.calculated_section_weight = (flt(row.ready_qty) * 1000)/(flt(row.ready_pieces) * flt(row.length_size))
-            row.calculated_qty = (flt(row.ready_pieces) * flt(row.standard_weight) * flt(row.length_size)) /1000
+                row.calculated_qty = (flt(row.ready_pieces) * flt(row.standard_weight) * flt(row.length_size)) /1000
             if not row.sales_order:
                 row.deliver_as_qty = 1
             if row.make_it_unplanned:
@@ -521,6 +516,9 @@ class FinishWorkOrder(Document):
                 se.finished_good = pwo.item
                 se.fg_completed_qty = pwo.ready_qty if pwo.deliver_as_qty else pwo.calculated_qty
                 se.finished_good_quantity = pwo.ready_qty if pwo.deliver_as_qty else pwo.calculated_qty
+                # Marks this SE as FWO-built so CustomStockEntry can drop
+                # stray zero-qty rows without affecting normal Manufacture SE.
+                se.flags.madhav_fwo_manufacture = True
 
                 # ✅ FIXED: Set BOTH posting_date AND posting_time
                 se.set_posting_time = 1
@@ -672,26 +670,37 @@ class FinishWorkOrder(Document):
 
                 se.fg_completed_qty = fg_final_qty
 
-                # Final guard: never hand ERPNext a zero-qty row (its message
-                # hides which FWO RM line caused it).
+                # Drop any zero-qty rows before insert (ERPNext Invalid Quantity).
                 for row in list(se.items):
                     if flt(row.qty) <= 0:
-                        frappe.throw(
-                            frappe._(
-                                "Work Order {0}: Stock Entry row for item {1} has "
-                                "qty 0. Fix Raw Materials qty/batch (item must match "
-                                "batch item) and try again."
-                            ).format(frappe.bold(pwo.work_order), frappe.bold(row.item_code))
-                        )
+                        se.remove(row)
+                if not any(cint(row.is_finished_item) for row in se.items):
+                    frappe.throw(
+                        frappe._(
+                            "Work Order {0}: Finished qty is missing on Stock Entry."
+                        ).format(frappe.bold(pwo.work_order))
+                    )
+                if not any(
+                    (not cint(row.is_finished_item) and not cint(row.is_scrap_item))
+                    for row in se.items
+                ):
+                    frappe.throw(
+                        frappe._(
+                            "Work Order {0}: No raw material qty to consume. "
+                            "Check Raw Materials table — at least one row needs qty > 0."
+                        ).format(frappe.bold(pwo.work_order))
+                    )
 
                 # Submit Stock Entry
                 # from_bom=0 makes ERPNext clear fg_completed_qty during
                 # insert validate; restore before submit so For Quantity
                 # still matches the finished row (7.56 vs 0.0 error).
+                se.flags.madhav_fwo_manufacture = True
                 se.insert()
                 se.fg_completed_qty = fg_final_qty
                 if hasattr(se, "finished_good_quantity"):
                     se.finished_good_quantity = fg_final_qty
+                se.flags.madhav_fwo_manufacture = True
                 se.submit()
                 pwo.db_set("stock_entry_reference", se.name)
                 
