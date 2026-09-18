@@ -773,99 +773,137 @@ class StockTransfer(Document):
 
 @frappe.whitelist()
 def get_batch_stock(
-    source_warehouse=None,
-    from_date=None,
-    to_date=None,
-    item_name=None
+	source_warehouse=None,
+	from_date=None,
+	to_date=None,
+	item_name=None,
+	target_warehouse=None,
 ):
-    conditions = [
-    "sabb.warehouse = %(source_warehouse)s",
-    "sbe.warehouse = %(source_warehouse)s"
-    ]
+	"""Batches still physically in ``source_warehouse`` for Fetch Details.
 
-    if from_date and to_date:
-        conditions.append(
-            "sabb.posting_date BETWEEN %(from_date)s AND %(to_date)s"
-        )
+	Qty is always the **live SLE balance** for that batch in the warehouse.
+	That way a partial Stock Transfer leaves the remainder visible on the
+	next Fetch Details — the old SABB ``SUM(qty - delivered_qty)`` path
+	could drop remainders when date filters excluded the inward bundle or
+	when bundle rows did not net cleanly after an outward Material Transfer.
 
-    if item_name:
-        conditions.append(
-            "i.item_name LIKE %(item_name)s"
-        )
+	``from_date`` / ``to_date`` only restrict *which batches* appear (those
+	with an inward posting in range). They never change how remaining qty
+	is calculated.
 
-    where_clause = " AND ".join(conditions)
+	``target_warehouse`` is accepted for client compatibility; unused.
+	"""
+	if not source_warehouse:
+		return []
 
-    data = frappe.db.sql(
-        f"""
-        SELECT
-            sbe.batch_no,
-            MAX(sabb.item_code) AS item_code,
-            MAX(i.item_name) AS item_name,
+	conditions = [
+		"sle.warehouse = %(source_warehouse)s",
+		"sle.is_cancelled = 0",
+		"IFNULL(sle.serial_and_batch_bundle, '') != ''",
+		"IFNULL(sbe.batch_no, '') != ''",
+	]
+	params = {"source_warehouse": source_warehouse}
 
-            SUM(
-                sbe.qty - IFNULL(sbe.delivered_qty, 0)
-            ) AS qty,
+	if item_name:
+		conditions.append("i.item_name LIKE %(item_name)s")
+		params["item_name"] = f"%{item_name}%"
 
-            IFNULL(MAX(p.pieces), 0) AS pieces,
+	# Optional: only batches that received stock in this warehouse in range.
+	# Remaining qty is still full live balance (includes older inwards).
+	date_batch_filter = ""
+	if from_date and to_date:
+		date_batch_filter = """
+			AND sbe.batch_no IN (
+				SELECT sbe_d.batch_no
+				FROM `tabStock Ledger Entry` sle_d
+				INNER JOIN `tabSerial and Batch Entry` sbe_d
+					ON sbe_d.parent = sle_d.serial_and_batch_bundle
+				WHERE sle_d.warehouse = %(source_warehouse)s
+				  AND sle_d.is_cancelled = 0
+				  AND sle_d.actual_qty > 0
+				  AND sle_d.posting_date BETWEEN %(from_date)s AND %(to_date)s
+				  AND IFNULL(sbe_d.batch_no, '') != ''
+			)
+		"""
+		params["from_date"] = from_date
+		params["to_date"] = to_date
 
-            MAX(b.average_length) AS average_length,
-            MAX(b.section_weight) AS section_weight,
-            MAX(b.reference_doctype) AS reference_doctype,
-            MAX(b.reference_name) AS reference_name
+	where_clause = " AND ".join(conditions)
 
-        FROM `tabSerial and Batch Entry` sbe
+	data = frappe.db.sql(
+		f"""
+		SELECT
+			sbe.batch_no,
+			MAX(sle.item_code) AS item_code,
+			MAX(i.item_name) AS item_name,
 
-        INNER JOIN `tabSerial and Batch Bundle` sabb
-            ON sabb.name = sbe.parent
+			SUM(SIGN(sle.actual_qty) * ABS(sbe.qty)) AS qty,
 
-        LEFT JOIN `tabBatch` b
-            ON b.name = sbe.batch_no
+			IFNULL(MAX(p.pieces), 0) AS pieces,
 
-        LEFT JOIN `tabItem` i
-            ON i.name = sabb.item_code
+			MAX(b.average_length) AS average_length,
+			MAX(b.section_weight) AS section_weight,
+			MAX(b.reference_doctype) AS reference_doctype,
+			MAX(b.reference_name) AS reference_name
 
-        LEFT JOIN (
-            SELECT
-                sbe2.batch_no,
-                psle.warehouse,
-                SUM(psle.actual_qty) AS pieces
-            FROM `tabPiece Stock Ledger Entry` psle
-            INNER JOIN `tabSerial and Batch Entry` sbe2
-                ON sbe2.parent = psle.serial_and_batch_bundle
-            WHERE IFNULL(psle.is_cancelled, 0) = 0
-            GROUP BY
-                sbe2.batch_no,
-                psle.warehouse
-        ) p
-            ON p.batch_no = sbe.batch_no
-            AND p.warehouse = sbe.warehouse
+		FROM `tabStock Ledger Entry` sle
 
-        WHERE
-            {where_clause}
-            AND sabb.is_cancelled = 0
-            And sabb.docstatus = 1
+		INNER JOIN `tabSerial and Batch Entry` sbe
+			ON sbe.parent = sle.serial_and_batch_bundle
 
-        GROUP BY
-            sbe.batch_no
+		LEFT JOIN `tabBatch` b
+			ON b.name = sbe.batch_no
 
-        HAVING
-            SUM(
-                sbe.qty - IFNULL(sbe.delivered_qty, 0)
-            ) > 0
+		LEFT JOIN `tabItem` i
+			ON i.name = sle.item_code
 
-        ORDER BY
-            MAX(sabb.posting_date) ASC
-        """,
-        {
-            "source_warehouse": source_warehouse,
-            "from_date": from_date,
-            "to_date": to_date,
-            "item_name": f"%{item_name}%" if item_name else None,
-        },
-        as_dict=1,
-    )
-    _fill_missing_batch_dimensions(data)
-    return data
+		LEFT JOIN (
+			SELECT
+				sbe2.batch_no,
+				psle.warehouse,
+				SUM(psle.actual_qty) AS pieces
+			FROM `tabPiece Stock Ledger Entry` psle
+			INNER JOIN `tabSerial and Batch Entry` sbe2
+				ON sbe2.parent = psle.serial_and_batch_bundle
+			WHERE IFNULL(psle.is_cancelled, 0) = 0
+			GROUP BY
+				sbe2.batch_no,
+				psle.warehouse
+		) p
+			ON p.batch_no = sbe.batch_no
+			AND p.warehouse = sle.warehouse
+
+		WHERE
+			{where_clause}
+			{date_batch_filter}
+
+		GROUP BY
+			sbe.batch_no
+
+		HAVING
+			SUM(SIGN(sle.actual_qty) * ABS(sbe.qty)) > 0.0001
+
+		ORDER BY
+			MIN(sle.posting_date) ASC
+		""",
+		params,
+		as_dict=1,
+	)
+	_fill_missing_batch_dimensions(data)
+	return data
+
+
+@frappe.whitelist()
+def get_transfer_batch_limits(item_code, warehouse, batch_no):
+	"""Live qty/pieces in warehouse for Stock Transfer row validation.
+
+	Batch.batch_qty / Batch.pieces are receipt-size totals and stay wrong
+	after a partial Material Transfer — do not use them as transfer caps.
+	"""
+	return {
+		"qty": get_live_batch_qty(item_code, warehouse, batch_no),
+		"pieces": get_live_batch_pieces(item_code, warehouse, batch_no),
+	}
 
 
 def _fill_missing_batch_dimensions(rows):

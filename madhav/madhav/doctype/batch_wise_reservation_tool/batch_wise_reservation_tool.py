@@ -781,6 +781,18 @@ def add_to_reservation_batches(
 	sales_order_item_qty=0, length=0, pieces=0, section_weight=0,
 	warehouse=None, posting_date=None,
 ):
+	if (
+		not docname
+		or str(docname).startswith("new-")
+		or not frappe.db.exists("Batch Wise Reservation Tool", docname)
+	):
+		frappe.throw(
+			frappe._(
+				"Please Save the Batch Wise Reservation Tool first, then click Reserve."
+			),
+			title=frappe._("Document Not Saved"),
+		)
+
 	doc = frappe.get_doc("Batch Wise Reservation Tool", docname)
 	if doc.docstatus != 0:
 		frappe.throw(frappe._("Cannot modify a submitted or cancelled document."))

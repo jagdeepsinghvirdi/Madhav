@@ -334,6 +334,15 @@ from madhav.madhav.monkey_patch.selling_controller import (
 
 SellingController.update_stock_reservation_entries = madhav_update_stock_reservation_entries
 
+from erpnext.stock.doctype.delivery_note.delivery_note import DeliveryNote
+from madhav.madhav.monkey_patch.delivery_note import (
+	validate_against_stock_reservation_entries as madhav_validate_against_stock_reservation_entries,
+)
+
+DeliveryNote.validate_against_stock_reservation_entries = (
+	madhav_validate_against_stock_reservation_entries
+)
+
 # from erpnext.controllers.selling_controller import SellingController
 # from madhav.madhav.monkey_patch.selling_controller import get_sle_for_source_warehouse
 # SellingController.get_sle_for_source_warehouse = get_sle_for_source_warehouse

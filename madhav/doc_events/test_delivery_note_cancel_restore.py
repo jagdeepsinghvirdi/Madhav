@@ -81,3 +81,50 @@ class TestDNCancelSRERestoreHelpers(FrappeTestCase):
 		):
 			room = _voucher_reservation_headroom("SO-1", "soi-1", 10.0, exclude_dn="DN-B")
 			self.assertAlmostEqual(flt(room), 6.0)
+
+	def test_capacity_error_detected_for_allowed_qty_message(self):
+		from madhav.doc_events.delivery_note import _is_reservation_capacity_error
+
+		self.assertTrue(
+			_is_reservation_capacity_error(
+				Exception("Cannot reserve more than Allowed Qty 1.177 Tonne for Item FG003197")
+			)
+		)
+		self.assertFalse(_is_reservation_capacity_error(Exception("Serial No missing")))
+
+	def test_snapshot_qty_within_allowed_qty_uses_min_of_stock_and_so(self):
+		from madhav.doc_events.delivery_note import _snapshot_qty_within_allowed_qty
+
+		with patch(
+			"erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry.get_available_qty_to_reserve",
+			return_value=1.56,
+		), patch(
+			"madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool.get_so_line_allowance",
+			return_value=1.177,
+		):
+			self.assertFalse(
+				_snapshot_qty_within_allowed_qty(
+					"FG003197",
+					"For Mill (EXTRA) - MUPL",
+					"MU-SO26-00739",
+					"v04epfe1kp",
+					1.56,
+					"Batch Wise Reservation Tool",
+					0,
+				)
+			)
+			self.assertTrue(
+				_snapshot_qty_within_allowed_qty(
+					"FG003197",
+					"For Mill (EXTRA) - MUPL",
+					"MU-SO26-00739",
+					"v04epfe1kp",
+					1.177,
+					"Batch Wise Reservation Tool",
+					0,
+				)
+			)
+
+
+if __name__ == "__main__":
+	unittest.main()

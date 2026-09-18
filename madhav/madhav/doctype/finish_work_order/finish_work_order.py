@@ -1064,50 +1064,11 @@ def get_available_batches(doctype, txt, searchfield, start, page_len, filters):
 
 @frappe.whitelist()
 def get_bom_raw_materials_for_items(items):
-    """
-    items: JSON list of {"item_code": <FG item>, "qty": <ready_qty>}
+	"""Disabled: Fetch Pending Work Orders must not auto-fill Raw Materials.
 
-    For each FG item, pulls its default submitted BOM, scales BOM Item
-    quantities to the given qty, and aggregates by raw material item_code
-    across all items passed in (so two WOs needing the same RM produce
-    one combined row, matching how the FIFO pool in before_submit expects it).
-    """
-    frappe.logger().info(f"RM FETCH CALLED WITH: {items}")
-    import json
-    from frappe.utils import flt
-
-    if isinstance(items, str):
-        items = json.loads(items)
-
-    aggregated = {}
-
-    for entry in items:
-        item_code = entry.get("item_code")
-        qty = flt(entry.get("qty"))
-        if not item_code or qty <= 0:
-            continue
-
-        bom_name = frappe.db.get_value(
-            "BOM",
-            {"item": item_code, "is_default": 1, "docstatus": 1},
-            "name"
-        )
-        if not bom_name:
-            frappe.log_error(
-                title="Missing Default BOM",
-                message=f"No default submitted BOM for item {item_code} "
-                        f"while auto-fetching raw materials for Finish Work Order."
-            )
-            continue
-
-        bom = frappe.get_cached_doc("BOM", bom_name)
-        bom_qty = flt(bom.quantity) or 1
-
-        for bom_item in bom.items:
-            required_qty = flt(bom_item.qty) * qty / bom_qty
-            aggregated[bom_item.item_code] = aggregated.get(bom_item.item_code, 0) + required_qty
-
-    return [
-        {"item_code": item_code, "qty": flt(qty, 3)}
-        for item_code, qty in aggregated.items()
-    ]
+	Previously this scaled default BOM components into the FWO Raw Materials
+	table. Shop-floor flow expects RM to be entered manually (item / batch /
+	warehouse / qty). Kept as a whitelist stub so any cached client still
+	calling it receives an empty list instead of populating RM rows.
+	"""
+	return []

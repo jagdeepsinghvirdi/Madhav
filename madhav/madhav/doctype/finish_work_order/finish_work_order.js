@@ -161,8 +161,11 @@ frappe.ui.form.on("Finish Work Order", {
                     });
 
                     frm.refresh_field("pending_work_orders");
+                    // Explicitly leave Raw Materials untouched / empty — never
+                    // auto-fill from BOM on this button (cached clients used to).
+                    frm.clear_table("raw_materials");
+                    frm.refresh_field("raw_materials");
                     frm.dirty();
-                    fetch_raw_materials_from_bom(frm);  
 
                     frappe.msgprint(
                         __("Fetched {0} Work Orders", [r.message.length])
@@ -172,51 +175,6 @@ frappe.ui.form.on("Finish Work Order", {
         });
     }
 });
-
-function fetch_raw_materials_from_bom(frm) {
-    let items = (frm.doc.pending_work_orders || [])
-        .filter(row => row.item && row.ready_qty)
-        .map(row => ({ item_code: row.item, qty: row.ready_qty }));
-
-    if (!items.length) return;
-
-    frappe.call({
-        method: "madhav.madhav.doctype.finish_work_order.finish_work_order.get_bom_raw_materials_for_items",
-        args: { items: items },
-        callback(r) {
-            if (!r.exc && r.message) {
-                frm.clear_table("raw_materials");
-                let skipped = [];
-                r.message.forEach(rm => {
-                    // A BOM component can compute to qty 0 (e.g. tiny BOM
-                    // ratio x small Ready Qty rounding to 0.000). Adding it
-                    // anyway left a silent zero-qty row that only surfaced
-                    // as a submit-time error naming the item; skip it here
-                    // instead and tell the user so they can enter it by hand.
-                    if (!flt(rm.qty)) {
-                        skipped.push(rm.item_code);
-                        return;
-                    }
-                    let row = frm.add_child("raw_materials");
-                    row.item_code = rm.item_code;
-                    row.qty = rm.qty;
-                });
-                frm.refresh_field("raw_materials");
-                frm.dirty();
-                if (skipped.length) {
-                    frappe.msgprint({
-                        title: __("Zero BOM Quantity"),
-                        indicator: "orange",
-                        message: __(
-                            "Computed qty was 0 for: {0}. Not added — enter the row manually with the correct Qty, Batch, and Source Warehouse if this material is actually required.",
-                            [skipped.map(i => frappe.bold(i)).join(", ")]
-                        )
-                    });
-                }
-            }
-        }
-    });
-}
 
 frappe.ui.form.on('Raw Material Items', {
     item_code: function(frm, cdt, cdn) {
