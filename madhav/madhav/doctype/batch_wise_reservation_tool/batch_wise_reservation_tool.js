@@ -367,6 +367,24 @@ frappe.ui.form.on("Available Stock Batches", {
 			return;
 		}
 
+		// add_to_reservation_batches loads the doc by name then saves.
+		// New / dirty forms still have name like new-batch-wise-... which
+		// is not in the DB — save first so Reserve does not 404.
+		try {
+			if (frm.is_new() || frm.is_dirty()) {
+				await frm.save();
+			}
+		} catch (e) {
+			frappe.msgprint({
+				title: __("Save Required"),
+				indicator: "red",
+				message: __(
+					"Could not save the Batch Wise Reservation Tool before reserving. Fix any validation errors, Save, then click Reserve again."
+				),
+			});
+			return;
+		}
+
 		const tolerance_warehouse = await madhav_load_tolerance_warehouse(frm);
 
 		frappe.call({

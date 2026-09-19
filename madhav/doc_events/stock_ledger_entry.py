@@ -114,7 +114,10 @@ def _has_legacy_null_batch_psle(batch_no):
 	"""
 	if not batch_no:
 		return False
-	return bool(
+	cache = frappe.flags.setdefault("_madhav_legacy_null_batch_psle", {})
+	if batch_no in cache:
+		return cache[batch_no]
+	found = bool(
 		frappe.db.sql(
 			"""
 			SELECT 1
@@ -139,6 +142,8 @@ def _has_legacy_null_batch_psle(batch_no):
 			batch_no,
 		)
 	)
+	cache[batch_no] = found
+	return found
 
 
 def _batch_has_piece_ledger_history(batch_no):

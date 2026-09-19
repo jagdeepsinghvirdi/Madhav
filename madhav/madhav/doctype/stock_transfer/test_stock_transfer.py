@@ -1493,3 +1493,95 @@ class TestStockTransferCancelRollbackE2E(FrappeTestCase):
 
 		# Stock Entry untouched, so no silent stock loss.
 		self.assertEqual(frappe.db.get_value("Stock Entry", se_name, "docstatus"), 1)
+
+	def test_fetch_details_shows_remainder_after_partial_transfer(self):
+		"""Partial ST must leave remaining source qty on the next Fetch Details.
+
+		Client report: after transferring only part of a fetched batch, the
+		leftover qty did not appear when Fetch Details was clicked again.
+		"""
+		from madhav.madhav.doctype.stock_transfer.stock_transfer import get_batch_stock
+
+		_, batch_no = self._receive_stock()
+		full_qty = self.RECEIPT_QTY
+		half_qty = flt(full_qty / 2, 3)
+		half_pieces = max(1, int(self.RECEIPT_PIECES / 2))
+
+		before = {
+			d.batch_no: flt(d.qty)
+			for d in get_batch_stock(source_warehouse=self.source_warehouse)
+		}
+		self.assertAlmostEqual(
+			before.get(batch_no),
+			full_qty,
+			places=3,
+			msg="setup: full batch must be fetchable before any transfer",
+		)
+
+		st = self._make_transfer(batch_no, qty=half_qty, pieces=half_pieces)
+
+		after = {
+			d.batch_no: flt(d.qty)
+			for d in get_batch_stock(source_warehouse=self.source_warehouse)
+		}
+		self.assertIn(
+			batch_no,
+			after,
+			"remaining batch qty must still appear on Fetch Details",
+		)
+		self.assertAlmostEqual(
+			after[batch_no],
+			flt(full_qty - half_qty, 3),
+			places=3,
+			msg="Fetch Details qty must equal live remainder after partial transfer",
+		)
+
+		# Second partial of the remainder must also leave a visible leftover.
+		rem = after[batch_no]
+		second_qty = flt(rem / 2, 3)
+		second_pcs = max(1, int(half_pieces / 2))
+		st2 = self._make_transfer(batch_no, qty=second_qty, pieces=second_pcs)
+
+		final = {
+			d.batch_no: flt(d.qty)
+			for d in get_batch_stock(source_warehouse=self.source_warehouse)
+		}
+		self.assertIn(batch_no, final)
+		self.assertAlmostEqual(
+			final[batch_no],
+			flt(rem - second_qty, 3),
+			places=3,
+		)
+
+	def test_fetch_details_date_filter_does_not_hide_remainder(self):
+		"""Date filter selects batches by inward date; qty stays live remainder."""
+		from madhav.madhav.doctype.stock_transfer.stock_transfer import get_batch_stock
+		from frappe.utils import add_days
+
+		_, batch_no = self._receive_stock()
+		half_qty = flt(self.RECEIPT_QTY / 2, 3)
+		half_pieces = max(1, int(self.RECEIPT_PIECES / 2))
+		self._make_transfer(batch_no, qty=half_qty, pieces=half_pieces)
+
+		today = nowdate()
+		rows = get_batch_stock(
+			source_warehouse=self.source_warehouse,
+			from_date=today,
+			to_date=today,
+		)
+		by_batch = {d.batch_no: flt(d.qty) for d in rows}
+		self.assertIn(batch_no, by_batch)
+		self.assertAlmostEqual(
+			by_batch[batch_no],
+			flt(self.RECEIPT_QTY - half_qty, 3),
+			places=3,
+			msg="filtering by today must still show live remainder, not only today's outward",
+		)
+
+		# Range that excludes the receipt must not list the batch.
+		rows_old = get_batch_stock(
+			source_warehouse=self.source_warehouse,
+			from_date=add_days(today, -10),
+			to_date=add_days(today, -5),
+		)
+		self.assertNotIn(batch_no, {d.batch_no for d in rows_old})

@@ -1,5 +1,6 @@
 frappe.ui.form.on("Delivery Note", {
 	refresh(frm) {
+		block_duplicate_of_reserved_delivery_note(frm);
 		if (!should_customize_sales_order_picker(frm)) return;
 		setTimeout(() => {
 			frm.remove_custom_button(__("Sales Order"), __("Get Items From"));
@@ -52,6 +53,45 @@ frappe.ui.form.on("Delivery Note", {
 	//     update_totals(frm);
 	// },
 });
+
+function dn_has_sales_order_links(frm) {
+	return (frm.doc.items || []).some(
+		(row) => row.against_sales_order || row.so_detail || row.custom_sre
+	);
+}
+
+function block_duplicate_of_reserved_delivery_note(frm) {
+	// Duplicate drops against_sales_order / so_detail / custom_sre (no_copy),
+	// then FIFO fills wrong batches and Mill EXTRA warehouses get restamped.
+	// After cancel, users must recreate via Get Items From → Sales Order.
+	if (frm.is_new() || !dn_has_sales_order_links(frm)) return;
+
+	const replace_duplicate = () => {
+		const $dup = frm.page.menu
+			.find('[data-label="Duplicate"], [data-label="' + __("Duplicate") + '"]')
+			.closest("li");
+		if (!$dup.length) return false;
+		$dup.find("a").off("click").on("click", (e) => {
+			e.preventDefault();
+			e.stopPropagation();
+			frappe.msgprint({
+				title: __("Do not Duplicate"),
+				indicator: "orange",
+				message: __(
+					"This Delivery Note is linked to reserved Sales Order stock. " +
+						"Duplicate drops Sales Order / reservation links and can pick the wrong batch or warehouse. " +
+						"After cancel, create a new Delivery Note and use <b>Get Items From → Sales Order</b> " +
+						"so reserved batches (Finished Goods vs For Mill EXTRA) stay correct."
+				),
+			});
+		});
+		return true;
+	};
+
+	if (!replace_duplicate()) {
+		setTimeout(replace_duplicate, 400);
+	}
+}
 frappe.ui.form.on('Delivery Note Item', {
 	batch_no(frm, cdt, cdn) {
 		let d = locals[cdt][cdn];
@@ -338,15 +378,18 @@ function open_sales_order_items_selector_for_delivery_note(frm) {
 					if (r && r.message && r.message.items) {
 						r.message.items.forEach(item => {
 							const new_row = frm.add_child("items");
-							delete item.idx;   // ✅ remove server idx so Frappe assigns correct one
-							delete item.name;  // ✅ remove server name to avoid conflicts
-							Object.assign(new_row, item);
-							Object.assign(new_row, item);
+							delete item.idx;
+							delete item.name;
+							// Assign field-by-field so read_only link fields
+							// (against_sales_order, so_detail, custom_sre) stick.
+							Object.keys(item).forEach((key) => {
+								if (item[key] === undefined || item[key] === null) return;
+								new_row[key] = item[key];
+							});
 						});
 					}
 				});
 				frm.refresh_field("items");
-				frappe.model.sync && frappe.model.sync(results[0]?.message);
 				frm.refresh();
 			});
 		},

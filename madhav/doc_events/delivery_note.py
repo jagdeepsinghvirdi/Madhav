@@ -145,8 +145,66 @@ def before_validate(self, method):
     Sync order (first match wins), and only when the current warehouse is
     missing or not in the reserved-warehouse list — never rewrite a row
     that is already on a valid reserved warehouse (preserves existing flow).
+
+    Note: ``super().validate()`` can still rewrite warehouses after this
+    hook. The DeliveryNote monkey-patch re-runs the same sync immediately
+    before ``validate_against_stock_reservation_entries`` so multi-SRE /
+    Mill-EXTRA flows stay aligned.
     """
+    # Re-run on every save (not only insert): Create DN / Duplicate leftovers
+    # can carry a FIFO batch_no that is not the reserved batch; clear +
+    # rebuild from SRE and stamp custom_sre so WH pin survives validate.
+    populate_missing_batch_bundle(self)
     _sync_dn_item_warehouse_to_reservation(self)
+
+
+def _custom_sre_name(row):
+    """DN Item.custom_sre when present (Get Items / multi-SRE mapping)."""
+    if hasattr(row, "get"):
+        name = row.get("custom_sre")
+        if name:
+            return name
+    return getattr(row, "custom_sre", None)
+
+
+def _warehouse_from_custom_sre(row):
+    """Warehouse from the DN row's linked SRE, including Cancelled.
+
+    ``before_submit`` cancels SREs used for Deliver-as-Qty overage before
+    ``create_stock_reconciliation`` re-validates the DN. After that cancel,
+    active reserved warehouses for the SO line may only list a *sibling*
+    SRE (same item, other warehouse — FG vs For Mill EXTRA). Ignoring a
+    cancelled ``custom_sre`` then flips the row/bundle onto the sibling WH
+    and posts negative stock. The linked SRE warehouse stays authoritative
+    for this row even when status is Cancelled.
+    """
+    explicit_sre = _custom_sre_name(row)
+    if not explicit_sre:
+        return None
+
+    sre_vals = frappe.db.get_value(
+        "Stock Reservation Entry",
+        explicit_sre,
+        [
+            "warehouse",
+            "docstatus",
+            "status",
+            "voucher_no",
+            "voucher_detail_no",
+        ],
+        as_dict=True,
+    )
+    if not sre_vals or not sre_vals.warehouse:
+        return None
+    if cint(sre_vals.docstatus) not in (1, 2):
+        return None
+    if sre_vals.status == "Delivered":
+        return None
+    if row.against_sales_order and sre_vals.voucher_no != row.against_sales_order:
+        return None
+    if row.so_detail and sre_vals.voucher_detail_no != row.so_detail:
+        return None
+    return sre_vals.warehouse
 
 
 def _sync_dn_item_warehouse_to_reservation(doc):
@@ -161,23 +219,22 @@ def _sync_dn_item_warehouse_to_reservation(doc):
         reserved_warehouses = get_sre_reserved_warehouses_for_voucher(
             "Sales Order", row.against_sales_order, row.so_detail
         )
-        if not reserved_warehouses:
-            # No active reservation — leave warehouse alone (unreserved DN).
-            continue
-
+        reserved_set = set(reserved_warehouses or [])
         target_wh = None
 
-        # 1) Explicit SRE on the DN row
-        explicit_sre = row.get("custom_sre") if hasattr(row, "get") else None
-        if explicit_sre:
-            target_wh = frappe.db.get_value(
-                "Stock Reservation Entry", explicit_sre, "warehouse"
-            )
+        # 1) Explicit SRE on the DN row — authoritative for this SO line
+        #    (multi-WH same item: FG + For Mill EXTRA), including Cancelled
+        #    SREs after Deliver-as-Qty overage cancel in before_submit.
+        target_wh = _warehouse_from_custom_sre(row)
+
+        # No active reservation and no usable custom_sre — leave alone.
+        if not reserved_warehouses and not target_wh:
+            continue
 
         # 2) Batch matched on an SRE sb_entries row for this SO line
         #    (before bundle — bundle may still carry the SO nominal WH)
         batch_no = row.batch_no
-        if not batch_no and row.serial_and_batch_bundle:
+        if not target_wh and not batch_no and row.serial_and_batch_bundle:
             batch_no = frappe.db.get_value(
                 "Serial and Batch Entry",
                 {
@@ -187,19 +244,21 @@ def _sync_dn_item_warehouse_to_reservation(doc):
                 "batch_no",
                 order_by="idx asc",
             )
-        if not target_wh and batch_no:
-            target_wh = _sre_warehouse_for_batch(
+        if not target_wh and batch_no and reserved_set:
+            batch_wh = _sre_warehouse_for_batch(
                 row.against_sales_order, row.so_detail, batch_no
             )
+            if batch_wh and batch_wh in reserved_set:
+                target_wh = batch_wh
 
         # 3) Serial and Batch Bundle warehouse (when it is a reserved WH)
-        if not target_wh and row.serial_and_batch_bundle:
+        if not target_wh and row.serial_and_batch_bundle and reserved_set:
             bundle_wh = frappe.db.get_value(
                 "Serial and Batch Bundle",
                 row.serial_and_batch_bundle,
                 "warehouse",
             )
-            if bundle_wh and bundle_wh in reserved_warehouses:
+            if bundle_wh and bundle_wh in reserved_set:
                 target_wh = bundle_wh
 
         # Specific match (custom_sre / batch / reserved bundle) always wins —
@@ -212,10 +271,26 @@ def _sync_dn_item_warehouse_to_reservation(doc):
                     _align_bundle_warehouse(row.serial_and_batch_bundle, target_wh)
             continue
 
+        if not reserved_warehouses:
+            continue
+
         # No specific match: only rewrite when current WH is missing / not
         # reserved — preserves dual-warehouse flows that already pick a
-        # valid reserved warehouse.
-        if row.warehouse and row.warehouse in reserved_warehouses:
+        # valid reserved warehouse (2 SREs / 2 stock entries, same item).
+        if row.warehouse and row.warehouse in reserved_set:
+            continue
+
+        # Row already carries a concrete batch / bundle. Do not fall through
+        # to reserved_warehouses[0] — after a Mill EXTRA SRE is cancelled,
+        # only FG siblings remain reserved and this would restamp Mill stock
+        # onto Finished Goods (then merge duplicate FG batches).
+        if row.batch_no or row.serial_and_batch_bundle:
+            continue
+
+        # Multiple reserved WHs and no specific match: do not pick [0]
+        # (would swap FG ↔ Mill EXTRA for the same item). Stale custom_sre
+        # on a single reserved WH still falls through below.
+        if len(reserved_warehouses) > 1:
             continue
 
         target_wh = reserved_warehouses[0]
@@ -279,6 +354,73 @@ def _sre_warehouse_for_batch(sales_order, so_detail, batch_no):
     return rows[0][0] if rows else None
 
 
+def _batch_available_pieces_for_row(row):
+    """Live piece balance for a DN row's batch; Batch.pieces as legacy fallback."""
+    if not row.batch_no:
+        return 0
+    available = 0.0
+    has_live = False
+    if row.item_code and row.warehouse:
+        # Prefer Piece Stock Ledger. Fall back to Batch.pieces only when the
+        # ledger has never tracked this batch — not when live balance is 0.
+        has_live = bool(
+            frappe.db.sql(
+                """
+                SELECT 1 FROM `tabPiece Stock Ledger Entry` psle
+                WHERE psle.is_cancelled = 0
+                  AND (
+                    psle.batch_no = %(batch_no)s
+                    OR (
+                        IFNULL(psle.batch_no, '') = ''
+                        AND psle.serial_and_batch_bundle IS NOT NULL
+                        AND EXISTS (
+                            SELECT 1 FROM `tabSerial and Batch Entry` sbe
+                            WHERE sbe.parent = psle.serial_and_batch_bundle
+                              AND sbe.batch_no = %(batch_no)s
+                        )
+                    )
+                  )
+                LIMIT 1
+                """,
+                {"batch_no": row.batch_no},
+            )
+        )
+        available = get_batch_available_pieces(
+            row.item_code, row.warehouse, row.batch_no
+        )
+    if not has_live:
+        available = flt(frappe.db.get_value("Batch", row.batch_no, "pieces") or 0)
+    return flt(available)
+
+
+def _cap_dn_row_pieces_to_available(doc):
+    """Clamp Deliver-as-Qty DN row pieces to what the batch physically holds.
+
+    Deliver-as-Qty derives pieces from invoice_qty via int_pieces_from_qty
+    (rounds up). Qty shortfall can be topped by Stock Reconciliation, but
+    pieces cannot — so a row asking for 8 from a 4-piece batch must be
+    capped before ``_validate_piece_availability`` runs.
+
+    Only Deliver-as-Qty rows are capped so normal reserved / SABB flows
+    keep their explicit piece selection and fail loudly if over-picked.
+    Multiple DaQ rows on the same batch share one availability budget.
+    """
+    remaining = {}
+    for row in (doc.get("items") if hasattr(doc, "get") else None) or getattr(doc, "items", None) or []:
+        if not cint(getattr(row, "custom_deliver_as_qty", 0)):
+            continue
+        if not row.batch_no or not flt(getattr(row, "pieces", None) or 0):
+            continue
+        key = (row.batch_no, row.warehouse or "")
+        if key not in remaining:
+            remaining[key] = _batch_available_pieces_for_row(row)
+        avail = remaining[key]
+        requested = flt(row.pieces)
+        if requested > avail + 0.0001:
+            row.pieces = cint(avail) if avail > 0 else 0
+        remaining[key] = max(avail - flt(row.pieces), 0)
+
+
 def _validate_piece_availability(doc):
     """
     Pieces requested against a batch must never exceed the batch's
@@ -286,15 +428,25 @@ def _validate_piece_availability(doc):
     Stock Reconciliation on shortfall), an over-piece selection is
     always a hard error, since pieces are discrete physical units that
     can't be partially topped up the way weight/qty can.
+
+    Availability prefers the Piece Stock Ledger (warehouse-aware); Batch
+    master pieces are the fallback for batches that predate PSLE.
     """
     pieces_needed = {}
+    available_by_batch = {}
     for row in doc.items:
-        if not row.batch_no or not flt(row.get("pieces")):
+        if not row.batch_no or not flt(getattr(row, "pieces", None) or 0):
             continue
         pieces_needed[row.batch_no] = pieces_needed.get(row.batch_no, 0) + flt(row.pieces)
+        key = row.batch_no
+        # Same batch on one DN should share one warehouse in practice;
+        # take the max live balance seen so multi-warehouse edge cases
+        # are not under-counted as zero.
+        live = _batch_available_pieces_for_row(row)
+        available_by_batch[key] = max(available_by_batch.get(key, 0), live)
 
     for batch_no, needed in pieces_needed.items():
-        available_pieces = flt(frappe.db.get_value("Batch", batch_no, "pieces") or 0)
+        available_pieces = available_by_batch.get(batch_no, 0)
         if needed > available_pieces + 0.0001:
             frappe.throw(
                 _(
@@ -498,11 +650,37 @@ def populate_missing_batch_bundle(self):
       - Any remaining warehouses get their own additional DN Item rows,
         rather than being silently merged into the primary bundle (which
         previously caused over-counted / warehouse-inconsistent bundles).
+
+    Also: a FIFO / Duplicate-filled ``batch_no`` that is NOT on any active
+    SRE for this SO line is cleared and rebuilt from reservation, and
+    ``custom_sre`` is stamped so Mill EXTRA vs FG warehouse pin survives
+    ``set_missing_values``.
     """
+    meta_has_sre = frappe.get_meta("Delivery Note Item").has_field("custom_sre")
+
     for item in self.items:
         if not item.against_sales_order or not item.so_detail:
             continue
+
+        # FIFO / Duplicate often leaves a batch that is not the reserved one.
+        # Clear it only when THIS warehouse still has an active reservation to
+        # rebuild from — otherwise keep the physical batch (e.g. Mill EXTRA
+        # after a BWRT SRE was cancelled for Deliver-as-Qty overage).
+        if (
+            item.batch_no
+            and not item.serial_and_batch_bundle
+            and not _batch_is_reserved_for_so_line(
+                item.against_sales_order, item.so_detail, item.batch_no
+            )
+            and _so_line_has_active_batch_sre_in_warehouse(
+                item.against_sales_order, item.so_detail, item.warehouse
+            )
+        ):
+            item.batch_no = None
+
         if item.serial_and_batch_bundle or item.batch_no:
+            if meta_has_sre and not _custom_sre_name(item) and item.batch_no:
+                _stamp_custom_sre_from_batch(item)
             continue
 
         sre_list = frappe.get_all(
@@ -528,6 +706,16 @@ def populate_missing_batch_bundle(self):
         if not batch_sres:
             continue
 
+        # Row already pinned to a warehouse (multi-WH same SO line): only
+        # rebuild from that warehouse. Pulling every SRE onto this row
+        # merged sibling FG reservations (same batch twice) and wiped Mill.
+        warehouse_scoped = False
+        if item.warehouse:
+            scoped = [s for s in batch_sres if s.warehouse == item.warehouse]
+            if scoped:
+                batch_sres = scoped
+                warehouse_scoped = True
+
         by_warehouse = {}
         for sre in batch_sres:
             by_warehouse.setdefault(sre.warehouse, []).append(sre)
@@ -547,9 +735,128 @@ def populate_missing_batch_bundle(self):
         if bundle_name:
             item.serial_and_batch_bundle = bundle_name
             item.warehouse = primary_warehouse
+            if meta_has_sre and len(primary_sres) == 1:
+                item.custom_sre = primary_sres[0].name
+
+        if warehouse_scoped:
+            continue
 
         for other_warehouse, other_sres in ordered[1:]:
             _append_dn_row_for_other_warehouse(self, item, other_warehouse, other_sres)
+
+
+def _so_line_has_active_batch_sre_in_warehouse(sales_order, so_detail, warehouse):
+    """True when this SO line still has an active Serial/Batch SRE in warehouse."""
+    if not sales_order or not so_detail or not warehouse:
+        return False
+    return bool(
+        frappe.db.sql(
+            """
+            SELECT 1
+            FROM `tabStock Reservation Entry` sre
+            WHERE sre.docstatus = 1
+              AND sre.voucher_type = 'Sales Order'
+              AND sre.voucher_no = %s
+              AND sre.voucher_detail_no = %s
+              AND sre.warehouse = %s
+              AND sre.reservation_based_on = 'Serial and Batch'
+              AND sre.status NOT IN ('Delivered', 'Cancelled')
+            LIMIT 1
+            """,
+            (sales_order, so_detail, warehouse),
+        )
+    )
+
+
+def _batch_is_reserved_for_so_line(sales_order, so_detail, batch_no):
+    """True when an active SRE for this SO line still holds this batch."""
+    if not sales_order or not so_detail or not batch_no:
+        return False
+    return bool(
+        frappe.db.sql(
+            """
+            SELECT 1
+            FROM `tabStock Reservation Entry` sre
+            INNER JOIN `tabSerial and Batch Entry` sbe
+                ON sbe.parent = sre.name
+                AND sbe.parenttype = 'Stock Reservation Entry'
+            WHERE sre.docstatus = 1
+              AND sre.voucher_type = 'Sales Order'
+              AND sre.voucher_no = %s
+              AND sre.voucher_detail_no = %s
+              AND sre.status NOT IN ('Delivered', 'Cancelled')
+              AND sbe.batch_no = %s
+              AND (IFNULL(sbe.qty, 0) - IFNULL(sbe.delivered_qty, 0)) > 0
+            LIMIT 1
+            """,
+            (sales_order, so_detail, batch_no),
+        )
+    )
+
+
+def _stamp_custom_sre_from_batch(item):
+    """Pin custom_sre from an *active* SRE that holds this row's batch.
+
+    Never stamp a Cancelled SRE here — Link fields reject cancelled
+    documents on save (``Cannot link cancelled document``). Warehouse
+    allowance for cancelled Mill EXTRA SREs is handled separately in
+    ``_allowed_warehouses_for_dn_item`` via batch lookup.
+    """
+    if not item.batch_no or not item.against_sales_order or not item.so_detail:
+        return
+
+    active = frappe.db.sql(
+        """
+        SELECT sre.name
+        FROM `tabStock Reservation Entry` sre
+        INNER JOIN `tabSerial and Batch Entry` sbe
+            ON sbe.parent = sre.name
+            AND sbe.parenttype = 'Stock Reservation Entry'
+        WHERE sre.docstatus = 1
+          AND sre.voucher_type = 'Sales Order'
+          AND sre.voucher_no = %s
+          AND sre.voucher_detail_no = %s
+          AND sre.status NOT IN ('Delivered', 'Cancelled')
+          AND sbe.batch_no = %s
+          AND (IFNULL(sbe.qty, 0) - IFNULL(sbe.delivered_qty, 0)) > 0
+        ORDER BY sre.creation
+        LIMIT 1
+        """,
+        (item.against_sales_order, item.so_detail, item.batch_no),
+    )
+    if active:
+        item.custom_sre = active[0][0]
+
+
+def _sre_warehouse_for_batch_including_cancelled(sales_order, so_detail, batch_no):
+    """Warehouse of an SRE (active or Cancelled) that held this batch on the SO line.
+
+    Deliver-as-Qty overage cancels the Mill EXTRA SRE before submit finishes.
+    Active reserved warehouses then only list Finished Goods siblings, but the
+    DN row still ships the Mill batch. Validation must allow that warehouse
+    without writing a cancelled name into ``custom_sre`` (Link rejects it).
+    """
+    if not sales_order or not so_detail or not batch_no:
+        return None
+    rows = frappe.db.sql(
+        """
+        SELECT sre.warehouse
+        FROM `tabStock Reservation Entry` sre
+        INNER JOIN `tabSerial and Batch Entry` sbe
+            ON sbe.parent = sre.name
+            AND sbe.parenttype = 'Stock Reservation Entry'
+        WHERE sre.voucher_type = 'Sales Order'
+          AND sre.voucher_no = %s
+          AND sre.voucher_detail_no = %s
+          AND sbe.batch_no = %s
+          AND sre.docstatus IN (1, 2)
+          AND IFNULL(sre.status, '') != 'Delivered'
+        ORDER BY sre.docstatus ASC, sre.modified DESC
+        LIMIT 1
+        """,
+        (sales_order, so_detail, batch_no),
+    )
+    return rows[0][0] if rows else None
 
 
 def _total_sre_reserved_qty(sre_rows):
@@ -581,6 +888,24 @@ def _append_dn_row_for_other_warehouse(doc, source_item, warehouse, sre_rows):
     if not bundle_name:
         return
 
+    # Idempotent: validate / re-save must not keep appending twin rows.
+    for existing in doc.get("items") or []:
+        if (
+            existing is not source_item
+            and existing.so_detail == source_item.so_detail
+            and existing.warehouse == warehouse
+            and existing.item_code == source_item.item_code
+        ):
+            if not existing.serial_and_batch_bundle:
+                existing.serial_and_batch_bundle = bundle_name
+            if (
+                frappe.get_meta("Delivery Note Item").has_field("custom_sre")
+                and len(sre_rows) == 1
+                and not _custom_sre_name(existing)
+            ):
+                existing.custom_sre = sre_rows[0].name
+            return
+
     new_row = doc.append("items", {})
     new_row.item_code = source_item.item_code
     new_row.item_name = source_item.item_name
@@ -592,6 +917,11 @@ def _append_dn_row_for_other_warehouse(doc, source_item, warehouse, sre_rows):
     new_row.custom_deliver_as_qty = source_item.custom_deliver_as_qty
     new_row.warehouse = warehouse
     new_row.serial_and_batch_bundle = bundle_name
+    if (
+        frappe.get_meta("Delivery Note Item").has_field("custom_sre")
+        and len(sre_rows) == 1
+    ):
+        new_row.custom_sre = sre_rows[0].name
 
     bundle = frappe.get_doc("Serial and Batch Bundle", bundle_name)
     row_qty = sum(abs(flt(e.qty)) for e in bundle.entries if e.batch_no)
@@ -669,6 +999,24 @@ def _build_merged_batch_bundle(item, sre_rows, warehouse):
             entry["qty"] = avail_qty
             merged_entries.append(entry)
 
+    if not merged_entries:
+        return None
+
+    # Two Stock Transfers can reserve the same batch twice on one SO line.
+    # ERPNext Serial and Batch Bundle forbids duplicate batch_no in entries.
+    coalesced = {}
+    for e in merged_entries:
+        key = e.get("serial_no") or e.get("batch_no")
+        if not key:
+            continue
+        if key not in coalesced:
+            coalesced[key] = e
+            continue
+        existing = coalesced[key]
+        existing["qty"] = flt(existing.get("qty")) + flt(e.get("qty"))
+        existing["pieces"] = flt(existing.get("pieces")) + flt(e.get("pieces"))
+
+    merged_entries = list(coalesced.values())
     if not merged_entries:
         return None
 
@@ -1218,26 +1566,35 @@ def _batches_touched_by_delivery_note(doc):
 
     # Legacy null-batch manufacture PSLEs are not tagged; recover those
     # batches from Serial and Batch Entry on any SLE/PSLE bundle for this DN.
-    from_bundle = frappe.db.sql(
+    # Resolve bundle names first — a correlated IN (SELECT … FROM SLE)
+    # against tabSerial and Batch Entry full-scans and can lock the DN
+    # submit/cancel transaction for minutes.
+    bundle_rows = frappe.db.sql(
         """
-        SELECT DISTINCT sbe.batch_no
-        FROM `tabSerial and Batch Entry` sbe
-        WHERE sbe.parent IN (
-            SELECT serial_and_batch_bundle
-            FROM `tabStock Ledger Entry`
-            WHERE voucher_type = %s AND voucher_no = %s
-              AND IFNULL(serial_and_batch_bundle, '') != ''
-            UNION
-            SELECT serial_and_batch_bundle
-            FROM `tabPiece Stock Ledger Entry`
-            WHERE voucher_type = %s AND voucher_no = %s
-              AND IFNULL(serial_and_batch_bundle, '') != ''
-        )
-          AND IFNULL(sbe.batch_no, '') != ''
+        SELECT serial_and_batch_bundle
+        FROM `tabStock Ledger Entry`
+        WHERE voucher_type = %s AND voucher_no = %s
+          AND IFNULL(serial_and_batch_bundle, '') != ''
+        UNION
+        SELECT serial_and_batch_bundle
+        FROM `tabPiece Stock Ledger Entry`
+        WHERE voucher_type = %s AND voucher_no = %s
+          AND IFNULL(serial_and_batch_bundle, '') != ''
         """,
         (doc.doctype, doc.name, doc.doctype, doc.name),
     )
-    batches.update(r[0] for r in from_bundle if r and r[0])
+    bundle_names = list({r[0] for r in bundle_rows if r and r[0]})
+    if bundle_names:
+        from_bundle = frappe.db.sql(
+            """
+            SELECT DISTINCT batch_no
+            FROM `tabSerial and Batch Entry`
+            WHERE parent IN %(parents)s
+              AND IFNULL(batch_no, '') != ''
+            """,
+            {"parents": bundle_names},
+        )
+        batches.update(r[0] for r in from_bundle if r and r[0])
 
     return {b for b in batches if b}
 
@@ -1255,36 +1612,50 @@ def sync_batch_master_qty_from_delivery(doc):
     leave qty at 0 while pieces stay inflated from a duplicate baseline.
     On cancel this must still find batches after item SABB/batch_no are cleared.
     """
-    if not frappe.db.has_column("Batch", "batch_qty") and not frappe.db.has_column(
-        "Batch", "pieces"
-    ):
+    has_batch_qty = frappe.db.has_column("Batch", "batch_qty")
+    has_pieces = frappe.db.has_column("Batch", "pieces")
+    if not has_batch_qty and not has_pieces:
         return
 
-    from madhav.doc_events.stock_ledger_entry import recalculate_batch_pieces
+    batches = list(_batches_touched_by_delivery_note(doc))
+    if not batches:
+        return
 
-    batches = _batches_touched_by_delivery_note(doc)
-
-    for batch_no in batches:
-        if frappe.db.has_column("Batch", "batch_qty"):
-            # Per-batch qty from the matched entry, not the bundle-wide
-            # sle.actual_qty — see get_batch_qty_from_sle().
-            qty = frappe.db.sql(
-                """
-                SELECT COALESCE(SUM(SIGN(sle.actual_qty) * ABS(sbe.qty)), 0)
-                FROM `tabStock Ledger Entry` sle
-                INNER JOIN `tabSerial and Batch Entry` sbe
-                    ON sbe.parent = sle.serial_and_batch_bundle
-                WHERE sbe.batch_no = %s AND sle.is_cancelled = 0
-                """,
+    if has_batch_qty:
+        # One grouped scan instead of N identical per-batch SUM queries.
+        # Per-batch qty from the matched entry, not the bundle-wide
+        # sle.actual_qty — see get_batch_qty_from_sle().
+        rows = frappe.db.sql(
+            """
+            SELECT sbe.batch_no,
+                   COALESCE(SUM(SIGN(sle.actual_qty) * ABS(sbe.qty)), 0) AS qty
+            FROM `tabStock Ledger Entry` sle
+            INNER JOIN `tabSerial and Batch Entry` sbe
+                ON sbe.parent = sle.serial_and_batch_bundle
+            WHERE sbe.batch_no IN %(batches)s AND sle.is_cancelled = 0
+            GROUP BY sbe.batch_no
+            """,
+            {"batches": batches},
+            as_dict=True,
+        )
+        qty_map = {r.batch_no: flt(r.qty) for r in rows}
+        for batch_no in batches:
+            frappe.db.set_value(
+                "Batch",
                 batch_no,
-            )[0][0]
-            frappe.db.set_value("Batch", batch_no, "batch_qty", flt(qty), update_modified=False)
+                "batch_qty",
+                qty_map.get(batch_no, 0.0),
+                update_modified=False,
+            )
 
-        if frappe.db.has_column("Batch", "pieces"):
+    if has_pieces:
+        from madhav.doc_events.stock_ledger_entry import recalculate_batch_pieces
+
+        for batch_no in batches:
             recalculate_batch_pieces(batch_no)
 
 
-def get_available_qty_for_item(row):
+def get_available_qty_for_item(row, already_claimed=None):
     """"Available" must always be live physical stock when it can be
     resolved, never averaged/maxed against a bundle's reservation-time
     snapshot. A max() with the snapshot fixes a stale-too-small
@@ -1292,6 +1663,12 @@ def get_available_qty_for_item(row):
     genuine shortfall when the snapshot is stale-too-large (e.g. other
     deliveries drew the batch down since this row was reserved). Live
     stock is the only figure that can't go stale either direction.
+
+    ``already_claimed``: optional ``{(item_code, warehouse, batch_no): qty}``
+    for qty already assigned to earlier rows on the same Delivery Note.
+    Without this, two DaQ rows that share one batch each see the full
+    live balance and both expand to invoice_qty (e.g. 0.39+0.39 from a
+    0.765 batch → negative stock).
     """
     warehouse = row.warehouse
     if not warehouse and row.serial_and_batch_bundle:
@@ -1314,10 +1691,15 @@ def get_available_qty_for_item(row):
     batch_nos.update(e.batch_no for e in batch_entries if e.batch_no)
 
     if batch_nos and warehouse:
-        live_total = sum(
-            get_batch_qty_from_sle(row.item_code, warehouse, b) for b in batch_nos
-        )
-        if any(_has_live_batch_ledger(row.item_code, warehouse, b) for b in batch_nos):
+        live_total = 0.0
+        has_live = False
+        for b in batch_nos:
+            if _has_live_batch_ledger(row.item_code, warehouse, b):
+                has_live = True
+            live = get_batch_qty_from_sle(row.item_code, warehouse, b)
+            used = flt((already_claimed or {}).get((row.item_code, warehouse, b), 0))
+            live_total += max(0.0, flt(live) - used)
+        if has_live:
             return live_total
 
     if row.serial_and_batch_bundle:
@@ -1343,6 +1725,40 @@ def get_available_qty_for_item(row):
     return 0
 
 
+def _dn_row_batch_qty_claims(row):
+    """batch_no -> abs qty this DN row currently claims from each batch."""
+    claims = {}
+    warehouse = row.warehouse
+    if row.serial_and_batch_bundle:
+        if not warehouse:
+            warehouse = frappe.db.get_value(
+                "Serial and Batch Bundle", row.serial_and_batch_bundle, "warehouse"
+            )
+        for e in frappe.get_all(
+            "Serial and Batch Entry",
+            filters={
+                "parent": row.serial_and_batch_bundle,
+                "parenttype": "Serial and Batch Bundle",
+            },
+            fields=["batch_no", "qty"],
+        ):
+            if e.batch_no:
+                claims[e.batch_no] = claims.get(e.batch_no, 0) + abs(flt(e.qty))
+    elif row.batch_no:
+        claims[row.batch_no] = abs(flt(row.stock_qty) or flt(row.qty))
+    return claims, warehouse
+
+
+def _register_dn_row_batch_claims(claimed, row):
+    """Add this row's current batch claims into the shared DN budget."""
+    claims, warehouse = _dn_row_batch_qty_claims(row)
+    if not warehouse or not row.item_code:
+        return
+    for batch_no, qty in claims.items():
+        key = (row.item_code, warehouse, batch_no)
+        claimed[key] = claimed.get(key, 0) + flt(qty)
+
+
 
 def _absorb_allocation_remainder(desired, target_qty):
     """Push the floating-point remainder left over by proportional
@@ -1357,7 +1773,7 @@ def _absorb_allocation_remainder(desired, target_qty):
     desired[largest] += remainder
 
 
-def _expand_entries_within_live_stock(item, batch_entries, originals, target_qty):
+def _expand_entries_within_live_stock(item, batch_entries, originals, target_qty, already_claimed=None):
     """Grow each bundle entry toward its proportional share of target_qty
     without ever handing a batch more than it physically holds.
 
@@ -1370,6 +1786,10 @@ def _expand_entries_within_live_stock(item, batch_entries, originals, target_qty
     A batch whose live qty cannot be resolved is floored at what it
     already holds rather than treated as empty — an unresolved lookup is
     not evidence of an empty batch.
+
+    ``already_claimed`` subtracts qty already taken by earlier rows on the
+    same Delivery Note (same item/warehouse/batch), so a batch split
+    across two DaQ rows cannot be expanded twice to the full live balance.
     """
     warehouse = item.warehouse or frappe.db.get_value(
         "Serial and Batch Bundle", item.serial_and_batch_bundle, "warehouse"
@@ -1389,7 +1809,12 @@ def _expand_entries_within_live_stock(item, batch_entries, originals, target_qty
         if warehouse and entry.batch_no and _has_live_batch_ledger(
             item.item_code, warehouse, entry.batch_no
         ):
-            caps.append(max(0, flt(live)))
+            used = flt(
+                (already_claimed or {}).get(
+                    (item.item_code, warehouse, entry.batch_no), 0
+                )
+            )
+            caps.append(max(0, flt(live) - used))
         else:
             caps.append(originals[i])
 
@@ -1415,7 +1840,7 @@ def _expand_entries_within_live_stock(item, batch_entries, originals, target_qty
     return desired
 
 
-def update_bundle_to_invoice_qty(item, invoice_qty, qty, deliver_as_qty):
+def update_bundle_to_invoice_qty(item, invoice_qty, qty, deliver_as_qty, already_claimed=None):
     if not deliver_as_qty:
         return
     if not item.serial_and_batch_bundle:
@@ -1447,7 +1872,7 @@ def update_bundle_to_invoice_qty(item, invoice_qty, qty, deliver_as_qty):
         _absorb_allocation_remainder(desired, target_qty)
     else:
         desired = _expand_entries_within_live_stock(
-            item, batch_entries, originals, target_qty
+            item, batch_entries, originals, target_qty, already_claimed=already_claimed
         )
 
     # The bundle may not have been able to absorb the full invoice qty (a
@@ -1537,7 +1962,7 @@ def update_bundle_to_invoice_qty(item, invoice_qty, qty, deliver_as_qty):
     return target_qty
 
 
-def _sync_row_qty_to_bundle(row):
+def _sync_row_qty_to_bundle(row, already_claimed=None):
     """Re-run the bundle allocation and pull the DN row's qty down to what
     the bundle could actually allocate.
 
@@ -1546,7 +1971,11 @@ def _sync_row_qty_to_bundle(row):
     posts a stock ledger the batches cannot cover.
     """
     allocated = update_bundle_to_invoice_qty(
-        row, flt(row.invoice_qty), flt(row.qty), flt(row.custom_deliver_as_qty)
+        row,
+        flt(row.invoice_qty),
+        flt(row.qty),
+        flt(row.custom_deliver_as_qty),
+        already_claimed=already_claimed,
     )
     qty = flt(row.invoice_qty) if allocated is None else flt(allocated)
     row.qty = qty
@@ -1606,11 +2035,20 @@ from frappe.utils import get_datetime, add_to_date, nowtime
 
 
 def before_submit(self, method):
+    # Cap before validate: Deliver-as-Qty invoice pieces often exceed the
+    # physical batch; qty can be reconciled, pieces cannot.
+    _cap_dn_row_pieces_to_available(self)
     _validate_piece_availability(self)
+
+    # Shared budget per (item, warehouse, batch) across DN rows so a batch
+    # split onto two Deliver-as-Qty lines cannot both expand to the full
+    # live balance (0.39+0.39 from a 0.765 batch → negative stock).
+    claimed = {}
 
     for i in self.items:
         if not i.custom_deliver_as_qty:
             i.difference_qty = 0
+            _register_dn_row_batch_claims(claimed, i)
             continue
 
         if _batch_info_unresolved(i):
@@ -1622,7 +2060,7 @@ def before_submit(self, method):
                 ).format(i.idx, i.item_code)
             )
 
-        available_qty = get_available_qty_for_item(i)
+        available_qty = get_available_qty_for_item(i, already_claimed=claimed)
 
         if flt(i.invoice_qty) > available_qty:
             i.difference_qty = flt(i.invoice_qty) - available_qty
@@ -1632,17 +2070,19 @@ def before_submit(self, method):
         no_shortfall = flt(i.difference_qty) <= 0 and flt(i.invoice_qty) > 0 and i.custom_deliver_as_qty
 
         if no_shortfall and i.serial_and_batch_bundle:
-            _sync_row_qty_to_bundle(i)
-        elif no_shortfall and i.batch_no:
-            # SI-originated rows: no bundle yet — core builds the Serial
-            # and Batch Bundle itself from batch_no + use_serial_batch_fields
-            # during its own on_submit stock ledger step, using this
-            # corrected qty. Nothing to proportionally rescale here.
-            i.qty = flt(i.invoice_qty)
-            i.stock_qty = flt(i.invoice_qty) * flt(i.conversion_factor or 1)
+            _sync_row_qty_to_bundle(i, already_claimed=claimed)
+        elif i.batch_no and (no_shortfall or flt(i.difference_qty) > 0):
+            # SI / direct-batch rows: core builds the bundle on submit from
+            # batch_no. Always re-apply dimensions so pieces stay capped to
+            # live stock even when qty will be topped up by reconciliation.
+            if no_shortfall:
+                i.qty = flt(i.invoice_qty)
+                i.stock_qty = flt(i.invoice_qty) * flt(i.conversion_factor or 1)
             if hasattr(i, "use_serial_batch_fields"):
                 i.use_serial_batch_fields = 1
             _apply_direct_batch_delivery_dimensions(i)
+
+        _register_dn_row_batch_claims(claimed, i)
 
     cancel_stock_reservations_from_so(self)
     create_stock_reconciliation(self)
@@ -1833,7 +2273,7 @@ def cancel_stock_reservations_from_so(doc):
 
 def _snapshot_sre(sre):
 	"""Capture fields needed to recreate a Stock Reservation Entry."""
-	return {
+	snap = {
 		"name": sre.name,
 		"item_code": sre.item_code,
 		"warehouse": sre.warehouse,
@@ -1866,6 +2306,9 @@ def _snapshot_sre(sre):
 			for e in (sre.get("sb_entries") or [])
 		],
 	}
+	if frappe.get_meta("Stock Reservation Entry").has_field("custom_is_tolerance"):
+		snap["custom_is_tolerance"] = cint(sre.get("custom_is_tolerance"))
+	return snap
 
 
 def _store_cancelled_sre_snapshot(delivery_note, snapshots):
@@ -2053,11 +2496,15 @@ def _dn_item_batch_qty_map(item):
 		if item.batch_no:
 			batch_qty[item.batch_no] = abs(flt(item.stock_qty))
 		return batch_qty
-	try:
-		sbb = frappe.get_doc("Serial and Batch Bundle", item.serial_and_batch_bundle)
-	except Exception:
-		return batch_qty
-	for entry in sbb.entries or []:
+	entries = frappe.get_all(
+		"Serial and Batch Entry",
+		filters={
+			"parent": item.serial_and_batch_bundle,
+			"parenttype": "Serial and Batch Bundle",
+		},
+		fields=["batch_no", "qty"],
+	)
+	for entry in entries:
 		if entry.batch_no:
 			batch_qty[entry.batch_no] = batch_qty.get(entry.batch_no, 0) + abs(flt(entry.qty))
 	return batch_qty
@@ -2223,7 +2670,14 @@ def restore_stock_reservations_after_cancel(doc):
 			if _snapshot_sre_still_active(snapshot):
 				continue
 			_recreate_stock_reservation_from_snapshot(snapshot, exclude_dn=doc.name)
-		except Exception:
+		except Exception as e:
+			# Same item reserved from multiple SEs / warehouses can leave the
+			# SO line at or over capacity after reverse_sre_delivery. Blocking
+			# cancel for that is worse than skipping the leftover (usually
+			# BWRT) row — user can re-reserve from BWRT / Stock Transfer.
+			# Expected capacity skips must not write Error Log (slow + noisy).
+			if _is_reservation_capacity_error(e):
+				continue
 			frappe.log_error(
 				title="DN Cancel - SRE Restore Error",
 				message=f"{doc.name}\n{frappe.as_json(snapshot)}\n{frappe.get_traceback()}",
@@ -2255,6 +2709,15 @@ def _sort_snapshots_for_restore(snapshots):
 		return (is_bwrt, snap.get("name") or "")
 
 	return sorted(snapshots or [], key=_key)
+
+
+def _is_reservation_capacity_error(exc):
+	"""True when recreate failed only because the SO line has no headroom."""
+	msg = str(exc) if exc is not None else ""
+	return (
+		"Cannot reserve more than Allowed Qty" in msg
+		or "already reserved/delivered against Sales Order" in msg
+	)
 
 
 def _snapshot_sre_still_active(snapshot):
@@ -2351,6 +2814,49 @@ def _voucher_reservation_headroom(sales_order, so_detail, voucher_qty, exclude_d
 	return max(max_voucher_qty - other_delivered - active_reserved, 0)
 
 
+def _snapshot_qty_within_allowed_qty(
+	item_code,
+	warehouse,
+	sales_order,
+	so_detail,
+	reserved_qty,
+	from_voucher_type,
+	is_tolerance,
+):
+	"""True when ``reserved_qty`` would pass Madhav Allowed Qty validation."""
+	reserved_qty = flt(reserved_qty)
+	if reserved_qty <= 0 or not item_code or not warehouse:
+		return False
+
+	from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
+		get_available_qty_to_reserve,
+	)
+
+	available_qty = flt(get_available_qty_to_reserve(item_code, warehouse))
+	if from_voucher_type == "Batch Wise Reservation Tool" and cint(is_tolerance):
+		allowed_qty = available_qty
+	else:
+		from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
+			get_auto_reserve_available_qty,
+			get_so_line_allowance,
+		)
+
+		if from_voucher_type in ("Finish Work Order", "Stock Transfer"):
+			so_available_qty = get_auto_reserve_available_qty(
+				sales_order, exclude_sre=None
+			)
+		else:
+			so_available_qty = get_so_line_allowance(
+				sales_order,
+				so_detail,
+				is_tolerance=cint(is_tolerance),
+				exclude_sre=None,
+			)
+		allowed_qty = min(available_qty, flt(so_available_qty))
+
+	return reserved_qty <= allowed_qty + 1e-9
+
+
 def _recreate_stock_reservation_from_snapshot(snapshot, exclude_dn=None):
 	reserved_qty = flt(snapshot.get("reserved_qty"))
 	if reserved_qty <= 0:
@@ -2374,11 +2880,14 @@ def _recreate_stock_reservation_from_snapshot(snapshot, exclude_dn=None):
 				flt(soi.qty) * flt(soi.conversion_factor or 1)
 			)
 
-	# Voucher capacity is SO-line-wide (all warehouses). Filtering by warehouse
-	# let a For-Mill tolerance SRE restore first, then blocked the FG SRE
-	# (e.g. 1.145 + 15 > voucher 15 → Allowed 13.855).
+	# Voucher capacity is SO-line-wide (all warehouses). BWRT rows are restored
+	# last (_sort_snapshots_for_restore) so primary FG/FWO reclaim capacity
+	# first. Skipping headroom for BWRT let recreate throw Allowed Qty and
+	# block DN cancel when the line was already full (same item, FG + Mill
+	# EXTRA / multiple Stock Entries).
 	from_voucher_type = snapshot.get("from_voucher_type")
-	if from_voucher_type != "Batch Wise Reservation Tool":
+	is_tolerance = cint(snapshot.get("custom_is_tolerance"))
+	if not (from_voucher_type == "Batch Wise Reservation Tool" and is_tolerance):
 		remaining_capacity = _voucher_reservation_headroom(
 			sales_order, so_detail, voucher_qty, exclude_dn=exclude_dn
 		)
@@ -2386,6 +2895,20 @@ def _recreate_stock_reservation_from_snapshot(snapshot, exclude_dn=None):
 			return
 		if reserved_qty > remaining_capacity:
 			reserved_qty = remaining_capacity
+
+	# Match StockReservationEntry.validate_with_allowed_qty — if this qty
+	# cannot clear Allowed Qty, skip before insert/submit (same end state
+	# as the capacity-error catch in restore_stock_reservations_after_cancel).
+	if not _snapshot_qty_within_allowed_qty(
+		snapshot.get("item_code"),
+		warehouse,
+		sales_order,
+		so_detail,
+		reserved_qty,
+		from_voucher_type,
+		is_tolerance,
+	):
+		return
 
 	delivered_qty = min(delivered_qty, reserved_qty)
 
@@ -2409,6 +2932,8 @@ def _recreate_stock_reservation_from_snapshot(snapshot, exclude_dn=None):
 	sre.from_voucher_type = from_voucher_type
 	sre.from_voucher_no = from_voucher_no
 	sre.from_voucher_detail_no = from_voucher_detail_no
+	if frappe.get_meta("Stock Reservation Entry").has_field("custom_is_tolerance"):
+		sre.custom_is_tolerance = is_tolerance
 
 	reservation_based_on = snapshot.get("reservation_based_on") or "Qty"
 	sb_entries = snapshot.get("sb_entries") or []
@@ -2470,8 +2995,22 @@ def _recreate_stock_reservation_from_snapshot(snapshot, exclude_dn=None):
 		sre.has_serial_no = 0
 
 	sre.flags.ignore_permissions = True
-	sre.insert()
-	sre.submit()
+	try:
+		sre.insert()
+		sre.submit()
+	except Exception:
+		# insert-then-submit can leave a Draft SRE when Allowed Qty fails;
+		# drop it so cancel's capacity-skip path matches a clean no-op.
+		if sre.get("name") and cint(
+			frappe.db.get_value("Stock Reservation Entry", sre.name, "docstatus")
+		) == 0:
+			frappe.delete_doc(
+				"Stock Reservation Entry",
+				sre.name,
+				ignore_permissions=True,
+				force=True,
+			)
+		raise
 
 	if delivered_qty > 0:
 		sre.db_set("delivered_qty", delivered_qty, update_modified=False)
@@ -2924,12 +3463,20 @@ def create_stock_reconciliation(self):
                 "Batch", sr_item.batch_no, batch_update, update_modified=False
             )
 
+    # After SR tops up stock, re-sync shortfall rows without re-taking qty
+    # already claimed by sibling rows that had no shortfall (same batch).
+    claimed_after_sr = {}
+    for dn_row in self.items:
+        if flt(dn_row.difference_qty) <= 0:
+            _register_dn_row_batch_claims(claimed_after_sr, dn_row)
+
     for dn_row in self.items:
         if flt(dn_row.difference_qty) <= 0:
             continue
 
         if dn_row.serial_and_batch_bundle:
-            _sync_row_qty_to_bundle(dn_row)
+            _sync_row_qty_to_bundle(dn_row, already_claimed=claimed_after_sr)
+            _register_dn_row_batch_claims(claimed_after_sr, dn_row)
             continue
 
         if dn_row.batch_no and hasattr(dn_row, "use_serial_batch_fields"):
@@ -2938,6 +3485,7 @@ def create_stock_reconciliation(self):
         dn_row.qty = flt(dn_row.invoice_qty)
         dn_row.stock_qty = flt(dn_row.invoice_qty) * flt(dn_row.conversion_factor or 1)
         _apply_direct_batch_delivery_dimensions(dn_row)
+        _register_dn_row_batch_claims(claimed_after_sr, dn_row)
 
     for row in self.items:
         row.amount = 0
@@ -3112,7 +3660,29 @@ def make_delivery_note_custom(source_name, target_doc=None, kwargs=None):
 
     set_missing_values(so, target_doc)
 
+    # set_missing_values can restamp SO nominal warehouse on every row.
+    # Re-pin from custom_sre so FG + For Mill EXTRA rows stay distinct.
+    _restore_dn_warehouses_from_custom_sre(target_doc)
+
+    # Remap idx 1..n — mapped SO Item idx is reused across SRE splits.
+    for i, row in enumerate(target_doc.get("items") or [], start=1):
+        row.idx = i
+
     return target_doc
+
+
+def _restore_dn_warehouses_from_custom_sre(dn_doc):
+    """After mapping / set_missing_values, warehouse must match custom_sre."""
+    meta_has_sre = frappe.get_meta("Delivery Note Item").has_field("custom_sre")
+    if not meta_has_sre:
+        return
+    for item in dn_doc.get("items") or []:
+        sre_name = item.get("custom_sre") if hasattr(item, "get") else getattr(item, "custom_sre", None)
+        if not sre_name:
+            continue
+        wh = frappe.db.get_value("Stock Reservation Entry", sre_name, "warehouse")
+        if wh and item.warehouse != wh:
+            item.warehouse = wh
 
 @frappe.whitelist()
 def make_delivery_note_from_si(source_name, target_doc=None):

@@ -204,24 +204,36 @@ async function validate_batch_limit(cdt, cdn, fieldname) {
 
     let row = locals[cdt][cdn];
 
-    if (!row.batch) return true;
+    if (!row.batch || !row.item_code) return true;
 
-    let batch;
+    let warehouse = row.source_warehouse || cur_frm.doc.source_warehouse;
+    if (!warehouse) return true;
 
+    let limits;
     try {
-        batch = await frappe.db.get_doc("Batch", row.batch);
+        // Live warehouse balance — Batch.batch_qty / Batch.pieces stay at
+        // receipt size after a partial Stock Transfer and must not cap rows.
+        limits = await frappe.call({
+            method: "madhav.madhav.doctype.stock_transfer.stock_transfer.get_transfer_batch_limits",
+            args: {
+                item_code: row.item_code,
+                warehouse: warehouse,
+                batch_no: row.batch,
+            },
+        });
+        limits = limits.message || {};
     } catch (e) {
-        console.error("Error fetching batch:", e);
-        return true; // Allow if batch fetch fails
+        console.error("Error fetching live batch limits:", e);
+        return true;
     }
 
 
     /* PIECES VALIDATION */
 
-    if (fieldname === "pieces") {
+    if (fieldname === "pieces" && limits.pieces != null) {
 
         let entered = flt(row.pieces);
-        let limit = flt(batch.pieces);
+        let limit = flt(limits.pieces);
 
         if (entered > limit) {
 
@@ -237,7 +249,7 @@ async function validate_batch_limit(cdt, cdn, fieldname) {
 
             frappe.msgprint({
                 title: "Batch Limit Reached",
-                message: `Pieces cannot exceed Batch Pieces. Value reset to <b>${limit}</b>`,
+                message: `Pieces cannot exceed available warehouse pieces. Value reset to <b>${limit}</b>`,
                 indicator: "orange"
             });
 
@@ -251,7 +263,7 @@ async function validate_batch_limit(cdt, cdn, fieldname) {
     if (fieldname === "qty") {
 
         let entered = flt(row.qty);
-        let limit = flt(batch.batch_qty);
+        let limit = flt(limits.qty);
 
         if (entered > limit) {
 
@@ -267,7 +279,7 @@ async function validate_batch_limit(cdt, cdn, fieldname) {
 
             frappe.msgprint({
                 title: "Batch Limit Reached",
-                message: `Qty cannot exceed Batch Qty. Value reset to <b>${limit}</b>`,
+                message: `Qty cannot exceed available warehouse qty. Value reset to <b>${limit}</b>`,
                 indicator: "orange"
             });
 
