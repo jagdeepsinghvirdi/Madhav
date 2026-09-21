@@ -4,6 +4,10 @@
 frappe.ui.form.on("Stock Transfer", {
 
     setup(frm) {
+        // Do not let the form "Cancel All" dialog cancel the Material Transfer
+        // first — ST still links to it and SE cancel fails with LinkExistsError.
+        // Backend on_cancel cancels the SE after this Stock Transfer is cancelled.
+        frm.ignore_doctypes_on_cancel_all = ["Stock Entry"];
 
          const set_df_grid_formatter = (doctype, fieldname, title_field, link_doctype) => {
         let df = frappe.meta.get_docfield(doctype, fieldname);

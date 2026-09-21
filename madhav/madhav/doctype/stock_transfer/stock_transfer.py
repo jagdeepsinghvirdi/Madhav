@@ -89,6 +89,14 @@ def get_live_batch_pieces(item_code, warehouse, batch_no):
 
 class StockTransfer(Document):
 
+    def before_cancel(self):
+        # UI "Cancel All" tries to cancel the Material Transfer *before* this
+        # Stock Transfer is cancelled. That fails with LinkExistsError because
+        # ST.stock_entry still points at the SE. Backend on_cancel cancels the
+        # SE after ST is already docstatus=2 — so ignore SE in the link check
+        # and in the form's cancel-all dialog (see stock_transfer.js).
+        self.ignore_linked_doctypes = ["Stock Entry"]
+
     def on_cancel(self):
         """Unreserve stock, then reverse Material Transfer back to source warehouse.
 
@@ -98,6 +106,9 @@ class StockTransfer(Document):
         ``db.set_value`` during ``before_submit`` was overwritten on submit save,
         leaving ``stock_entry`` blank — cancel then skipped the SE and stock
         stayed in the target warehouse.
+
+        Order matters: this runs after ST is already cancelled in the DB, so
+        cancelling the SE is not blocked by the ST → SE link.
         """
         errors = []
 
@@ -128,10 +139,18 @@ class StockTransfer(Document):
 
         # 2) Resolve linked Material Transfer (field may be blank on older docs)
         se_name = self._resolve_linked_stock_entry()
+
+        # Drop both sides of the link before SE cancel so neither document
+        # blocks the other if ignore_links is not honoured somewhere.
+        if self.stock_entry or se_name:
+            self.db_set("stock_entry", "", update_modified=False)
+
         if se_name:
             try:
                 se = frappe.get_doc("Stock Entry", se_name)
                 if se.docstatus == 1:
+                    if se.meta.has_field("stock_transfer"):
+                        se.db_set("stock_transfer", "", update_modified=False)
                     # Cancel piece ledgers before SE so links do not block
                     _cancel_psles_for_voucher(se_name)
                     se.flags.ignore_permissions = True
@@ -147,9 +166,6 @@ class StockTransfer(Document):
             # Submitted transfers always create an SE — missing link means
             # stock would stay in the target warehouse if we continue.
             errors.append("linked Stock Entry not found (cannot rollback warehouse qty)")
-
-        if self.stock_entry or se_name:
-            self.db_set("stock_entry", "", update_modified=False)
 
         if errors:
             frappe.throw(

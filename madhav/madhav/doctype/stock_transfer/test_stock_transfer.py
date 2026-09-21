@@ -56,6 +56,11 @@ class TestStockTransferCancelHelpers(FrappeTestCase):
 		):
 			self.assertEqual(doc._resolve_linked_stock_entry(), "SE-1")
 
+	def test_before_cancel_ignores_stock_entry_link_check(self):
+		doc = frappe.get_doc({"doctype": "Stock Transfer"})
+		doc.before_cancel()
+		self.assertEqual(doc.ignore_linked_doctypes, ["Stock Entry"])
+
 	def test_on_cancel_cancels_sre_then_se_with_ignore_links(self):
 		doc = frappe.get_doc({"doctype": "Stock Transfer"})
 		doc.name = "STE-X"
@@ -65,6 +70,8 @@ class TestStockTransferCancelHelpers(FrappeTestCase):
 		sre = MagicMock()
 		se = MagicMock()
 		se.docstatus = 1
+		se.meta = MagicMock()
+		se.meta.has_field = MagicMock(return_value=True)
 
 		with patch.object(doc, "_resolve_linked_stock_entry", return_value="SE-X"), patch(
 			"madhav.madhav.doctype.stock_transfer.stock_transfer._cancel_psles_for_voucher"
@@ -74,13 +81,15 @@ class TestStockTransferCancelHelpers(FrappeTestCase):
 		), patch(
 			"madhav.madhav.doctype.stock_transfer.stock_transfer.frappe.get_doc",
 			side_effect=[sre, se],
-		), patch.object(doc, "db_set"):
+		), patch.object(doc, "db_set") as db_set:
 			doc.on_cancel()
 
 			sre.cancel.assert_called_once()
 			cancel_psle.assert_called_once_with("SE-X")
 			self.assertTrue(se.flags.ignore_links)
 			se.cancel.assert_called_once()
+			se.db_set.assert_any_call("stock_transfer", "", update_modified=False)
+			db_set.assert_any_call("stock_entry", "", update_modified=False)
 
 	def test_on_cancel_throws_when_stock_entry_missing(self):
 		doc = frappe.get_doc({"doctype": "Stock Transfer"})
