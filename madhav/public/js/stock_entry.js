@@ -180,8 +180,60 @@ frappe.ui.form.on('Stock Entry Detail', {
             // Make average_length read-only if batch_no is selected
             grid_row.toggle_editable("average_length", !child.batch_no);
         }
+
+        if (frm.doc.stock_entry_type === "Repack") {
+            fetch_batch_details_for_repack(frm, cdt, cdn);
+        }
     }
 });
+
+function fetch_batch_details_for_repack(frm, cdt, cdn) {
+    const child = locals[cdt][cdn];
+    if (!child.batch_no) {
+        return;
+    }
+
+    frappe.db.get_value(
+        "Batch",
+        child.batch_no,
+        ["average_length", "section_weight", "pieces", "length_weight_in_kg"],
+        (r) => {
+            if (!r) {
+                return;
+            }
+
+            const updates = {};
+            if (flt(r.average_length)) {
+                updates.average_length = flt(r.average_length);
+            }
+            if (flt(r.section_weight)) {
+                updates.section_weight = flt(r.section_weight);
+            }
+            if (flt(r.pieces)) {
+                updates.pieces = flt(r.pieces);
+            }
+            if (flt(r.length_weight_in_kg)) {
+                updates.length_weight_in_kg = flt(r.length_weight_in_kg);
+            }
+
+            // Qty (tonne) from pieces × length × section weight, same as other SE types
+            const pieces = flt(updates.pieces != null ? updates.pieces : child.pieces);
+            const avg_len = flt(
+                updates.average_length != null ? updates.average_length : child.average_length
+            );
+            const section_weight = flt(
+                updates.section_weight != null ? updates.section_weight : child.section_weight
+            );
+            if (pieces && avg_len && section_weight) {
+                updates.qty = flt((pieces * avg_len * section_weight) / 1000, 4);
+            }
+
+            Object.keys(updates).forEach((field) => {
+                frappe.model.set_value(cdt, cdn, field, updates[field]);
+            });
+        }
+    );
+}
 
 function set_batch_filter(frm, cdt, cdn) {
     // Set the query filter for batch_no field
