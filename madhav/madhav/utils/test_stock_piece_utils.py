@@ -3,10 +3,13 @@ import unittest
 from madhav.madhav.utils.stock_piece_utils import (
 	_entry_avail_qty,
 	distribute_integer_pieces,
+	int_pieces_from_qty,
+	pieces_for_direct_batch_delivery,
 	preserve_entry_pieces,
 	resolve_entry_pieces,
 	resolve_entry_section_weight,
 	resolve_weighted_length_from_entries,
+	should_preserve_pieces_for_qty_change,
 	stored_entry_pieces,
 	sum_undelivered_pieces_from_sre_rows,
 )
@@ -117,6 +120,34 @@ class TestStockPieceUtilsPartialDelivery(unittest.TestCase):
 		}
 		self.assertEqual(resolve_entry_pieces(row2, 0.25, 6.0, 9.0), 5)
 
+	def test_small_weight_change_does_not_drop_a_piece(self):
+		# 40 PC at 12m x 8 kg/m. One piece weighs 0.096. A 0.05 cut used to
+		# round 40 down to 39 and leave a piece pending on the batch.
+		length, section_weight = 12.0, 8.0
+		full_qty = 40 * length * section_weight / 1000
+		row = {
+			"qty": full_qty,
+			"delivered_qty": 0,
+			"pieces": 40,
+			"length": length,
+			"section_weight": section_weight,
+		}
+		self.assertEqual(
+			resolve_entry_pieces(row, full_qty - 0.05, length, section_weight),
+			40,
+		)
+		self.assertTrue(
+			should_preserve_pieces_for_qty_change(
+				full_qty, full_qty - 0.05, length, section_weight
+			)
+		)
+		# Half the weight is a real partial delivery and still scales.
+		self.assertFalse(
+			should_preserve_pieces_for_qty_change(
+				full_qty, full_qty / 2, length, section_weight
+			)
+		)
+
 	def test_sum_undelivered_pieces_skips_fully_delivered_batch(self):
 		rows = [
 			{
@@ -137,6 +168,26 @@ class TestStockPieceUtilsPartialDelivery(unittest.TestCase):
 			},
 		]
 		self.assertEqual(sum_undelivered_pieces_from_sre_rows(rows), 6)
+
+
+class TestDirectBatchPiecesStayPhysical(unittest.TestCase):
+	def test_entered_pieces_are_not_ceiled_up(self):
+		# raw = 32.0004 ceils to 33. The entered 32 PC must stay 32.
+		length, section_weight = 6.0, 10.0
+		qty = 32.0004 * length * section_weight / 1000
+		self.assertEqual(int_pieces_from_qty(qty, length, section_weight), 33)
+		self.assertEqual(
+			pieces_for_direct_batch_delivery(32, qty, length, section_weight),
+			32,
+		)
+
+	def test_missing_pieces_still_derive_from_weight(self):
+		length, section_weight = 6.0, 10.0
+		qty = 32.0004 * length * section_weight / 1000
+		self.assertEqual(
+			pieces_for_direct_batch_delivery(0, qty, length, section_weight),
+			33,
+		)
 
 
 if __name__ == "__main__":

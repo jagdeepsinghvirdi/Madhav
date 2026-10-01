@@ -115,6 +115,20 @@ frappe.ui.form.on('Delivery Note Item', {
 				let target_qty = flt(d.invoice_qty) || flt(d.qty);
 				let length = flt(r.average_length) || flt(d.average_length || d.length_size);
 				let section_weight = flt(r.section_weight) || flt(d.section_weight);
+				let entered = cint(d.pieces);
+
+				// Pieces already on the row are the physical count. A quantity
+				// that is less than one piece away from that count must not
+				// be ceiled into an extra piece (32 PC → 33) or rounded down
+				// (40 PC → 39). A genuinely different quantity still derives
+				// pieces, so a partial delivery does not keep the full batch.
+				if (entered > 0 && target_qty > 0 && length > 0 && section_weight > 0) {
+					let piece_weight = (length * section_weight) / 1000;
+					let implied = (entered * length * section_weight) / 1000;
+					if (piece_weight > 0 && Math.abs(target_qty - implied) < piece_weight) {
+						return;
+					}
+				}
 
 				let pieces = batch_pieces;
 				if (target_qty > 0 && length > 0 && section_weight > 0) {

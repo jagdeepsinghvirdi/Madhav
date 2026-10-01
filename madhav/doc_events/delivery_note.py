@@ -1383,6 +1383,10 @@ def change_qty_serial_and_batch(self):
             desired_qty[0] += leftover_qty
 
         # ── Step 2: Integer pieces for display / piece ledger (do NOT rewrite weight) ──
+        from madhav.madhav.utils.stock_piece_utils import (
+            should_preserve_pieces_for_qty_change,
+        )
+
         desired_pieces = []
         for i, entry in enumerate(batch_entries):
             entry_length = resolve_entry_length(
@@ -1398,13 +1402,22 @@ def change_qty_serial_and_batch(self):
 
             # Prefer pieces already on the reservation/bundle for this row.
             # Recalculate only when missing — avoids ceil(SO pieces) again (+1 PC).
-            # Scale stored pieces when this bundle row is a partial undelivered share.
+            # Scale stored pieces only for a real partial share. A weight change
+            # smaller than one piece must not turn 40 PC into 39.
             existing_pieces = cint(flt(entry.pieces))
             row_avail_qty = abs(flt(entry.qty))
             if hasattr(entry, "delivered_qty"):
                 row_avail_qty = max(0.0, row_avail_qty - flt(entry.delivered_qty))
             if existing_pieces > 0 and row_avail_qty > 0:
-                if abs(row_avail_qty - desired_qty[i]) > 0.0001 and desired_qty[i] > 0:
+                if (
+                    desired_qty[i] > 0
+                    and not should_preserve_pieces_for_qty_change(
+                        row_avail_qty,
+                        desired_qty[i],
+                        entry_length,
+                        entry_section_weight,
+                    )
+                ):
                     pieces = max(
                         0,
                         int(round(existing_pieces * (desired_qty[i] / row_avail_qty))),
@@ -1885,6 +1898,8 @@ def update_bundle_to_invoice_qty(item, invoice_qty, qty, deliver_as_qty, already
         distribute_integer_pieces,
         int_pieces_from_qty,
         preserve_entry_pieces,
+        qty_from_pieces,
+        should_preserve_pieces_for_qty_change,
         stored_entry_pieces,
     )
 
@@ -1894,11 +1909,33 @@ def update_bundle_to_invoice_qty(item, invoice_qty, qty, deliver_as_qty, already
     )
     # A mapped SI/DN row commonly carries the pieces for the complete
     # selected batch.  Scale that physical count when Deliver as Qty shrinks
-    # the bundle; otherwise a 20-PC partial delivery posts all 30 PCs.
+    # the bundle by at least one piece; otherwise a 20-PC partial delivery
+    # posts all 30 PCs. A smaller weight change must not turn 40 PC into 39.
+    piece_weights = []
+    for entry in batch_entries:
+        weight = qty_from_pieces(
+            1, flt(getattr(entry, "length", 0)), flt(getattr(entry, "section_weight", 0))
+        )
+        if weight > 0:
+            piece_weights.append(weight)
+    if not piece_weights:
+        row_weight = qty_from_pieces(
+            1,
+            flt(getattr(item, "length_size", 0)) or flt(getattr(item, "average_length", 0)),
+            flt(getattr(item, "section_weight", 0)),
+        )
+        if row_weight > 0:
+            piece_weights.append(row_weight)
+    min_piece_weight = min(piece_weights) if piece_weights else 0
+
     if (
         item_pieces > 0
         and original_bundle_pieces > 0
-        and abs(target_qty - total_original_qty) > 0.0001
+        and not should_preserve_pieces_for_qty_change(
+            total_original_qty,
+            target_qty,
+            piece_weight=min_piece_weight,
+        )
     ):
         item_pieces = int(round(
             original_bundle_pieces * target_qty / total_original_qty
@@ -2013,14 +2050,19 @@ def _apply_direct_batch_delivery_dimensions(row):
     if section_weight and hasattr(row, "section_weight"):
         row.section_weight = section_weight
     if length and section_weight and hasattr(row, "pieces"):
-        pieces = int_pieces_from_qty(row.qty, length, section_weight)
-        # int_pieces_from_qty() rounds a weight UP to whole pieces, so a row
-        # topped up by a reconciliation (6.000 Kg -> 6.010 Kg on 1.5 Kg pieces)
-        # asked for 5 pieces from a batch physically holding 4, and the piece
-        # ledger went negative. A delivery can never take more pieces than the
-        # batch has; the Sales Order path already caps this way, and the two
-        # flows have to agree. Availability comes from the piece ledger, with
-        # the Batch master only as a fallback for batches that predate it.
+        # Entered pieces are the physical count. Do not ceil them from a
+        # slightly different quantity (32 PC must not become 33). Derive
+        # from weight only when the row has no pieces yet.
+        from madhav.madhav.utils.stock_piece_utils import pieces_for_direct_batch_delivery
+
+        pieces = pieces_for_direct_batch_delivery(
+            getattr(row, "pieces", 0), row.qty, length, section_weight
+        )
+        # A delivery can never take more pieces than the batch has. A row
+        # topped up by a reconciliation (6.000 Kg -> 6.010 Kg on 1.5 Kg
+        # pieces) must not ask for 5 pieces from a batch holding 4, or the
+        # piece ledger goes negative. Availability comes from the piece
+        # ledger, with the Batch master only as a fallback.
         available = get_batch_available_pieces(
             row.item_code, row.warehouse, row.batch_no
         )

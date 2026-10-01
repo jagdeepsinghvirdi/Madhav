@@ -218,7 +218,12 @@ def resolve_entry_pieces(entry, avail_qty, length, section_weight):
 	if stored > 0 and total_qty > 0 and avail_qty > 0:
 		orig_avail = max(0.0, total_qty - delivered)
 		if orig_avail > 0:
-			# Proportional share of already-integer reservation pieces
+			# A weight change smaller than one piece must not drop a bar
+			# (40 PC → 39). A real partial share still scales.
+			if should_preserve_pieces_for_qty_change(
+				orig_avail, avail_qty, length, section_weight
+			):
+				return max(0, int(round(stored)))
 			return max(0, int(round(stored * (avail_qty / orig_avail))))
 
 	# No stored pieces — derive once from undelivered weight
@@ -235,6 +240,45 @@ def qty_from_pieces(pieces, length, section_weight):
 	if not pieces or not length or not section_weight:
 		return 0
 	return (pieces * length * section_weight) / 1000
+
+
+def should_preserve_pieces_for_qty_change(
+	qty_before, qty_after, length=0, section_weight=0, piece_weight=None
+):
+	"""True when a weight change is too small to add or remove a physical piece.
+
+	Pieces are a count of bars, not a rounding of tonnes. A Delivery Note
+	must not turn 32 PC into 33, or 40 PC into 39, only because quantity
+	moved by less than one piece. A real partial delivery (about half the
+	weight) still returns False so the caller can scale.
+
+	``int_pieces_from_qty`` itself is unchanged — Sales Order and planning
+	still ceil from weight.
+	"""
+	delta = abs(flt(qty_before) - flt(qty_after))
+	if delta <= 0.0001:
+		return True
+
+	weight = (
+		flt(piece_weight)
+		if piece_weight is not None
+		else qty_from_pieces(1, length, section_weight)
+	)
+	if weight <= 0:
+		return False
+	return delta < weight
+
+
+def pieces_for_direct_batch_delivery(existing_pieces, qty, length, section_weight):
+	"""Pieces to post on a Delivery Note row that has a batch and no bundle.
+
+	An entered count is the physical delivery and is kept. Weight is used
+	only when the row has no pieces yet.
+	"""
+	existing = max(0, int(round(flt(existing_pieces))))
+	if existing > 0:
+		return existing
+	return int_pieces_from_qty(qty, length, section_weight)
 
 
 def distribute_integer_pieces(total_pieces, weights):
