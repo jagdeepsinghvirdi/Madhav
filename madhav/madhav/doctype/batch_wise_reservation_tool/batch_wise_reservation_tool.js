@@ -438,3 +438,76 @@ function madhav_load_tolerance_warehouse(frm) {
 		.then((r) => r.message || null);
 	return frm.__tolerance_warehouse_promise;
 }
+
+function cap_reservation_against_batch(frm, cdt, cdn, qty_field, pieces_field, batch_field) {
+	const row = locals[cdt][cdn];
+	if (!row || row.__bwrt_cap || !row[batch_field]) {
+		return;
+	}
+	const warehouse = row.source_warehouse || frm.doc.warehouse;
+	if (!warehouse || !row.item_code) {
+		return;
+	}
+	frappe.call({
+		method:
+			"madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool.get_batch_reservation_limits",
+		args: {
+			item_code: row.item_code,
+			warehouse: warehouse,
+			batch_no: row[batch_field],
+		},
+		callback(r) {
+			if (!r.message) {
+				return;
+			}
+			const max_qty = flt(r.message.qty);
+			const max_pieces = cint(r.message.pieces);
+			const entered_qty = flt(row[qty_field]);
+			const entered_pieces = cint(row[pieces_field]);
+			if (entered_qty <= max_qty + 0.0001 && (!max_pieces || entered_pieces <= max_pieces)) {
+				return;
+			}
+			row.__bwrt_cap = true;
+			const updates = [];
+			if (entered_qty > max_qty + 0.0001) {
+				updates.push(
+					frappe.model.set_value(cdt, cdn, qty_field, max_qty)
+				);
+			}
+			if (max_pieces && entered_pieces > max_pieces) {
+				updates.push(
+					frappe.model.set_value(cdt, cdn, pieces_field, max_pieces)
+				);
+			}
+			Promise.all(updates).finally(() => {
+				row.__bwrt_cap = false;
+			});
+			frappe.msgprint({
+				title: __("Batch limit"),
+				indicator: "red",
+				message: __(
+					"Batch {0} has {1} qty and {2} pieces available. You cannot enter more than that.",
+					[row[batch_field], max_qty, max_pieces]
+				),
+			});
+		},
+	});
+}
+
+frappe.ui.form.on("Available Stock Batches", {
+	available_qty(frm, cdt, cdn) {
+		cap_reservation_against_batch(frm, cdt, cdn, "available_qty", "pieces", "batch");
+	},
+	pieces(frm, cdt, cdn) {
+		cap_reservation_against_batch(frm, cdt, cdn, "available_qty", "pieces", "batch");
+	},
+});
+
+frappe.ui.form.on("Staged Batch Reservations Verification", {
+	reserved_qty(frm, cdt, cdn) {
+		cap_reservation_against_batch(frm, cdt, cdn, "reserved_qty", "reserved_pieces", "batch_no");
+	},
+	reserved_pieces(frm, cdt, cdn) {
+		cap_reservation_against_batch(frm, cdt, cdn, "reserved_qty", "reserved_pieces", "batch_no");
+	},
+});

@@ -270,23 +270,64 @@ def get_batch_available_qty(item_code, warehouse, batch_no, exclude_sre=None):
 	return max(0, floor_qty(actual_qty - reserved_qty, 3))
 
 
-def calc_proportional_pieces(reserve_qty, batch_no):
-	"""Whole pieces for the quantity actually reserved.
+def batch_piece_limit(batch_no, available_qty):
+	"""Physical pieces still free on a batch, never above Batch.pieces.
 
-	``Batch.pieces`` and ``Batch.batch_qty`` are mutable master values and
-	cannot be used as a ratio for a partial reservation.  The reservation
-	row must instead use the physical batch dimensions.
+	Scaling available qty against Batch.batch_qty used to round 31.7 up to
+	32 and reserve one piece the batch does not have.
 	"""
-	from madhav.madhav.utils.stock_piece_utils import int_pieces_from_qty
-
+	if not batch_no:
+		return 0
 	batch = frappe.db.get_value(
-		"Batch", batch_no, ["average_length", "section_weight"], as_dict=True
+		"Batch", batch_no, ["pieces", "batch_qty"], as_dict=True
 	)
 	if not batch:
 		return 0
-	return int_pieces_from_qty(
-		reserve_qty, batch.average_length, batch.section_weight
+	physical = cint(batch.pieces)
+	if physical <= 0:
+		return 0
+	basis = flt(batch.batch_qty)
+	if basis <= 0 or flt(available_qty) <= 0:
+		return physical
+	scaled = int(round(physical * flt(available_qty) / basis))
+	return max(0, min(scaled, physical))
+
+
+def calc_proportional_pieces(reserve_qty, batch_no):
+	"""Whole pieces for the quantity actually reserved.
+
+	Uses the batch's own piece count, scaled to the reserved share, and
+	never rounds that count up by one. Weight is only a fallback when the
+	batch has no piece count, and that fallback rounds to the nearest
+	piece instead of ceiling.
+	"""
+	from madhav.madhav.utils.stock_piece_utils import qty_from_pieces
+
+	batch = frappe.db.get_value(
+		"Batch", batch_no,
+		["pieces", "batch_qty", "average_length", "section_weight"],
+		as_dict=True,
 	)
+	if not batch:
+		return 0
+
+	physical = cint(batch.pieces)
+	basis = flt(batch.batch_qty)
+	reserve_qty = flt(reserve_qty)
+	if physical > 0 and basis > 0 and reserve_qty > 0:
+		if reserve_qty + 0.0001 >= basis:
+			return physical
+		return max(0, min(int(round(physical * reserve_qty / basis)), physical))
+
+	length = flt(batch.average_length)
+	section_weight = flt(batch.section_weight)
+	if not length or not section_weight or reserve_qty <= 0:
+		return physical
+	raw = reserve_qty / qty_from_pieces(1, length, section_weight)
+	pieces = max(0, int(round(raw)))
+	if physical > 0:
+		return min(pieces, physical)
+	return pieces
 
 
 def get_so_line_allowance(
@@ -535,6 +576,37 @@ class BatchWiseReservationTool(Document):
 	def on_cancel(self):
 		self.cancel_stock_reservation_entries()
 
+	def validate(self):
+		self._validate_reservation_within_batch()
+
+	def _validate_reservation_within_batch(self):
+		"""Staged qty and pieces cannot exceed what the batch still holds."""
+		totals = {}
+		for row in self.get("reservation_batches") or []:
+			if not row.batch_no or not row.item_code:
+				continue
+			warehouse = row.source_warehouse or self.warehouse
+			key = (row.item_code, warehouse, row.batch_no)
+			bucket = totals.setdefault(key, {"qty": 0, "pieces": 0, "idx": row.idx})
+			bucket["qty"] += flt(row.reserved_qty)
+			bucket["pieces"] += cint(row.reserved_pieces)
+
+		for (item_code, warehouse, batch_no), bucket in totals.items():
+			available_qty = get_batch_available_qty(item_code, warehouse, batch_no)
+			if bucket["qty"] > flt(available_qty) + 0.0001:
+				frappe.throw(
+					frappe._(
+						"Row #{0}: Reserved Qty {1} is more than Batch {2} has available ({3})."
+					).format(bucket["idx"], bucket["qty"], frappe.bold(batch_no), available_qty)
+				)
+			piece_cap = batch_piece_limit(batch_no, available_qty)
+			if piece_cap and bucket["pieces"] > piece_cap:
+				frappe.throw(
+					frappe._(
+						"Row #{0}: Reserved Pieces {1} are more than Batch {2} has ({3})."
+					).format(bucket["idx"], bucket["pieces"], frappe.bold(batch_no), piece_cap)
+				)
+
 	def create_stock_reservationentries(self):
 		if not self.reservation_batches:
 			frappe.throw(frappe._("No reservation batches found. Please add batch reservations before submitting."))
@@ -553,6 +625,7 @@ class BatchWiseReservationTool(Document):
 				sales_order_item=row.sales_order_item,
 				batch_no=row.batch_no,
 				is_tolerance=cint(row.get("is_tolerance")),
+				pieces=row.reserved_pieces,
 				from_voucher_type=self.doctype,
 				from_voucher_no=self.name,
 				from_voucher_detail_no=row.name,
@@ -582,6 +655,7 @@ class BatchWiseReservationTool(Document):
 		self, item_code, warehouse, qty, so_qty, stock_uom,
 		sales_order=None, sales_order_item=None, batch_no=None, is_tolerance=0,
 		from_voucher_type=None, from_voucher_no=None, from_voucher_detail_no=None,
+		pieces=0,
 	):
 		if not sales_order:
 			return
@@ -641,7 +715,13 @@ class BatchWiseReservationTool(Document):
 				).format(frappe.bold(item_code), frappe.bold(batch_no or "-"), frappe.bold(sales_order), qty, stock_uom, reserve_qty)
 			)
 
-		final_pieces = calc_proportional_pieces(reserve_qty, batch_no) if batch_no else 0
+		final_pieces = cint(pieces) if cint(pieces) > 0 else (
+			calc_proportional_pieces(reserve_qty, batch_no) if batch_no else 0
+		)
+		if batch_no:
+			piece_cap = batch_piece_limit(batch_no, limits.batch_available_qty)
+			if piece_cap and final_pieces > piece_cap:
+				final_pieces = piece_cap
 
 		sre = frappe.new_doc("Stock Reservation Entry")
 		sre.item_code = item_code
@@ -829,6 +909,8 @@ def add_to_reservation_batches(
 	)
 
 	reserved_qty = flt(reserved_qty, 3)
+	available_pieces = batch_piece_limit(batch_no, limits.batch_available_qty)
+	requested_pieces = cint(pieces)
 
 	if reserved_qty > limits.allowed_qty:
 		frappe.throw(
@@ -841,7 +923,19 @@ def add_to_reservation_batches(
 			)
 		)
 
-	final_pieces = calc_proportional_pieces(reserved_qty, batch_no) if batch_no else cint(pieces)
+	if available_pieces and requested_pieces > available_pieces:
+		frappe.throw(
+			frappe._(
+				"Cannot reserve {0} pieces from Batch {1}. The batch has {2} pieces available."
+			).format(requested_pieces, batch_no, available_pieces)
+		)
+
+	if requested_pieces > 0:
+		final_pieces = requested_pieces
+	else:
+		final_pieces = calc_proportional_pieces(reserved_qty, batch_no) if batch_no else 0
+	if available_pieces and final_pieces > available_pieces:
+		final_pieces = available_pieces
 
 	doc.append("reservation_batches", {
 		"sales_order": sales_order,
@@ -931,10 +1025,7 @@ def fetch_available_batches(item_code, warehouse, pending_qty=0, reserve_qty=0):
 			continue
 
 		batch = batch_map.get(row.batch)
-		# Pieces scaled to what's actually available, not the batch total (Phase 6)
-		available_pieces = 0
-		if batch and flt(batch.batch_qty):
-			available_pieces = int(round(flt(batch.pieces) * (available_qty / flt(batch.batch_qty))))
+		available_pieces = batch_piece_limit(row.batch, available_qty)
 
 		result.append({
 			"batch": row.batch,
@@ -1008,6 +1099,16 @@ def get_reserved_batches(docname):
 			})
 
 	return reserved_batches
+
+
+@frappe.whitelist()
+def get_batch_reservation_limits(item_code, warehouse, batch_no):
+	"""Qty and pieces still free on one batch. The form uses this as a hard cap."""
+	available_qty = get_batch_available_qty(item_code, warehouse, batch_no) if batch_no else 0
+	return {
+		"qty": flt(available_qty),
+		"pieces": batch_piece_limit(batch_no, available_qty),
+	}
 
 
 @frappe.whitelist()

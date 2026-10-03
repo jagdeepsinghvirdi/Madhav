@@ -354,9 +354,10 @@ def _sre_warehouse_for_batch(sales_order, so_detail, batch_no):
     return rows[0][0] if rows else None
 
 
-def _batch_available_pieces_for_row(row):
+def _batch_available_pieces_for_row(row, batch_no=None):
     """Live piece balance for a DN row's batch; Batch.pieces as legacy fallback."""
-    if not row.batch_no:
+    batch_no = batch_no or getattr(row, "batch_no", None)
+    if not batch_no:
         return 0
     available = 0.0
     has_live = False
@@ -382,14 +383,14 @@ def _batch_available_pieces_for_row(row):
                   )
                 LIMIT 1
                 """,
-                {"batch_no": row.batch_no},
+                {"batch_no": batch_no},
             )
         )
         available = get_batch_available_pieces(
-            row.item_code, row.warehouse, row.batch_no
+            row.item_code, row.warehouse, batch_no
         )
     if not has_live:
-        available = flt(frappe.db.get_value("Batch", row.batch_no, "pieces") or 0)
+        available = flt(frappe.db.get_value("Batch", batch_no, "pieces") or 0)
     return flt(available)
 
 
@@ -421,6 +422,63 @@ def _cap_dn_row_pieces_to_available(doc):
         remaining[key] = max(avail - flt(row.pieces), 0)
 
 
+def _dn_row_batch_nos(row):
+    """Batches this DN row actually ships."""
+    batches = set()
+    if row.batch_no:
+        batches.add(row.batch_no)
+    if row.serial_and_batch_bundle:
+        batches.update(
+            frappe.get_all(
+                "Serial and Batch Entry",
+                filters={
+                    "parent": row.serial_and_batch_bundle,
+                    "parenttype": "Serial and Batch Bundle",
+                },
+                pluck="batch_no",
+            )
+        )
+    batches.discard(None)
+    return batches
+
+
+def _row_piece_demands(row):
+    """Map batch_no → integer pieces demanded by one Delivery Note Item row."""
+    pieces = cint(flt(getattr(row, "pieces", 0) or 0))
+    if pieces <= 0:
+        return {}
+
+    batch_no = getattr(row, "batch_no", None)
+    if batch_no:
+        return {batch_no: pieces}
+
+    bundle = getattr(row, "serial_and_batch_bundle", None)
+    if not bundle:
+        return {}
+
+    batches = _dn_row_batch_nos(row)
+    if len(batches) == 1:
+        return {next(iter(batches)): pieces}
+
+    entries = frappe.get_all(
+        "Serial and Batch Entry",
+        filters={"parent": bundle, "parenttype": "Serial and Batch Bundle"},
+        fields=["batch_no", "pieces"],
+    )
+    out = {}
+    for entry in entries:
+        if not entry.batch_no:
+            continue
+        entry_pieces = cint(flt(entry.pieces))
+        if entry_pieces > 0:
+            out[entry.batch_no] = out.get(entry.batch_no, 0) + entry_pieces
+    return out
+
+
+def _piece_pool_key(row, batch_no):
+    return (batch_no, row.warehouse or "", row.item_code or "")
+
+
 def _validate_piece_availability(doc):
     """
     Pieces requested against a batch must never exceed the batch's
@@ -432,27 +490,52 @@ def _validate_piece_availability(doc):
     Availability prefers the Piece Stock Ledger (warehouse-aware); Batch
     master pieces are the fallback for batches that predate PSLE.
     """
-    pieces_needed = {}
-    available_by_batch = {}
-    for row in doc.items:
-        if not row.batch_no or not flt(getattr(row, "pieces", None) or 0):
-            continue
-        pieces_needed[row.batch_no] = pieces_needed.get(row.batch_no, 0) + flt(row.pieces)
-        key = row.batch_no
-        # Same batch on one DN should share one warehouse in practice;
-        # take the max live balance seen so multi-warehouse edge cases
-        # are not under-counted as zero.
-        live = _batch_available_pieces_for_row(row)
-        available_by_batch[key] = max(available_by_batch.get(key, 0), live)
+    remaining = {}
+    for row in doc.items or []:
+        for batch_no, need in _row_piece_demands(row).items():
+            key = _piece_pool_key(row, batch_no)
+            if key not in remaining:
+                remaining[key] = _batch_available_pieces_for_row(row, batch_no)
+            left = flt(remaining[key])
+            if need > left + 0.0001:
+                frappe.throw(
+                    _(
+                        "Row #{0}: Length/Pieces ({1}) exceed available pieces ({2}) for Batch {3}."
+                    ).format(row.idx, int(need), int(left), frappe.bold(batch_no))
+                )
+            remaining[key] = left - need
 
-    for batch_no, needed in pieces_needed.items():
-        available_pieces = available_by_batch.get(batch_no, 0)
-        if needed > available_pieces + 0.0001:
-            frappe.throw(
-                _(
-                    "Batch {0}: total pieces requested ({1}) exceed available pieces ({2})."
-                ).format(frappe.bold(batch_no), needed, available_pieces)
-            )
+
+@frappe.whitelist()
+def get_max_pieces_for_dn_item(items, row_name):
+    """Max Length/Pieces allowed on one row after other rows on this DN."""
+    if isinstance(items, str):
+        items = json.loads(items)
+
+    rows = [frappe._dict(d) for d in (items or [])]
+    target = next((r for r in rows if r.name == row_name), None)
+    if not target or not target.item_code:
+        return None
+
+    batch_no = target.batch_no
+    if not batch_no and target.serial_and_batch_bundle:
+        batches = _dn_row_batch_nos(target)
+        if len(batches) == 1:
+            batch_no = next(iter(batches))
+    if not batch_no:
+        return None
+
+    avail = _batch_available_pieces_for_row(target, batch_no)
+    used = 0
+    pool = _piece_pool_key(target, batch_no)
+    for row in rows:
+        if row.name == row_name:
+            continue
+        for other_batch, pieces in _row_piece_demands(row).items():
+            if _piece_pool_key(row, other_batch) == pool:
+                used += pieces
+
+    return max(0, cint(avail - used))
 
 def fix_group_cost_center(self):
     """
@@ -2146,26 +2229,6 @@ def _row_sales_order(row):
     if row.so_detail:
         return frappe.db.get_value("Sales Order Item", row.so_detail, "parent")
     return None
-
-
-def _dn_row_batch_nos(row):
-    """Batches this DN row actually ships."""
-    batches = set()
-    if row.batch_no:
-        batches.add(row.batch_no)
-    if row.serial_and_batch_bundle:
-        batches.update(
-            frappe.get_all(
-                "Serial and Batch Entry",
-                filters={
-                    "parent": row.serial_and_batch_bundle,
-                    "parenttype": "Serial and Batch Bundle",
-                },
-                pluck="batch_no",
-            )
-        )
-    batches.discard(None)
-    return batches
 
 
 def _sres_used_by_dn_row(row, sales_order, docstatus=1):

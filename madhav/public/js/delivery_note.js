@@ -49,6 +49,10 @@ frappe.ui.form.on("Delivery Note", {
 		set_lengthpieces(frm);
 	},
 
+	validate(frm) {
+		return enforce_delivery_note_piece_limits(frm, true);
+	},
+
 	// before_save: function(frm) {
 	//     update_totals(frm);
 	// },
@@ -141,8 +145,12 @@ frappe.ui.form.on('Delivery Note Item', {
 				if (pieces != null) {
 					frappe.model.set_value(cdt, cdn, "pieces", pieces);
 				}
+				enforce_delivery_note_piece_limits(frm, false, cdt, cdn);
 			}
 		);
+	},
+	warehouse(frm, cdt, cdn) {
+		enforce_delivery_note_piece_limits(frm, false, cdt, cdn);
 	},
 	item_code(frm, cdt, cdn) {
 		let d = locals[cdt][cdn];
@@ -157,6 +165,7 @@ frappe.ui.form.on('Delivery Note Item', {
 	},
 	pieces(frm, cdt, cdn) {
 		calculate_qty(cdt, cdn);
+		enforce_delivery_note_piece_limits(frm, false, cdt, cdn);
 	},
 	average_length(frm, cdt, cdn) {
 		calculate_qty(cdt, cdn);
@@ -218,6 +227,73 @@ function set_lengthpieces(frm) {
 		}
 	});
 	frm.refresh_field("items");
+}
+
+function dn_items_for_piece_check(frm) {
+	return (frm.doc.items || []).map((row) => ({
+		name: row.name,
+		idx: row.idx,
+		item_code: row.item_code,
+		warehouse: row.warehouse || frm.doc.set_warehouse,
+		batch_no: row.batch_no,
+		serial_and_batch_bundle: row.serial_and_batch_bundle,
+		pieces: row.pieces,
+	}));
+}
+
+function enforce_delivery_note_piece_limits(frm, throw_on_error, cdt, cdn) {
+	if (frm.__piece_limit_lock) {
+		return Promise.resolve();
+	}
+
+	const rows = dn_items_for_piece_check(frm);
+	const targets = (cdn ? rows.filter((row) => row.name === cdn) : rows).filter(
+		(row) => cint(row.pieces) > 0 && row.item_code && (row.batch_no || row.serial_and_batch_bundle)
+	);
+	if (!targets.length) {
+		return Promise.resolve();
+	}
+
+	return Promise.all(
+		targets.map((row) =>
+			frappe
+				.call({
+					method: "madhav.doc_events.delivery_note.get_max_pieces_for_dn_item",
+					args: { items: rows, row_name: row.name },
+				})
+				.then((r) => {
+					if (r.message == null) {
+						return;
+					}
+					const live = (frm.doc.items || []).find((item) => item.name === row.name);
+					if (!live || live.__piece_limit_lock) {
+						return;
+					}
+					const max_pieces = cint(r.message);
+					const entered = cint(live.pieces);
+					if (entered <= max_pieces) {
+						return;
+					}
+					const message = __(
+						"Row #{0}: Batch {1} has {2} pieces. Length/Pieces cannot be {3}.",
+						[live.idx, live.batch_no || "", max_pieces, entered]
+					);
+					if (throw_on_error) {
+						frappe.validated = false;
+						frappe.throw(message);
+					}
+					live.__piece_limit_lock = true;
+					frappe.msgprint({
+						title: __("Pieces limit"),
+						indicator: "red",
+						message,
+					});
+					frappe.model.set_value(live.doctype, live.name, "pieces", max_pieces).then(() => {
+						live.__piece_limit_lock = false;
+					});
+				})
+		)
+	);
 }
 
 function add_sales_order_button_with_item_reference(frm) {
