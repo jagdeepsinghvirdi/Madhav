@@ -472,6 +472,88 @@ class FinishWorkOrder(Document):
                 title=frappe._("Insufficient Batch Stock"),
             )
 
+        self._validate_raw_material_item_stock(demand, posting_datetime, precision)
+
+    def _validate_raw_material_item_stock(self, demand, posting_datetime, precision):
+        item_demand = {}
+        for (item_code, warehouse, _batch_no), entry in demand.items():
+            item_demand.setdefault((item_code, warehouse), 0.0)
+            item_demand[(item_code, warehouse)] += entry["qty"]
+
+        for (item_code, warehouse), asked in item_demand.items():
+            asked = flt(asked, precision)
+            available = flt(self._item_stock_at(item_code, warehouse, posting_datetime), precision)
+            if asked - available <= 1.0 / (10 ** precision):
+                continue
+
+            negatives = self._negative_batches_at(item_code, warehouse, posting_datetime, precision)
+            detail = ""
+            if negatives:
+                detail = frappe._(
+                    "<br><br>Batch-wise stock is negative in this warehouse for: {0}."
+                    "<br>Fix that first (Repost Item Valuation for this Item and Warehouse),"
+                    " the Raw Materials rows themselves are within their batch stock."
+                ).format(", ".join(f"{b} ({q})" for b, q in negatives))
+
+            frappe.throw(
+                frappe._(
+                    "Item {0} has {1} in {2}{3}, but this Finish Work Order consumes {4} (short by {5}).{6}"
+                ).format(
+                    frappe.bold(item_code),
+                    available,
+                    frappe.bold(warehouse),
+                    frappe._(" as on {0}").format(self.posting_date) if self.posting_date else "",
+                    asked,
+                    flt(asked - available, precision),
+                    detail,
+                ),
+                title=frappe._("Insufficient Warehouse Stock"),
+            )
+
+    def _item_stock_at(self, item_code, warehouse, posting_datetime):
+        conditions = "item_code = %(item_code)s and warehouse = %(warehouse)s and is_cancelled = 0"
+        values = {"item_code": item_code, "warehouse": warehouse}
+        if posting_datetime:
+            conditions += " and posting_datetime <= %(posting_datetime)s"
+            values["posting_datetime"] = posting_datetime
+
+        return (
+            frappe.db.sql(
+                f"select sum(actual_qty) from `tabStock Ledger Entry` where {conditions}", values
+            )[0][0]
+            or 0
+        )
+
+    def _negative_batches_at(self, item_code, warehouse, posting_datetime, precision):
+        conditions = "sle.item_code = %(item_code)s and sle.warehouse = %(warehouse)s and sle.is_cancelled = 0"
+        values = {"item_code": item_code, "warehouse": warehouse}
+        if posting_datetime:
+            conditions += " and sle.posting_datetime <= %(posting_datetime)s"
+            values["posting_datetime"] = posting_datetime
+
+        rows = frappe.db.sql(
+            f"""
+            select batch_no, sum(qty) as qty from (
+                select sbe.batch_no as batch_no,
+                       sign(sle.actual_qty) * abs(sbe.qty) as qty
+                from `tabStock Ledger Entry` sle
+                join `tabSerial and Batch Entry` sbe on sbe.parent = sle.serial_and_batch_bundle
+                where {conditions} and sle.serial_and_batch_bundle is not null
+                union all
+                select sle.batch_no as batch_no, sle.actual_qty as qty
+                from `tabStock Ledger Entry` sle
+                where {conditions} and sle.serial_and_batch_bundle is null
+                      and sle.batch_no is not null
+            ) as batch_moves
+            group by batch_no
+            having sum(qty) < 0
+            order by sum(qty)
+            """,
+            values,
+            as_dict=True,
+        )
+        return [(r.batch_no, flt(r.qty, precision)) for r in rows]
+
     def before_submit(self):
         self.update_remarks_from_so()
 
