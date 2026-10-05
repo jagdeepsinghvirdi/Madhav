@@ -474,11 +474,21 @@ function fetch_batch_qty(frm, cdt, cdn) {
             },
             callback: function(r) {
                 let available = flt(r.message);
+                frappe.model.set_value(cdt, cdn, 'available_qty', available);
                 // Only fill qty when empty — never overwrite BOM/required qty
                 // with full batch stock, and never overwrite with 0 (that
                 // produced Manufacture SE "qty cannot be zero" on FWO submit).
                 if (available > 0 && !flt(row.qty)) {
                     frappe.model.set_value(cdt, cdn, 'qty', available);
+                } else if (available > 0 && flt(row.qty) > available) {
+                    frappe.msgprint({
+                        title: __('Qty Exceeds Batch Stock'),
+                        indicator: 'orange',
+                        message: __(
+                            'Row {0}: batch {1} has only {2} of {3} in {4}, but qty is {5}. Submit will fail until this is corrected.',
+                            [row.idx, row.batch_no, available, row.item_code, row.source_warehouse, flt(row.qty)]
+                        )
+                    });
                 } else if (available <= 0) {
                     frappe.msgprint({
                         title: __('No Batch Stock'),
