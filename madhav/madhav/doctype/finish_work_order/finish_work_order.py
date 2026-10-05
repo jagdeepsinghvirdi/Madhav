@@ -30,12 +30,16 @@ class FinishWorkOrder(Document):
 
             # Cancel SE immediately after its SRE so the reservation is
             # cleared before the stock ledger validation runs
+            had_stock_entry = bool(row.stock_entry_reference)
             if row.stock_entry_reference:
                 se = frappe.get_doc("Stock Entry", row.stock_entry_reference)
                 if se.docstatus == 1:
                     se.flags.ignore_links = True
                     se.cancel()
                 row.db_set("stock_entry_reference", "")
+
+            if had_stock_entry and not row.make_it_unplanned:
+                self._restore_work_order_progress(row)
 
             if row.make_it_unplanned == 1:
                 if frappe.db.exists("Work Order", row.work_order):
@@ -45,6 +49,27 @@ class FinishWorkOrder(Document):
                         wo.cancel()
                 row.db_set("work_order", "")
 
+
+    def _restore_work_order_progress(self, row):
+        if not row.work_order or not frappe.db.exists("Work Order", row.work_order):
+            return
+
+        wo = frappe.get_doc("Work Order", row.work_order)
+        if wo.docstatus != 1:
+            return
+
+        finished_qty = flt(
+            row.ready_qty if row.deliver_as_qty else row.calculated_qty, 3
+        )
+        finished_pcs = flt(row.ready_pieces or 0)
+
+        completed_pcs = max(flt(wo.completed_pcs or 0) - finished_pcs, 0)
+        total_pcs = flt(wo.pieces or 0)
+        pending_qty = min(flt(wo.pending_qty or 0) + finished_qty, flt(wo.qty or 0))
+
+        wo.db_set("completed_pcs", completed_pcs)
+        wo.db_set("pending_pcs", max(total_pcs - completed_pcs, 0))
+        wo.db_set("pending_qty", pending_qty)
 
     def on_update(self):
         if self.docstatus == 0:
@@ -433,11 +458,11 @@ class FinishWorkOrder(Document):
         if not demand:
             return
 
-        posting_datetime = f"{self.posting_date} 23:59:59" if self.posting_date else None
+        posting_datetime = f"{self.posting_date} {nowtime()}" if self.posting_date else None
 
         shortages = []
         for (item_code, warehouse, batch_no), entry in demand.items():
-            available = flt(
+            available_then = flt(
                 get_batch_qty(
                     batch_no=batch_no,
                     warehouse=warehouse,
@@ -447,11 +472,31 @@ class FinishWorkOrder(Document):
                 ),
                 precision,
             )
+            available_now = available_then
+            if posting_datetime:
+                available_now = flt(
+                    get_batch_qty(
+                        batch_no=batch_no,
+                        warehouse=warehouse,
+                        item_code=item_code,
+                        ignore_reserved_stock=True,
+                    ),
+                    precision,
+                )
+            available = min(available_then, available_now)
             asked = flt(entry["qty"], precision)
             if asked - available > 1.0 / (10 ** precision):
+                later = ""
+                if available_now < available_then:
+                    later = frappe._(
+                        " Stock existed on {0} ({1}) but later entries have consumed it down to {2},"
+                        " so a back-dated consumption would make those entries negative."
+                        " Use a batch that still has stock, or move the Posting Date forward."
+                    ).format(self.posting_date, available_then, available_now)
+
                 shortages.append(
                     frappe._(
-                        "Row #{0}: batch {1} has {2} of {3} in {4}{5}, cannot consume {6} (short by {7})."
+                        "Row #{0}: batch {1} has {2} of {3} in {4}{5}, cannot consume {6} (short by {7}).{8}"
                     ).format(
                         ", #".join(str(i) for i in sorted(entry["rows"])),
                         frappe.bold(batch_no),
@@ -463,6 +508,7 @@ class FinishWorkOrder(Document):
                         else "",
                         asked,
                         flt(asked - available, precision),
+                        later,
                     )
                 )
 
