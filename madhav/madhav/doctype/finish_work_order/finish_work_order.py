@@ -406,6 +406,72 @@ class FinishWorkOrder(Document):
                 soi = frappe.db.get_value("Work Order", row.work_order, "sales_order_item")
                 frappe.db.set_value("Sales Order Item", soi, "remarks", row.remarks or "")
 
+    def _validate_raw_material_batch_stock(self, rm_pool):
+        from erpnext.stock.doctype.batch.batch import get_batch_qty
+
+        precision = frappe.get_precision("Stock Entry Detail", "qty")
+
+        required = flt(
+            sum(flt(pwo.consumption or 0) for pwo in self.pending_work_orders), precision
+        )
+        if required <= 0:
+            return
+
+        demand = {}
+        for rm in rm_pool:
+            if required <= 0:
+                break
+            take = flt(min(required, flt(rm["original_qty"])), precision)
+            required = flt(required - take, precision)
+            if take <= 0 or not rm.get("batch_no"):
+                continue
+            key = (rm["item_code"], rm["warehouse"], rm["batch_no"])
+            entry = demand.setdefault(key, {"qty": 0.0, "rows": []})
+            entry["qty"] += take
+            entry["rows"].append(rm["idx"])
+
+        if not demand:
+            return
+
+        posting_datetime = f"{self.posting_date} 23:59:59" if self.posting_date else None
+
+        shortages = []
+        for (item_code, warehouse, batch_no), entry in demand.items():
+            available = flt(
+                get_batch_qty(
+                    batch_no=batch_no,
+                    warehouse=warehouse,
+                    item_code=item_code,
+                    posting_datetime=posting_datetime,
+                    ignore_reserved_stock=True,
+                ),
+                precision,
+            )
+            asked = flt(entry["qty"], precision)
+            if asked - available > 1.0 / (10 ** precision):
+                shortages.append(
+                    frappe._(
+                        "Row #{0}: batch {1} has {2} of {3} in {4}{5}, cannot consume {6} (short by {7})."
+                    ).format(
+                        ", #".join(str(i) for i in sorted(entry["rows"])),
+                        frappe.bold(batch_no),
+                        available,
+                        frappe.bold(item_code),
+                        frappe.bold(warehouse),
+                        frappe._(" as on {0}").format(self.posting_date)
+                        if self.posting_date
+                        else "",
+                        asked,
+                        flt(asked - available, precision),
+                    )
+                )
+
+        if shortages:
+            frappe.throw(
+                "<br>".join(shortages),
+                title=frappe._("Insufficient Batch Stock"),
+            )
+
     def before_submit(self):
         self.update_remarks_from_so()
 
@@ -439,6 +505,7 @@ class FinishWorkOrder(Document):
                         title=frappe._("Missing Source Warehouse"),
                     )
                 rm_pool.append({
+                    "idx": rm.idx,
                     "item_code": rm.item_code,
                     "warehouse": warehouse,
                     "remaining_qty": flt(rm.qty),
@@ -476,6 +543,8 @@ class FinishWorkOrder(Document):
                 ),
                 title=frappe._("Raw Materials Required"),
             )
+
+        self._validate_raw_material_batch_stock(rm_pool)
 
         rm_index = 0
 

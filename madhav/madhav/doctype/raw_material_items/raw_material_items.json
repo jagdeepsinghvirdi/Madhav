@@ -21,6 +21,7 @@
   "uom",
   "section_break_ocoe",
   "qty",
+  "available_qty",
   "length",
   "column_break_bnic",
   "pieces",
@@ -65,6 +66,15 @@
    "in_list_view": 1,
    "label": "Qty",
    "reqd": 1
+  },
+  {
+   "description": "Batch stock in the Source Warehouse. Display only.",
+   "fieldname": "available_qty",
+   "fieldtype": "Float",
+   "in_list_view": 1,
+   "label": "Available Qty",
+   "no_copy": 1,
+   "read_only": 1
   },
   {
    "fieldname": "required_qty",
@@ -149,7 +159,7 @@
  "index_web_pages_for_search": 1,
  "istable": 1,
  "links": [],
- "modified": "2026-05-13 10:57:45.632401",
+ "modified": "2026-10-05 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "Madhav",
  "name": "Raw Material Items",
