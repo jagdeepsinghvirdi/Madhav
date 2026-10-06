@@ -303,6 +303,9 @@ from erpnext.stock.serial_batch_bundle import SerialBatchCreation
 from madhav.madhav.monkey_patch.serial_batch_bundle import create_batch
 SerialBatchCreation.create_batch = create_batch
 
+# Backdated issues must pick up a batch's posted inward rate. Import applies the patch.
+import madhav.madhav.monkey_patch.batch_valuation  # noqa: F401
+
 from erpnext.stock.doctype.stock_reservation_entry import stock_reservation_entry as sre_module
 from madhav.madhav.monkey_patch.stock_reservation_entry import (
 	auto_reserve_serial_and_batch,

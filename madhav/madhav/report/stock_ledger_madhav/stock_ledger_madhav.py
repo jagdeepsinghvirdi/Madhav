@@ -73,10 +73,15 @@ def execute(filters=None):
 
 	batch_balance_dict = frappe._dict({})
 	batch_piece_balance_dict = frappe._dict({})  # ADDED: Track piece balance per batch
-	
-	# if actual_qty and filters.get("batch_no"):
-	# 	batch_balance_dict[filters.batch_no] = [actual_qty, stock_value]
-	# 	batch_piece_balance_dict[filters.batch_no] = piece_balance  # ADDED
+
+	# Carry the batch opening into the running balance. Without this, the first
+	# outward row in the period starts from 0 and the batch looks negative.
+	if filters.get("batch_no") and opening_row:
+		batch_balance_dict[filters.batch_no] = [
+			flt(opening_row.get("qty_after_transaction")),
+			flt(opening_row.get("stock_value")),
+		]
+		batch_piece_balance_dict[filters.batch_no] = flt(opening_row.get("qty_in_pieces"))
 	
 	for sle in sl_entries:
 		item_detail = item_details[sle.item_code]
