@@ -1,5 +1,35 @@
+function fill_customer_po(frm) {
+    const pending = (frm.doc.sales_orders || []).filter((row) => {
+        return row.sales_order && !row.po_no && !(frm._customer_po_fetched || {})[row.name];
+    });
+    if (!pending.length) {
+        return;
+    }
+
+    frm._customer_po_fetched = frm._customer_po_fetched || {};
+    pending.forEach((row) => {
+        frm._customer_po_fetched[row.name] = true;
+    });
+
+    frappe.db.get_list("Sales Order", {
+        filters: { name: ["in", pending.map((row) => row.sales_order)] },
+        fields: ["name", "po_no"],
+        limit: pending.length,
+    }).then((orders) => {
+        const po_by_so = {};
+        (orders || []).forEach((order) => {
+            po_by_so[order.name] = order.po_no || "";
+        });
+        pending.forEach((row) => {
+            row.po_no = po_by_so[row.sales_order] || "";
+        });
+        frm.refresh_field("sales_orders");
+    });
+}
+
 frappe.ui.form.on('Production Plan', {
     refresh: function(frm) {
+        fill_customer_po(frm);
         if (frm.doc.docstatus === 1) {
             if (frm.doc.status !== "Completed") {
                 let items = frm.events.get_items_for_work_order(frm);
@@ -184,11 +214,12 @@ frappe.ui.form.on("Production Plan Sales Order", {
         frappe.db.get_value(
             "Sales Order",
             row.sales_order,
-            ["customer", "customer_name"],
+            ["customer", "customer_name", "po_no"],
             (r) => {
                 if (r) {
                     row.customer = r.customer;
                     row.customer_name = r.customer_name;
+                    row.po_no = r.po_no || "";
                     frm.refresh_field("sales_orders");
                 }
             }
