@@ -129,6 +129,22 @@ class CustomProductionPlan(ERPNextProductionPlan):
 		else:
 			frappe.msgprint(_("Sales orders are not available for production"))
 
+	def add_so_in_table(self, open_so):
+		super().add_so_in_table(open_so)
+		names = [row.sales_order for row in self.sales_orders if row.sales_order]
+		if not names:
+			return
+		po_by_so = {
+			row.name: row.po_no
+			for row in frappe.get_all(
+				"Sales Order",
+				filters={"name": ["in", names]},
+				fields=["name", "po_no"],
+			)
+		}
+		for row in self.sales_orders:
+			row.po_no = po_by_so.get(row.sales_order) or ""
+
 	def custom_get_so_items(self):
 	# Check for empty table or empty rows
 		if not self.get("sales_orders") or not self.get_so_mr_list(
@@ -332,20 +348,16 @@ class CustomProductionPlan(ERPNextProductionPlan):
 					row.customer_name = so_details.customer_name or ""
 
 		# Drop lines fully covered by existing reservations (both qty
-		# and pieces) instead of leaving a 0-value row in the plan.
-		# Filter by name (unique per row, even before save) and rebuild
-		# via self.set() rather than list.remove() in a loop, which is
-		# safer given how many rows can share identical field values
-		# (e.g. many unlinked rows with item_code/qty/None sales_order
-		# all equal) - self.set() also re-indexes idx correctly.
-		fully_reserved_names = {
-			row.name for row in self.po_items
-			if flt(row.planned_qty or 0) <= 0 and flt(row.pieces or 0) <= 0
-		}
-		if fully_reserved_names:
-			self.set("po_items", [
-				row for row in self.po_items if row.name not in fully_reserved_names
-			])
+		# and pieces). New rows have no name yet, so filtering by name
+		# also removed every other line on the same plan.
+		self.set(
+			"po_items",
+			[
+				row
+				for row in self.po_items
+				if not (flt(row.planned_qty or 0) <= 0 and flt(row.pieces or 0) <= 0)
+			],
+		)
 
 		self.calculate_total_planned_qty()
 
