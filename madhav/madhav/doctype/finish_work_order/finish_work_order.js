@@ -167,9 +167,49 @@ frappe.ui.form.on("Finish Work Order", {
                     frm.refresh_field("raw_materials");
                     frm.dirty();
 
-                    frappe.msgprint(
-                        __("Fetched {0} Work Orders", [r.message.length])
-                    );
+                    const fetched_count = (r.message || []).length;
+                    frappe.show_alert({
+                        message: __("Fetched {0} Work Orders", [fetched_count]),
+                        indicator: "green",
+                    });
+
+                    // New FWO only: first Fetch silently auto-saves (QI WH
+                    // persist). No business errors here — those wait for the
+                    // user's manual Save click.
+                    const is_new_doc = frm.is_new() || cint(frm.doc.__islocal);
+                    if (
+                        is_new_doc &&
+                        !frm._fwo_auto_saved_after_fetch &&
+                        fetched_count > 0
+                    ) {
+                        frm._fwo_auto_saved_after_fetch = true;
+                        setTimeout(() => {
+                            if (!(frm.is_new() || cint(frm.doc.__islocal))) {
+                                return;
+                            }
+                            frappe.call({
+                                method:
+                                    "madhav.madhav.doctype.finish_work_order.finish_work_order.silent_autosave_after_fetch",
+                                args: { doc: frm.doc },
+                                freeze: true,
+                                freeze_message: __("Saving..."),
+                                callback(save_r) {
+                                    if (save_r.exc || !save_r.message) {
+                                        frm._fwo_auto_saved_after_fetch = false;
+                                        return;
+                                    }
+                                    // Bind the form to the inserted name so the
+                                    // UI does not stay on new-… after autosave.
+                                    frappe.model.sync(save_r.message);
+                                    frappe.set_route(
+                                        "Form",
+                                        save_r.message.doctype,
+                                        save_r.message.name
+                                    );
+                                },
+                            });
+                        }, 400);
+                    }
                 }
             }
         });
