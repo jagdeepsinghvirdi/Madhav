@@ -16,3 +16,8 @@ dump.rdb
 # Local e2e
 .e2e_logs/
 .e2e_scripts/
+
+# Database dumps (never commit production data)
+*.sql
+*.sql.gz
+*.sql.bz2

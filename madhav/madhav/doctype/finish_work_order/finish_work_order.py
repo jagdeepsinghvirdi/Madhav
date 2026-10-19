@@ -54,12 +54,16 @@ class FinishWorkOrder(Document):
 
             # Cancel SE immediately after its SRE so the reservation is
             # cleared before the stock ledger validation runs
+            had_stock_entry = bool(row.stock_entry_reference)
             if row.stock_entry_reference:
                 se = frappe.get_doc("Stock Entry", row.stock_entry_reference)
                 if se.docstatus == 1:
                     se.flags.ignore_links = True
                     se.cancel()
                 row.db_set("stock_entry_reference", "")
+
+            if had_stock_entry and not row.make_it_unplanned:
+                self._restore_work_order_progress(row)
 
             if row.make_it_unplanned == 1:
                 if frappe.db.exists("Work Order", row.work_order):
@@ -69,6 +73,26 @@ class FinishWorkOrder(Document):
                         wo.cancel()
                 row.db_set("work_order", "")
 
+    def _restore_work_order_progress(self, row):
+        if not row.work_order or not frappe.db.exists("Work Order", row.work_order):
+            return
+
+        wo = frappe.get_doc("Work Order", row.work_order)
+        if wo.docstatus != 1:
+            return
+
+        finished_qty = flt(
+            row.ready_qty if row.deliver_as_qty else row.calculated_qty, 3
+        )
+        finished_pcs = flt(row.ready_pieces or 0)
+
+        completed_pcs = max(flt(wo.completed_pcs or 0) - finished_pcs, 0)
+        total_pcs = flt(wo.pieces or 0)
+        pending_qty = min(flt(wo.pending_qty or 0) + finished_qty, flt(wo.qty or 0))
+
+        wo.db_set("completed_pcs", completed_pcs)
+        wo.db_set("pending_pcs", max(total_pcs - completed_pcs, 0))
+        wo.db_set("pending_qty", pending_qty)
 
     def on_update(self):
         if self.docstatus == 0:
@@ -448,6 +472,175 @@ class FinishWorkOrder(Document):
                 soi = frappe.db.get_value("Work Order", row.work_order, "sales_order_item")
                 frappe.db.set_value("Sales Order Item", soi, "remarks", row.remarks or "")
 
+    def _validate_raw_material_batch_stock(self, rm_pool):
+        from erpnext.stock.doctype.batch.batch import get_batch_qty
+
+        precision = frappe.get_precision("Stock Entry Detail", "qty")
+
+        required = flt(
+            sum(flt(pwo.consumption or 0) for pwo in self.pending_work_orders), precision
+        )
+        if required <= 0:
+            return
+
+        demand = {}
+        for rm in rm_pool:
+            if required <= 0:
+                break
+            take = flt(min(required, flt(rm["original_qty"])), precision)
+            required = flt(required - take, precision)
+            if take <= 0 or not rm.get("batch_no"):
+                continue
+            key = (rm["item_code"], rm["warehouse"], rm["batch_no"])
+            entry = demand.setdefault(key, {"qty": 0.0, "rows": []})
+            entry["qty"] += take
+            entry["rows"].append(rm["idx"])
+
+        if not demand:
+            return
+
+        posting_datetime = f"{self.posting_date} {nowtime()}" if self.posting_date else None
+
+        shortages = []
+        for (item_code, warehouse, batch_no), entry in demand.items():
+            available_then = flt(
+                get_batch_qty(
+                    batch_no=batch_no,
+                    warehouse=warehouse,
+                    item_code=item_code,
+                    posting_datetime=posting_datetime,
+                    ignore_reserved_stock=True,
+                ),
+                precision,
+            )
+            available_now = available_then
+            if posting_datetime:
+                available_now = flt(
+                    get_batch_qty(
+                        batch_no=batch_no,
+                        warehouse=warehouse,
+                        item_code=item_code,
+                        ignore_reserved_stock=True,
+                    ),
+                    precision,
+                )
+            available = min(available_then, available_now)
+            asked = flt(entry["qty"], precision)
+            if asked - available > 1.0 / (10 ** precision):
+                later = ""
+                if available_now < available_then:
+                    later = frappe._(
+                        " Stock existed on {0} ({1}) but later entries have consumed it down to {2},"
+                        " so a back-dated consumption would make those entries negative."
+                        " Use a batch that still has stock, or move the Posting Date forward."
+                    ).format(self.posting_date, available_then, available_now)
+
+                shortages.append(
+                    frappe._(
+                        "Row #{0}: batch {1} has {2} of {3} in {4}{5}, cannot consume {6} (short by {7}).{8}"
+                    ).format(
+                        ", #".join(str(i) for i in sorted(entry["rows"])),
+                        frappe.bold(batch_no),
+                        available,
+                        frappe.bold(item_code),
+                        frappe.bold(warehouse),
+                        frappe._(" as on {0}").format(self.posting_date)
+                        if self.posting_date
+                        else "",
+                        asked,
+                        flt(asked - available, precision),
+                        later,
+                    )
+                )
+
+        if shortages:
+            frappe.throw(
+                "<br>".join(shortages),
+                title=frappe._("Insufficient Batch Stock"),
+            )
+
+        self._validate_raw_material_item_stock(demand, posting_datetime, precision)
+
+    def _validate_raw_material_item_stock(self, demand, posting_datetime, precision):
+        item_demand = {}
+        for (item_code, warehouse, _batch_no), entry in demand.items():
+            item_demand.setdefault((item_code, warehouse), 0.0)
+            item_demand[(item_code, warehouse)] += entry["qty"]
+
+        for (item_code, warehouse), asked in item_demand.items():
+            asked = flt(asked, precision)
+            available = flt(self._item_stock_at(item_code, warehouse, posting_datetime), precision)
+            if asked - available <= 1.0 / (10 ** precision):
+                continue
+
+            negatives = self._negative_batches_at(item_code, warehouse, posting_datetime, precision)
+            detail = ""
+            if negatives:
+                detail = frappe._(
+                    "<br><br>Batch-wise stock is negative in this warehouse for: {0}."
+                    "<br>Fix that first (Repost Item Valuation for this Item and Warehouse),"
+                    " the Raw Materials rows themselves are within their batch stock."
+                ).format(", ".join(f"{b} ({q})" for b, q in negatives))
+
+            frappe.throw(
+                frappe._(
+                    "Item {0} has {1} in {2}{3}, but this Finish Work Order consumes {4} (short by {5}).{6}"
+                ).format(
+                    frappe.bold(item_code),
+                    available,
+                    frappe.bold(warehouse),
+                    frappe._(" as on {0}").format(self.posting_date) if self.posting_date else "",
+                    asked,
+                    flt(asked - available, precision),
+                    detail,
+                ),
+                title=frappe._("Insufficient Warehouse Stock"),
+            )
+
+    def _item_stock_at(self, item_code, warehouse, posting_datetime):
+        conditions = "item_code = %(item_code)s and warehouse = %(warehouse)s and is_cancelled = 0"
+        values = {"item_code": item_code, "warehouse": warehouse}
+        if posting_datetime:
+            conditions += " and posting_datetime <= %(posting_datetime)s"
+            values["posting_datetime"] = posting_datetime
+
+        return (
+            frappe.db.sql(
+                f"select sum(actual_qty) from `tabStock Ledger Entry` where {conditions}", values
+            )[0][0]
+            or 0
+        )
+
+    def _negative_batches_at(self, item_code, warehouse, posting_datetime, precision):
+        conditions = "sle.item_code = %(item_code)s and sle.warehouse = %(warehouse)s and sle.is_cancelled = 0"
+        values = {"item_code": item_code, "warehouse": warehouse}
+        if posting_datetime:
+            conditions += " and sle.posting_datetime <= %(posting_datetime)s"
+            values["posting_datetime"] = posting_datetime
+
+        rows = frappe.db.sql(
+            f"""
+            select batch_no, sum(qty) as qty from (
+                select sbe.batch_no as batch_no,
+                       sign(sle.actual_qty) * abs(sbe.qty) as qty
+                from `tabStock Ledger Entry` sle
+                join `tabSerial and Batch Entry` sbe on sbe.parent = sle.serial_and_batch_bundle
+                where {conditions} and sle.serial_and_batch_bundle is not null
+                union all
+                select sle.batch_no as batch_no, sle.actual_qty as qty
+                from `tabStock Ledger Entry` sle
+                where {conditions} and sle.serial_and_batch_bundle is null
+                      and sle.batch_no is not null
+            ) as batch_moves
+            group by batch_no
+            having sum(qty) < 0
+            order by sum(qty)
+            """,
+            values,
+            as_dict=True,
+        )
+        return [(r.batch_no, flt(r.qty, precision)) for r in rows]
+
     def apply_quality_inspection_warehouses(self):
         """Persist the Quality Inspection warehouse on the first Save.
 
@@ -543,6 +736,7 @@ class FinishWorkOrder(Document):
                 )
             rm_pool.append(
                 {
+                    "idx": rm.idx,
                     "item_code": rm.item_code,
                     "warehouse": warehouse,
                     "remaining_qty": flt(rm.qty),
@@ -756,6 +950,9 @@ class FinishWorkOrder(Document):
                         "Set Actual Ready Qty / Ready Pieces, then Save."
                     ).format(pwo.idx, frappe.bold(pwo.item))
                 )
+
+        # Live batch / warehouse stock (from main) — same timing as pool dry-run.
+        self._validate_raw_material_batch_stock(rm_pool)
 
     def before_submit(self):
         self.apply_quality_inspection_warehouses()
