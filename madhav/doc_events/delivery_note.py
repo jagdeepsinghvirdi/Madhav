@@ -4,7 +4,10 @@ from frappe.utils import flt, cint, nowtime, nowdate
 from frappe import _
 
 from madhav.madhav.utils.stock_piece_utils import (
+	distribute_integer_pieces,
+	dn_pieces_for_invoice_change,
 	int_pieces_from_qty,
+	invoice_qty_tolerance_result,
 	qty_from_pieces,
 	resolve_entry_length,
 	resolve_entry_pieces,
@@ -13,6 +16,8 @@ from madhav.madhav.utils.stock_piece_utils import (
 	sum_undelivered_pieces_from_sre_rows,
 	sync_dn_item_length_from_entries,
 )
+
+DEFAULT_INVOICE_QTY_TOLERANCE_PERCENT = 3
 
 def on_submit(doc, method=None):
     if not doc.items:
@@ -410,13 +415,17 @@ def _cap_dn_row_pieces_to_available(doc):
     for row in (doc.get("items") if hasattr(doc, "get") else None) or getattr(doc, "items", None) or []:
         if not cint(getattr(row, "custom_deliver_as_qty", 0)):
             continue
-        if not row.batch_no or not flt(getattr(row, "pieces", None) or 0):
+        demands = _row_piece_demands(row)
+        if len(demands) != 1:
             continue
-        key = (row.batch_no, row.warehouse or "")
+        batch_no, requested = next(iter(demands.items()))
+        if not batch_no or not requested:
+            continue
+        key = (batch_no, row.warehouse or "")
         if key not in remaining:
-            remaining[key] = _batch_available_pieces_for_row(row)
+            remaining[key] = _batch_available_pieces_for_row(row, batch_no)
         avail = remaining[key]
-        requested = flt(row.pieces)
+        requested = flt(requested)
         if requested > avail + 0.0001:
             row.pieces = cint(avail) if avail > 0 else 0
         remaining[key] = max(avail - flt(row.pieces), 0)
@@ -1162,13 +1171,27 @@ def validate(self, method):
         if deliver_as_qty and not row.custom_deliver_as_qty:
             row.custom_deliver_as_qty = deliver_as_qty
 
-        if _has_deliver_as_qty_over_delivery(self):
-            for args in self.status_updater:
-                if (
-                    args.get("target_dt") in ("Sales Order Item", "Sales Invoice Item")
-                    and args.get("overflow_type") == "delivery"
-                ):
-                    args["validate_qty"] = False
+    submitting = getattr(self, "_action", None) == "submit"
+    is_return = cint(getattr(self, "is_return", 0))
+    if submitting and not is_return:
+        _enforce_delivery_tolerance(self)
+
+    # Draft Save still relaxes ERPNext's document check so an outside-tolerance
+    # note can be saved. On submit, one outside row must not turn that check
+    # off for the other rows. Returns keep the previous save behaviour.
+    relax_over_delivery = False
+    if _has_deliver_as_qty_over_delivery(self):
+        if is_return or not submitting:
+            relax_over_delivery = True
+        elif _over_delivery_rows_inside_tolerance(self):
+            relax_over_delivery = True
+    if relax_over_delivery:
+        for args in self.status_updater:
+            if (
+                args.get("target_dt") in ("Sales Order Item", "Sales Invoice Item")
+                and args.get("overflow_type") == "delivery"
+            ):
+                args["validate_qty"] = False
 
 
 def _has_deliver_as_qty_over_delivery(doc):
@@ -1389,6 +1412,8 @@ def _apply_reserved_dims_to_dn_item(dn_item, so_item, sre):
 
 
 def change_qty_serial_and_batch(self):
+    if cint(getattr(self, "is_return", 0)):
+        return
     for item in self.items:
         if not item.against_sales_order:
             continue
@@ -1466,11 +1491,9 @@ def change_qty_serial_and_batch(self):
             desired_qty[0] += leftover_qty
 
         # ── Step 2: Integer pieces for display / piece ledger (do NOT rewrite weight) ──
-        from madhav.madhav.utils.stock_piece_utils import (
-            should_preserve_pieces_for_qty_change,
-        )
-
-        desired_pieces = []
+        entered_total = cint(flt(getattr(item, "pieces", 0)))
+        bundle_pieces = sum(cint(flt(entry.pieces)) for entry in batch_entries)
+        piece_weight = (total_original_qty / bundle_pieces) if bundle_pieces else 0
         for i, entry in enumerate(batch_entries):
             entry_length = resolve_entry_length(
                 entry, entry.batch_no, item.so_detail
@@ -1483,35 +1506,36 @@ def change_qty_serial_and_batch(self):
             if entry_section_weight and not flt(entry.section_weight):
                 entry.section_weight = entry_section_weight
 
-            # Prefer pieces already on the reservation/bundle for this row.
-            # Recalculate only when missing — avoids ceil(SO pieces) again (+1 PC).
-            # Scale stored pieces only for a real partial share. A weight change
-            # smaller than one piece must not turn 40 PC into 39.
-            existing_pieces = cint(flt(entry.pieces))
-            row_avail_qty = abs(flt(entry.qty))
-            if hasattr(entry, "delivered_qty"):
-                row_avail_qty = max(0.0, row_avail_qty - flt(entry.delivered_qty))
-            if existing_pieces > 0 and row_avail_qty > 0:
-                if (
-                    desired_qty[i] > 0
-                    and not should_preserve_pieces_for_qty_change(
-                        row_avail_qty,
-                        desired_qty[i],
-                        entry_length,
-                        entry_section_weight,
-                    )
-                ):
-                    pieces = max(
-                        0,
-                        int(round(existing_pieces * (desired_qty[i] / row_avail_qty))),
-                    )
-                else:
-                    pieces = existing_pieces
-            else:
-                pieces = int_pieces_from_qty(
-                    desired_qty[i], entry_length, entry_section_weight
+        if entered_total > 0:
+            # The count on the Delivery Note row wins. It is never increased,
+            # and a partial the user already typed is not scaled again.
+            kept = dn_pieces_for_invoice_change(
+                entered_total,
+                bundle_pieces,
+                total_original_qty,
+                target_qty,
+                piece_weight=piece_weight,
+            )
+            desired_pieces = distribute_integer_pieces(kept, desired_qty)
+        else:
+            desired_pieces = []
+            for i, entry in enumerate(batch_entries):
+                entry_length = resolve_entry_length(
+                    entry, entry.batch_no, item.so_detail
                 )
-            desired_pieces.append(pieces)
+                entry_section_weight = resolve_entry_section_weight(
+                    entry, item.item_code, entry_length, entry.batch_no
+                )
+                # Missing dimensions must not turn a blank count into a
+                # ceiling of 0 that later looks like a real piece change.
+                if not entry_length or not entry_section_weight:
+                    desired_pieces.append(0)
+                    continue
+                desired_pieces.append(
+                    int_pieces_from_qty(
+                        desired_qty[i], entry_length, entry_section_weight
+                    )
+                )
 
         target_total_pieces = sum(desired_pieces)
 
@@ -1805,20 +1829,175 @@ def get_available_qty_for_item(row, already_claimed=None):
             return bundle_qty
 
     if row.against_sales_order and row.so_detail:
-        sre_rows = frappe.get_all(
-            "Stock Reservation Entry",
-            filters={
-                "voucher_type": "Sales Order",
-                "voucher_no": row.against_sales_order,
-                "voucher_detail_no": row.so_detail,
-                "docstatus": 1,
-            },
-            fields=["reserved_qty", "delivered_qty"],
-        )
-        if sre_rows:
-            return sum(flt(d.reserved_qty) - flt(d.delivered_qty) for d in sre_rows)
+        reserved = _undelivered_qty_on_matching_sres(row, warehouse, batch_nos)
+        if reserved is not None:
+            return reserved
 
     return 0
+
+
+def _undelivered_qty_on_matching_sres(row, warehouse, batch_nos):
+    """Undelivered qty on this row's own active reservations.
+
+    Cancelled reservations are excluded. When the row already sits on one
+    of the reserved warehouses, a sibling reservation in another warehouse
+    is not this row's qty. A batch on the row only matches reservations
+    that contain that batch, including batches inside the bundle.
+    """
+    sre_rows = frappe.get_all(
+        "Stock Reservation Entry",
+        filters={
+            "voucher_type": "Sales Order",
+            "voucher_no": row.against_sales_order,
+            "voucher_detail_no": row.so_detail,
+            "docstatus": 1,
+        },
+        fields=[
+            "name",
+            "reserved_qty",
+            "delivered_qty",
+            "warehouse",
+            "reservation_based_on",
+        ],
+    )
+    if not sre_rows:
+        return None
+
+    reserved_warehouses = {sre.warehouse for sre in sre_rows if sre.warehouse}
+    if warehouse and warehouse in reserved_warehouses:
+        sre_rows = [sre for sre in sre_rows if sre.warehouse == warehouse]
+
+    matched = []
+    for sre in sre_rows:
+        if batch_nos and sre.reservation_based_on == "Serial and Batch":
+            sre_batches = set(
+                frappe.get_all(
+                    "Serial and Batch Entry",
+                    filters={
+                        "parent": sre.name,
+                        "parenttype": "Stock Reservation Entry",
+                    },
+                    pluck="batch_no",
+                )
+            )
+            if not (sre_batches & set(batch_nos)):
+                continue
+        elif batch_nos:
+            continue
+        matched.append(sre)
+
+    if not matched:
+        return 0
+    return sum(max(flt(sre.reserved_qty) - flt(sre.delivered_qty), 0) for sre in matched)
+
+
+def _delivery_tolerance_percent():
+    """3% unless Stock Settings carries madhav_invoice_qty_tolerance."""
+    try:
+        if frappe.get_meta("Stock Settings").has_field("madhav_invoice_qty_tolerance"):
+            value = frappe.db.get_single_value(
+                "Stock Settings", "madhav_invoice_qty_tolerance"
+            )
+            if value not in (None, ""):
+                return flt(value)
+    except Exception:
+        pass
+    return DEFAULT_INVOICE_QTY_TOLERANCE_PERCENT
+
+
+def _enforce_delivery_tolerance(doc):
+    """Stop Submit when Invoice Qty is outside the configured percent of Qty.
+
+    The check runs per row and does not cancel reservations or post stock.
+    Rows without Invoice Qty are skipped. Draft Save does not call this.
+    """
+    precision = cint(frappe.get_precision("Delivery Note Item", "qty") or 3)
+    limit = _delivery_tolerance_percent()
+    for row in doc.items or []:
+        if not cint(getattr(row, "custom_deliver_as_qty", 0)):
+            continue
+        result = invoice_qty_tolerance_result(
+            getattr(row, "qty", 0),
+            getattr(row, "invoice_qty", None),
+            limit,
+            precision,
+            getattr(row, "conversion_factor", 1),
+        )
+        if result.get("skip"):
+            continue
+        if result.get("zero_qty"):
+            frappe.throw(
+                _(
+                    "Row #{0}: Qty is zero and Invoice Qty is {1}. "
+                    "Enter Qty before submit."
+                ).format(row.idx, flt(row.invoice_qty)),
+                title=_("Invoice Qty Tolerance"),
+            )
+        if not result.get("within"):
+            frappe.throw(
+                _(
+                    "Row #{0}: Invoice Qty {1} differs from Qty {2} by {3}%, "
+                    "which is above the {4}% tolerance."
+                ).format(
+                    row.idx,
+                    flt(row.invoice_qty),
+                    flt(row.qty),
+                    flt(result.get("percent"), 2),
+                    flt(limit),
+                ),
+                title=_("Invoice Qty Tolerance"),
+            )
+
+
+def _over_delivery_rows_inside_tolerance(doc):
+    precision = cint(frappe.get_precision("Delivery Note Item", "qty") or 3)
+    limit = _delivery_tolerance_percent()
+    for row in doc.items or []:
+        if not cint(getattr(row, "custom_deliver_as_qty", 0)) or not flt(row.invoice_qty):
+            continue
+        over = flt(row.invoice_qty) > flt(row.qty)
+        if not over and row.so_detail:
+            so_qty = flt(frappe.db.get_value("Sales Order Item", row.so_detail, "qty"))
+            over = flt(row.invoice_qty) > so_qty
+        if not over and row.si_detail:
+            si_qty = flt(frappe.db.get_value("Sales Invoice Item", row.si_detail, "qty"))
+            over = flt(row.invoice_qty) > si_qty
+        if not over:
+            continue
+        result = invoice_qty_tolerance_result(
+            row.qty, row.invoice_qty, limit, precision, getattr(row, "conversion_factor", 1)
+        )
+        if result.get("zero_qty") or not result.get("within"):
+            return False
+    return True
+
+
+def _block_blank_pieces_without_dimensions(doc):
+    """Keep entered pieces. Block Submit only when pieces are blank and a dimension is missing."""
+    for row in doc.items or []:
+        if not cint(getattr(row, "custom_deliver_as_qty", 0)):
+            continue
+        if cint(flt(getattr(row, "pieces", 0))):
+            continue
+        if not row.batch_no and not row.serial_and_batch_bundle:
+            continue
+        length = flt(getattr(row, "length_size", 0)) or flt(getattr(row, "average_length", 0))
+        section_weight = flt(getattr(row, "section_weight", 0))
+        if length and section_weight:
+            continue
+        if not length and not section_weight:
+            missing = _("length and section weight")
+        elif not length:
+            missing = _("length")
+        else:
+            missing = _("section weight")
+        frappe.throw(
+            _(
+                "Row #{0}: Item {1} is missing {2}, so pieces cannot be calculated. "
+                "Enter the pieces or the missing dimension before submit."
+            ).format(row.idx, row.item_code, missing),
+            title=_("Missing Dimensions"),
+        )
 
 
 def _dn_row_batch_qty_claims(row):
@@ -1981,49 +2160,28 @@ def update_bundle_to_invoice_qty(item, invoice_qty, qty, deliver_as_qty, already
         distribute_integer_pieces,
         int_pieces_from_qty,
         preserve_entry_pieces,
-        qty_from_pieces,
-        should_preserve_pieces_for_qty_change,
         stored_entry_pieces,
     )
 
-    item_pieces = cint(flt(getattr(item, "pieces", 0)))
+    entered_pieces = cint(flt(getattr(item, "pieces", 0)))
     original_bundle_pieces = sum(
         cint(flt(getattr(entry, "pieces", 0))) for entry in batch_entries
     )
-    # A mapped SI/DN row commonly carries the pieces for the complete
-    # selected batch.  Scale that physical count when Deliver as Qty shrinks
-    # the bundle by at least one piece; otherwise a 20-PC partial delivery
-    # posts all 30 PCs. A smaller weight change must not turn 40 PC into 39.
-    piece_weights = []
-    for entry in batch_entries:
-        weight = qty_from_pieces(
-            1, flt(getattr(entry, "length", 0)), flt(getattr(entry, "section_weight", 0))
-        )
-        if weight > 0:
-            piece_weights.append(weight)
-    if not piece_weights:
-        row_weight = qty_from_pieces(
-            1,
-            flt(getattr(item, "length_size", 0)) or flt(getattr(item, "average_length", 0)),
-            flt(getattr(item, "section_weight", 0)),
-        )
-        if row_weight > 0:
-            piece_weights.append(row_weight)
-    min_piece_weight = min(piece_weights) if piece_weights else 0
-
-    if (
-        item_pieces > 0
-        and original_bundle_pieces > 0
-        and not should_preserve_pieces_for_qty_change(
+    # Use this row's own piece weight. The lightest batch in a mixed bundle
+    # must not make a small gap look like a whole piece and rescale every batch.
+    piece_weight = (
+        total_original_qty / original_bundle_pieces if original_bundle_pieces else 0
+    )
+    if entered_pieces > 0:
+        item_pieces = dn_pieces_for_invoice_change(
+            entered_pieces,
+            original_bundle_pieces,
             total_original_qty,
             target_qty,
-            piece_weight=min_piece_weight,
+            piece_weight=piece_weight,
         )
-    ):
-        item_pieces = int(round(
-            original_bundle_pieces * target_qty / total_original_qty
-        ))
-    n_entries = len(batch_entries)
+    else:
+        item_pieces = 0
 
     if item_pieces > 0 and target_qty > 0:
         piece_alloc = distribute_integer_pieces(item_pieces, desired)
@@ -2057,8 +2215,9 @@ def update_bundle_to_invoice_qty(item, invoice_qty, qty, deliver_as_qty, already
             entry.section_weight = entry_section_weight
 
         pieces = piece_alloc[i] if i < len(piece_alloc) else 0
-        if desired[i] > 0 and pieces <= 0:
-            # Qty row must not stay at 0 PC when we have a piece total to allocate.
+        if desired[i] > 0 and pieces <= 0 and entered_pieces <= 0:
+            # Blank pieces can be filled once from weight. An entered count
+            # is never replaced by that ceiling.
             pieces = preserve_entry_pieces(entry, item_pieces, desired[i] / target_qty)
             if pieces <= 0:
                 pieces = int_pieces_from_qty(
@@ -2160,6 +2319,13 @@ from frappe.utils import get_datetime, add_to_date, nowtime
 
 
 def before_submit(self, method):
+    if cint(getattr(self, "is_return", 0)):
+        return
+
+    # Stop before any reservation cancel, piece change, or reconciliation.
+    _enforce_delivery_tolerance(self)
+    _block_blank_pieces_without_dimensions(self)
+
     # Cap before validate: Deliver-as-Qty invoice pieces often exceed the
     # physical batch; qty can be reconciled, pieces cannot.
     _cap_dn_row_pieces_to_available(self)
@@ -2187,8 +2353,14 @@ def before_submit(self, method):
 
         available_qty = get_available_qty_for_item(i, already_claimed=claimed)
 
-        if flt(i.invoice_qty) > available_qty:
-            i.difference_qty = flt(i.invoice_qty) - available_qty
+        # Round to stock qty precision first so a 1.189 vs 1.190 gap that
+        # collapses at 2 decimals (both 1.19) is not treated as a shortfall,
+        # and cancel/reconcile are not started for pure rounding dust.
+        qty_precision = cint(frappe.get_precision("Delivery Note Item", "qty") or 3)
+        inv_rounded = flt(i.invoice_qty, qty_precision)
+        avail_rounded = flt(available_qty, qty_precision)
+        if inv_rounded > avail_rounded:
+            i.difference_qty = flt(inv_rounded - avail_rounded, qty_precision)
         else:
             i.difference_qty = 0
 

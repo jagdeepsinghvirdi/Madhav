@@ -6,6 +6,30 @@ from frappe.model.document import Document
 from frappe.utils import now, nowdate, nowtime
 from frappe.utils import flt, cint
 from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import get_available_qty_to_reserve
+from madhav.madhav.utils.stock_piece_utils import absorb_rounding_dust
+
+
+def _pwo_basis_qty(row):
+	"""Qty used for both raw-material share and finished-goods output.
+
+	Deliver as Qty, a row with no Sales Order, and an unplanned row stay on
+	Ready Qty. A Sales Order row with Deliver as Qty off uses Calculated Qty,
+	the same number the finished good is posted with.
+	"""
+	if (
+		cint(getattr(row, "make_it_unplanned", 0))
+		or not getattr(row, "sales_order", None)
+		or cint(getattr(row, "deliver_as_qty", 0))
+	):
+		return flt(getattr(row, "ready_qty", 0))
+	return flt(getattr(row, "calculated_qty", 0))
+
+
+def _round_qty(value, precision=3):
+	"""Round a qty without depending on frappe.flt precision init."""
+	prec = max(0, int(precision or 0))
+	return round(flt(value), prec)
+
 
 class FinishWorkOrder(Document):
     def on_cancel(self):
@@ -49,7 +73,6 @@ class FinishWorkOrder(Document):
                         wo.cancel()
                 row.db_set("work_order", "")
 
-
     def _restore_work_order_progress(self, row):
         if not row.work_order or not frappe.db.exists("Work Order", row.work_order):
             return
@@ -75,15 +98,24 @@ class FinishWorkOrder(Document):
         if self.docstatus == 0:
             self.create_unplanned_work_orders()
         
-    def after_insert(self):
-        for row in self.pending_work_orders:
-            if row.sales_order:
-                doc = frappe.get_doc("Sales Order",row.sales_order)
-                if doc.quality_required and not row.make_it_unplanned:
-                    row.target_warehouse = frappe.db.get_value("Company",self.company,"default_quality_inspection_warehouse")
-
     def validate(self):
+        # Fetch auto-save only persists QI warehouse / row calcs. Business
+        # errors wait for the user's manual Save click.
+        silent = bool(self.flags.get("fwo_silent_autosave"))
+        self.apply_quality_inspection_warehouses()
+        for row in self.pending_work_orders:
+            if row.ready_qty and row.ready_pieces and row.length_size:
+                row.calculated_section_weight = (flt(row.ready_qty) * 1000)/(flt(row.ready_pieces) * flt(row.length_size))
+                row.calculated_qty = (flt(row.ready_pieces) * flt(row.standard_weight) * flt(row.length_size)) /1000
+            if not row.sales_order:
+                row.deliver_as_qty = 1
+            if row.make_it_unplanned:
+                row.qty = row.ready_qty
+                row.pieces = row.ready_pieces
         self.update_totals()
+        if silent:
+            return
+
         for row in self.raw_materials:
             if not row.item_code:
                 continue
@@ -112,15 +144,10 @@ class FinishWorkOrder(Document):
                         ),
                         title=frappe._("Batch / Item Mismatch"),
                     )
-        for row in self.pending_work_orders:
-            if row.ready_qty and row.ready_pieces and row.length_size:
-                row.calculated_section_weight = (flt(row.ready_qty) * 1000)/(flt(row.ready_pieces) * flt(row.length_size))
-                row.calculated_qty = (flt(row.ready_pieces) * flt(row.standard_weight) * flt(row.length_size)) /1000
-            if not row.sales_order:
-                row.deliver_as_qty = 1
-            if row.make_it_unplanned:
-                row.qty = row.ready_qty
-                row.pieces = row.ready_pieces
+        # RM is user-entered and split by ready/basis qty. All stock-readiness
+        # errors (RM pool, scrap, WH, dimensions) run on manual Save below —
+        # not on Fetch auto-save, and not delayed until Approve.
+        self.validate_stock_readiness()
 
     def update_totals(self):
         total_wo_qty = 0
@@ -128,41 +155,55 @@ class FinishWorkOrder(Document):
         total_rm_qty = 0
         total_rm_pieces = 0
         total_scrap_qty = 0
-        
+        basis_qtys = []
+
         for row in self.pending_work_orders:
             total_wo_qty += row.ready_qty or 0
             total_wo_pieces += row.ready_pieces or 0
-            
+            basis_qtys.append(_pwo_basis_qty(row))
+
         for row in self.raw_materials:
+            # Zero-qty raw material lines stay allowed and do not count.
             total_rm_qty += row.qty or 0
             total_rm_pieces += row.pieces or 0
-            
+
         for row in self.scrap_items:
             total_scrap_qty += row.qty or 0
-            
+
         self.total_work_order_qty = total_wo_qty
         self.total_work_order_pieces = total_wo_pieces
         self.total_raw_material_qty = total_rm_qty
         self.total_raw_material_pieces = total_rm_pieces
         self.scrap_qty = total_scrap_qty
-        
-        # Prevent division by zero
-        if total_wo_qty:
-            self.scrap_ratio = total_scrap_qty / total_wo_qty
+
+        basis_total = sum(basis_qtys)
+        # Prevent division by zero. A zero work-order total leaves the ratios at 0.
+        if basis_total:
+            self.scrap_ratio = total_scrap_qty / basis_total
+            self.consumption_ratio = total_rm_qty / basis_total
         else:
             self.scrap_ratio = 0
-
-        if (total_wo_qty ):
-            self.consumption_ratio = total_rm_qty / (total_wo_qty)
-        else:
             self.consumption_ratio = 0
 
-        # Update child table fields
-        for row in self.pending_work_orders:
-            ready_qty = row.ready_qty or 0
+        precision = frappe.get_precision("Stock Entry Detail", "qty") or 3
+        if basis_total:
+            consumptions = [
+                basis * self.consumption_ratio for basis in basis_qtys
+            ]
+            scrap_shares = [
+                basis * self.scrap_ratio for basis in basis_qtys
+            ]
+        else:
+            consumptions = [0 for _basis in basis_qtys]
+            scrap_shares = [0 for _basis in basis_qtys]
+        consumptions = absorb_rounding_dust(consumptions, total_rm_qty, precision)
+        scrap_shares = absorb_rounding_dust(scrap_shares, total_scrap_qty, precision)
 
-            row.consumption = ready_qty * self.consumption_ratio
-            row.scrap_qty = ready_qty * self.scrap_ratio
+        for row, consumption, scrap_qty in zip(
+            self.pending_work_orders, consumptions, scrap_shares
+        ):
+            row.consumption = consumption
+            row.scrap_qty = scrap_qty
 
     def create_unplanned_work_orders(self):
 
@@ -600,39 +641,101 @@ class FinishWorkOrder(Document):
         )
         return [(r.batch_no, flt(r.qty, precision)) for r in rows]
 
-    def before_submit(self):
-        self.update_remarks_from_so()
+    def apply_quality_inspection_warehouses(self):
+        """Persist the Quality Inspection warehouse on the first Save.
 
-        # Holds data collected while creating Stock Entries so on_submit
-        # can create the Stock Reservation Entries afterwards.
-        self._fg_reservation_data = []
+        The automatic switch runs only while the row is still on the fetched
+        Finished Goods warehouse. A warehouse the user selected is left as it
+        is. Make it Unplanned does not force Quality Inspection. A blank or
+        other-company warehouse is not written; the draft still saves and
+        Submit stops until the company warehouse is valid.
+        """
+        qi_warehouse = None
+        if self.company:
+            qi_warehouse = frappe.db.get_value(
+                "Company", self.company, "default_quality_inspection_warehouse"
+            )
+        qi_valid = bool(
+            qi_warehouse
+            and frappe.db.get_value("Warehouse", qi_warehouse, "company") == self.company
+        )
+        blocked = []
 
-        # ==============================
-        # BUILD FIFO RAW MATERIAL POOL
-        # ==============================
+        for row in self.pending_work_orders or []:
+            # Always sync the line checkbox from the Sales Order so a cleared
+            # SO cannot leave a stale Quality Required flag forcing QI later.
+            if row.sales_order and frappe.db.exists("Sales Order", row.sales_order):
+                row.quality_required = cint(
+                    frappe.db.get_value("Sales Order", row.sales_order, "quality_required")
+                )
+            else:
+                row.quality_required = 0
+
+            if (
+                cint(row.make_it_unplanned)
+                or not row.sales_order
+                or not cint(row.quality_required)
+            ):
+                continue
+
+            finished_goods = None
+            if row.work_order and frappe.db.exists("Work Order", row.work_order):
+                finished_goods = frappe.db.get_value(
+                    "Work Order", row.work_order, "fg_warehouse"
+                )
+            current = row.target_warehouse
+            still_on_finished_goods = (not current) or (
+                finished_goods and current == finished_goods
+            )
+            if not still_on_finished_goods:
+                continue
+
+            if not qi_valid:
+                blocked.append(row)
+                continue
+
+            row.target_warehouse = qi_warehouse
+
+        if not blocked:
+            return
+
+        if self.flags.get("fwo_silent_autosave"):
+            # Fetch auto-save: keep FG warehouse on those rows, no popup.
+            return
+
+        message = frappe._(
+            "Company {0} needs a Quality Inspection warehouse that belongs to {0}. "
+            "Rows {1} stay on Finished Goods. Set the company QI warehouse, then Save again."
+        ).format(
+            frappe.bold(self.company),
+            ", ".join(str(row.idx) for row in blocked),
+        )
+        frappe.throw(message, title=frappe._("Quality Inspection Warehouse"))
+
+    def _build_rm_consume_pool(self):
+        """Positive-qty Raw Material rows with a resolvable source warehouse."""
         rm_pool = []
         for rm in self.raw_materials:
-            if rm.qty and rm.qty > 0:
-                warehouse = rm.source_warehouse
-                # BOM / batch pick often leaves Source Warehouse blank even
-                # when the batch has live stock — resolve from ledger so the
-                # old submit path keeps working without forcing a UI field.
-                if not warehouse and rm.batch_no:
-                    warehouse = _warehouse_for_batch_stock(rm.item_code, rm.batch_no)
-                if not warehouse:
-                    frappe.throw(
-                        frappe._(
-                            "Row #{0}: Source Warehouse is missing for raw material {1}. "
-                            "Batch {2} has no live stock warehouse to auto-fill from — "
-                            "set Source Warehouse on the Raw Materials row."
-                        ).format(
-                            rm.idx,
-                            frappe.bold(rm.item_code),
-                            frappe.bold(rm.batch_no or "—"),
-                        ),
-                        title=frappe._("Missing Source Warehouse"),
-                    )
-                rm_pool.append({
+            if not (rm.qty and flt(rm.qty) > 0):
+                continue
+            warehouse = rm.source_warehouse
+            if not warehouse and rm.batch_no:
+                warehouse = _warehouse_for_batch_stock(rm.item_code, rm.batch_no)
+            if not warehouse:
+                frappe.throw(
+                    frappe._(
+                        "Row #{0}: Source Warehouse is missing for raw material {1}. "
+                        "Batch {2} has no live stock warehouse to auto-fill from — "
+                        "set Source Warehouse on the Raw Materials row."
+                    ).format(
+                        rm.idx,
+                        frappe.bold(rm.item_code),
+                        frappe.bold(rm.batch_no or "—"),
+                    ),
+                    title=frappe._("Missing Source Warehouse"),
+                )
+            rm_pool.append(
+                {
                     "idx": rm.idx,
                     "item_code": rm.item_code,
                     "warehouse": warehouse,
@@ -643,51 +746,236 @@ class FinishWorkOrder(Document):
                     "length": rm.length,
                     "section_weight": rm.section_weight,
                     "cost_center": self.cost_center,
-                    "branch": self.branch
-                })
+                    "branch": self.branch,
+                }
+            )
+        return rm_pool
+
+    def _build_scrap_pool(self):
+        scrap_pool = []
+        for sc in self.scrap_items:
+            if sc.qty and flt(sc.qty) > 0:
+                scrap_pool.append(
+                    {
+                        "item_code": sc.item,
+                        "remaining_qty": flt(sc.qty),
+                        "warehouse": sc.warehouse,
+                    }
+                )
+        return scrap_pool
+
+    def validate_stock_readiness(self):
+        """All Approve-time stock checks — run on manual Save so the user
+        sees every error before the workflow reaches Approve.
+        """
+        precision = frappe.get_precision("Stock Entry Detail", "qty") or 3
+        rm_pool = self._build_rm_consume_pool()
 
         if self.raw_materials and not rm_pool:
             frappe.throw(
                 frappe._(
                     "Raw Materials rows exist but all have qty 0. "
-                    "Enter a positive qty for each raw material before submit."
+                    "Enter a positive qty for each raw material, then Save."
                 ),
                 title=frappe._("Invalid Raw Material Qty"),
             )
 
-        # Manufacture SE is built from this pool (same as working SE
-        # MUST26-04799: RM row with Source Warehouse + qty). Without a pool
-        # ERPNext throws a confusing "raw material missing" on an FG-only SE.
+        # Use ready/basis qty (not consumption). Consumption is derived from
+        # entered RM, so empty RM always made consumption 0 and this guard
+        # never fired — Save looked fine until Approve skipped every SE.
         has_wo_to_finish = any(
-            flt(p.consumption or 0) > 0 and p.work_order for p in self.pending_work_orders
+            flt(_pwo_basis_qty(p)) > 0
+            and (p.work_order or cint(p.make_it_unplanned))
+            for p in self.pending_work_orders
         )
         if has_wo_to_finish and not rm_pool:
             frappe.throw(
                 frappe._(
                     "No Raw Materials to consume. Add rows on the Raw Materials "
-                    "table (Item, Qty, Batch, Source Warehouse) before submit — "
+                    "table (Item, Qty, Batch, Source Warehouse), then Save — "
                     "Finish Work Order creates the Manufacture Stock Entry from "
                     "this table, it does not pull RM from the Work Order BOM."
                 ),
                 title=frappe._("Raw Materials Required"),
             )
 
+        scrap_pool = self._build_scrap_pool()
+        # Deep copy remaining qtys so this dry-run does not mutate submit pools.
+        rm_sim = [
+            {
+                "item_code": r["item_code"],
+                "remaining_qty": flt(r["remaining_qty"]),
+            }
+            for r in rm_pool
+        ]
+        scrap_sim = [
+            {
+                "item_code": s["item_code"],
+                "remaining_qty": flt(s["remaining_qty"]),
+            }
+            for s in scrap_pool
+        ]
+        rm_index = 0
+        scrap_index = 0
+        dust = _round_qty(10 ** (-precision), precision) if precision else 0.001
+
+        for pwo in self.pending_work_orders:
+            fg_qty = flt(pwo.consumption or 0, precision)
+            scrap_required = flt(pwo.scrap_qty or 0, precision)
+
+            if (
+                pwo.sales_order
+                and not cint(pwo.make_it_unplanned)
+                and not cint(pwo.deliver_as_qty)
+                and flt(pwo.ready_qty) > 0
+                and flt(pwo.calculated_qty) <= 0
+            ):
+                frappe.throw(
+                    frappe._(
+                        "Row {0}: Calculated Qty is zero for item {1}. "
+                        "Enter pieces, length, and section weight, then Save."
+                    ).format(pwo.idx, frappe.bold(pwo.item)),
+                    title=frappe._("Missing Dimensions"),
+                )
+
+            if fg_qty <= 0:
+                continue
+
+            if not pwo.work_order:
+                if cint(pwo.make_it_unplanned):
+                    # WO is created in on_update after this Save. Defer the
+                    # consume dry-run for this row until the next Save.
+                    fg_final_qty = flt(_pwo_basis_qty(pwo), 3)
+                    if fg_final_qty <= 0:
+                        frappe.throw(
+                            frappe._(
+                                "Row {0}: Finished qty is zero for item {1}. "
+                                "Set Actual Ready Qty / Ready Pieces, then Save."
+                            ).format(pwo.idx, frappe.bold(pwo.item))
+                        )
+                    continue
+                frappe.throw(
+                    f"Row {pwo.idx}: Work Order is not set for item <b>{pwo.item}</b>."
+                )
+
+            so_item = frappe.db.get_value(
+                "Work Order", pwo.work_order, "sales_order_item"
+            )
+            if pwo.sales_order and so_item and not cint(pwo.quality_required):
+                so_wh = frappe.db.get_value("Sales Order Item", so_item, "warehouse")
+                if so_wh and pwo.target_warehouse == so_wh:
+                    from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
+                        validate_length_for_so_reservation,
+                    )
+
+                    validate_length_for_so_reservation(
+                        so_item,
+                        pwo.length_size,
+                        sales_order=pwo.sales_order,
+                        item_code=pwo.item,
+                    )
+
+            remaining_fg_qty = fg_qty
+            while remaining_fg_qty > 0.0001 and rm_index < len(rm_sim):
+                rm_row = rm_sim[rm_index]
+                if rm_row["remaining_qty"] <= 0:
+                    rm_index += 1
+                    continue
+                consume = flt(min(remaining_fg_qty, rm_row["remaining_qty"]), precision)
+                if consume <= 0:
+                    if rm_row["remaining_qty"] <= 0.0001:
+                        rm_row["remaining_qty"] = 0
+                        rm_index += 1
+                        continue
+                    frappe.throw(
+                        frappe._(
+                            "Row {0}: Cannot consume Raw Material {1} — "
+                            "computed qty rounds to zero. Check Raw Material qty "
+                            "and Work Order ready qty."
+                        ).format(pwo.idx, frappe.bold(rm_row["item_code"]))
+                    )
+                rm_row["remaining_qty"] -= consume
+                remaining_fg_qty -= consume
+                if rm_row["remaining_qty"] <= 0.0001:
+                    rm_row["remaining_qty"] = 0
+                    rm_index += 1
+
+            if _round_qty(remaining_fg_qty, precision) > dust:
+                frappe.throw(
+                    frappe._(
+                        "Row {0}: Raw material pool exhausted for Work Order {1}. "
+                        "Still need {2}. Increase Raw Materials qty or reduce ready qty."
+                    ).format(
+                        pwo.idx,
+                        frappe.bold(pwo.work_order),
+                        flt(remaining_fg_qty, precision),
+                    )
+                )
+
+            remaining_scrap = scrap_required
+            while remaining_scrap > 0.0001 and scrap_index < len(scrap_sim):
+                sc_row = scrap_sim[scrap_index]
+                if sc_row["remaining_qty"] <= 0:
+                    scrap_index += 1
+                    continue
+                consume_scrap = flt(
+                    min(remaining_scrap, sc_row["remaining_qty"]), precision
+                )
+                if consume_scrap <= 0:
+                    if sc_row["remaining_qty"] <= 0.0001:
+                        sc_row["remaining_qty"] = 0
+                        scrap_index += 1
+                        continue
+                    break
+                sc_row["remaining_qty"] -= consume_scrap
+                remaining_scrap -= consume_scrap
+                if sc_row["remaining_qty"] <= 0.0001:
+                    sc_row["remaining_qty"] = 0
+                    scrap_index += 1
+
+            if flt(remaining_scrap, precision) > 0:
+                frappe.throw(
+                    frappe._(
+                        "Row {0}: Scrap is still short by {1}. "
+                        "The scrap lines have to add up to the scrap entered."
+                    ).format(pwo.idx, flt(remaining_scrap, precision)),
+                    title=frappe._("Scrap Quantity"),
+                )
+
+            fg_final_qty = flt(_pwo_basis_qty(pwo), 3)
+            if fg_final_qty <= 0:
+                frappe.throw(
+                    frappe._(
+                        "Row {0}: Finished qty is zero for item {1}. "
+                        "Set Actual Ready Qty / Ready Pieces, then Save."
+                    ).format(pwo.idx, frappe.bold(pwo.item))
+                )
+
+        # Live batch / warehouse stock (from main) — same timing as pool dry-run.
         self._validate_raw_material_batch_stock(rm_pool)
 
+    def before_submit(self):
+        self.apply_quality_inspection_warehouses()
+        self.update_remarks_from_so()
+        # Refresh consumption / scrap shares before building the SE pool.
+        self.update_totals()
+        # Re-run the same checks Approve used to surface only here.
+        self.validate_stock_readiness()
+
+        # Holds data collected while creating Stock Entries so on_submit
+        # can create the Stock Reservation Entries afterwards.
+        self._fg_reservation_data = []
+
+        # ==============================
+        # BUILD FIFO RAW MATERIAL POOL
+        # ==============================
+        rm_pool = self._build_rm_consume_pool()
         rm_index = 0
 
         # ==============================
         # BUILD FIFO SCRAP POOL
         # ==============================
-        scrap_pool = []
-        for sc in self.scrap_items:
-            if sc.qty and sc.qty > 0:
-                scrap_pool.append({
-                    "item_code": sc.item,
-                    "remaining_qty": sc.qty,
-                    "warehouse": sc.warehouse
-                })
-
+        scrap_pool = self._build_scrap_pool()
         scrap_index = 0
 
         precision = frappe.get_precision("Stock Entry Detail", "qty")
@@ -708,28 +996,6 @@ class FinishWorkOrder(Document):
                     f"Row {pwo.idx}: Work Order is not set for item <b>{pwo.item}</b>."
                 )
 
-            # Validate length before manufacture SE when this FWO row will
-            # auto-reserve against the Sales Order (target WH = SO WH).
-            so_item = frappe.db.get_value(
-                "Work Order", pwo.work_order, "sales_order_item"
-            )
-            if (
-                pwo.sales_order
-                and so_item
-                and not cint(pwo.quality_required)
-            ):
-                so_wh = frappe.db.get_value("Sales Order Item", so_item, "warehouse")
-                if so_wh and pwo.target_warehouse == so_wh:
-                    from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
-                        validate_length_for_so_reservation,
-                    )
-                    validate_length_for_so_reservation(
-                        so_item,
-                        pwo.length_size,
-                        sales_order=pwo.sales_order,
-                        item_code=pwo.item,
-                    )
-
             try:
                 # ==============================
                 # CREATE STOCK ENTRY
@@ -748,8 +1014,8 @@ class FinishWorkOrder(Document):
                 # rows still come from FWO Raw Materials FIFO below, not get_items).
                 se.bom_no = frappe.db.get_value("Work Order", pwo.work_order, "bom_no")
                 se.finished_good = pwo.item
-                se.fg_completed_qty = pwo.ready_qty if pwo.deliver_as_qty else pwo.calculated_qty
-                se.finished_good_quantity = pwo.ready_qty if pwo.deliver_as_qty else pwo.calculated_qty
+                se.fg_completed_qty = _pwo_basis_qty(pwo)
+                se.finished_good_quantity = _pwo_basis_qty(pwo)
 
                 # ✅ FIXED: Set BOTH posting_date AND posting_time
                 se.set_posting_time = 1
@@ -828,7 +1094,10 @@ class FinishWorkOrder(Document):
                         rm_row["remaining_qty"] = 0
                         rm_index += 1
 
-                if flt(remaining_fg_qty, precision) > 0:
+                # One precision unit is rounding dust from share allocation —
+                # validate_stock_readiness already enforced real shortfalls.
+                dust = _round_qty(10 ** (-(precision or 0)), precision) if precision else 0.001
+                if _round_qty(remaining_fg_qty, precision) > dust:
                     frappe.throw(
                         frappe._(
                             "Row {0}: Raw material pool exhausted for Work Order {1}. "
@@ -878,12 +1147,19 @@ class FinishWorkOrder(Document):
                         sc_row["remaining_qty"] = 0
                         scrap_index += 1
 
+                if flt(remaining_scrap, precision or 3) > 0:
+                    frappe.throw(
+                        frappe._(
+                            "Row {0}: Scrap is still short by {1}. "
+                            "The scrap lines have to add up to the scrap entered."
+                        ).format(pwo.idx, flt(remaining_scrap, precision)),
+                        title=frappe._("Scrap Quantity"),
+                    )
+
                 # ==============================
                 # FINISHED GOOD
                 # ==============================
-                fg_final_qty = round(
-                    pwo.ready_qty if pwo.deliver_as_qty == 1 else pwo.calculated_qty, 3
-                )
+                fg_final_qty = flt(_pwo_basis_qty(pwo), 3)
                 if fg_final_qty <= 0:
                     frappe.throw(
                         frappe._(
@@ -1187,6 +1463,28 @@ def _warehouse_for_batch_stock(item_code, batch_no):
         (item_code, batch_no),
     )
     return rows[0][0] if rows else None
+
+
+@frappe.whitelist()
+def silent_autosave_after_fetch(doc):
+	"""First Fetch on a new FWO: save without business-validation errors.
+
+	Applies QI warehouse / row totals only. Manual Save still runs the full
+	checks (RM yield, batch, QI warehouse, etc.).
+	"""
+	import json
+
+	if isinstance(doc, str):
+		doc = json.loads(doc)
+
+	fwo = frappe.get_doc(doc)
+	if cint(fwo.docstatus) != 0:
+		frappe.throw(frappe._("Only draft Finish Work Orders can be auto-saved after fetch."))
+
+	fwo.flags.fwo_silent_autosave = True
+	fwo.flags.ignore_version = True
+	fwo.save()
+	return fwo.as_dict()
 
 
 @frappe.whitelist()

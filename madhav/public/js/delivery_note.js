@@ -121,25 +121,23 @@ frappe.ui.form.on('Delivery Note Item', {
 				let section_weight = flt(r.section_weight) || flt(d.section_weight);
 				let entered = cint(d.pieces);
 
-				// Pieces already on the row are the physical count. A quantity
-				// that is less than one piece away from that count must not
-				// be ceiled into an extra piece (32 PC → 33) or rounded down
-				// (40 PC → 39). A genuinely different quantity still derives
-				// pieces, so a partial delivery does not keep the full batch.
-				if (entered > 0 && target_qty > 0 && length > 0 && section_weight > 0) {
-					let piece_weight = (length * section_weight) / 1000;
-					let implied = (entered * length * section_weight) / 1000;
-					if (piece_weight > 0 && Math.abs(target_qty - implied) < piece_weight) {
-						return;
-					}
+				// Issue 2(i): entered PC is the physical bar count. Never
+				// ceiling it from a new qty / invoice qty — even when the
+				// weight gap is a full piece or more.
+				if (entered > 0) {
+					enforce_delivery_note_piece_limits(frm, false, cdt, cdn);
+					return;
 				}
 
-				let pieces = batch_pieces;
-				if (target_qty > 0 && length > 0 && section_weight > 0) {
-					pieces = pieces_from_qty(target_qty, length, section_weight);
-					if (batch_pieces > 0 && pieces > batch_pieces) {
-						pieces = batch_pieces;
-					}
+				// Fill pieces only while the row is blank, and only when both
+				// dimensions exist. A missing dimension must not write 0 PC.
+				if (!(target_qty > 0 && length > 0 && section_weight > 0)) {
+					return;
+				}
+
+				let pieces = pieces_from_qty(target_qty, length, section_weight);
+				if (batch_pieces > 0 && pieces > batch_pieces) {
+					pieces = batch_pieces;
 				}
 
 				if (pieces != null) {
@@ -148,6 +146,14 @@ frappe.ui.form.on('Delivery Note Item', {
 				enforce_delivery_note_piece_limits(frm, false, cdt, cdn);
 			}
 		);
+	},
+	// Qty / Invoice Qty may move for billing weight. Do not derive a new PC
+	// from that weight when Length/Pieces is already filled (issue 2(i)).
+	qty(frm, cdt, cdn) {
+		preserve_entered_dn_pieces_on_qty_change(frm, cdt, cdn);
+	},
+	invoice_qty(frm, cdt, cdn) {
+		preserve_entered_dn_pieces_on_qty_change(frm, cdt, cdn);
 	},
 	warehouse(frm, cdt, cdn) {
 		enforce_delivery_note_piece_limits(frm, false, cdt, cdn);
@@ -174,6 +180,46 @@ frappe.ui.form.on('Delivery Note Item', {
 		calculate_qty(cdt, cdn);
 	}
 });
+
+function preserve_entered_dn_pieces_on_qty_change(frm, cdt, cdn) {
+	let row = locals[cdt][cdn];
+	if (!row) return;
+
+	// Entered / already-stamped PC stays. Cap against batch availability only.
+	if (cint(row.pieces) > 0) {
+		enforce_delivery_note_piece_limits(frm, false, cdt, cdn);
+		return;
+	}
+
+	// Blank PC on a direct batch row: fill once from weight (same as batch_no).
+	if (!row.batch_no || row.serial_and_batch_bundle) return;
+
+	frappe.db.get_value(
+		"Batch",
+		row.batch_no,
+		["pieces", "average_length", "section_weight"],
+		function (r) {
+			if (!r) return;
+			let live = locals[cdt][cdn];
+			if (!live || cint(live.pieces) > 0) return;
+
+			let target_qty = flt(live.invoice_qty) || flt(live.qty);
+			let length = flt(r.average_length) || flt(live.average_length || live.length_size);
+			let section_weight = flt(r.section_weight) || flt(live.section_weight);
+			if (!(target_qty > 0 && length > 0 && section_weight > 0)) return;
+
+			let pieces = pieces_from_qty(target_qty, length, section_weight);
+			let batch_pieces = cint(r.pieces);
+			if (batch_pieces > 0 && pieces > batch_pieces) {
+				pieces = batch_pieces;
+			}
+			if (pieces != null) {
+				frappe.model.set_value(cdt, cdn, "pieces", pieces);
+			}
+			enforce_delivery_note_piece_limits(frm, false, cdt, cdn);
+		}
+	);
+}
 
 function calculate_qty(cdt, cdn) {
 	let row = locals[cdt][cdn];

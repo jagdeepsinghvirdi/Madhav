@@ -199,32 +199,37 @@ def resolve_entry_section_weight(entry, item_code, length, batch_no=None):
 def resolve_entry_pieces(entry, avail_qty, length, section_weight):
 	"""Integer pieces for undelivered qty on a reservation/bundle row.
 
-	Prefer stored integer pieces scaled to undelivered qty; derive from weight
-	only when pieces are missing on the row.
+	SRE ``pieces`` stays at the original reserved count when ``delivered_qty``
+	moves — only qty is reduced. Scale against full reserved qty so a later
+	DN gets remaining pieces (e.g. 74 reserved, 49 delivered → 25 left), not
+	the full 74 again. Derive from weight only when pieces are missing.
 	"""
-	avail_qty = flt(avail_qty)
+	avail_qty = abs(flt(avail_qty))
 	length = flt(length)
 	section_weight = flt(section_weight)
 
 	if isinstance(entry, dict):
 		stored = flt(entry.get("pieces"))
-		total_qty = flt(entry.get("qty"))
+		total_qty = abs(flt(entry.get("qty")))
 		delivered = flt(entry.get("delivered_qty"))
 	else:
 		stored = flt(getattr(entry, "pieces", 0))
-		total_qty = flt(getattr(entry, "qty", 0))
+		total_qty = abs(flt(getattr(entry, "qty", 0)))
 		delivered = flt(getattr(entry, "delivered_qty", 0))
 
 	if stored > 0 and total_qty > 0 and avail_qty > 0:
-		orig_avail = max(0.0, total_qty - delivered)
-		if orig_avail > 0:
-			# A weight change smaller than one piece must not drop a bar
-			# (40 PC → 39). A real partial share still scales.
+		remaining_qty = max(0.0, total_qty - delivered)
+		if remaining_qty > 0:
+			# Pieces that still belong to the undelivered reserved qty.
+			remaining_pieces = max(
+				0, int(round(stored * (remaining_qty / total_qty)))
+			)
+			# Tiny weight tweak on what is left must not drop a bar.
 			if should_preserve_pieces_for_qty_change(
-				orig_avail, avail_qty, length, section_weight
+				remaining_qty, avail_qty, length, section_weight
 			):
-				return max(0, int(round(stored)))
-			return max(0, int(round(stored * (avail_qty / orig_avail))))
+				return remaining_pieces
+			return max(0, int(round(stored * (avail_qty / total_qty))))
 
 	# No stored pieces — derive once from undelivered weight
 	if avail_qty > 0 and length and section_weight:
@@ -342,3 +347,101 @@ def preserve_entry_pieces(entry, item_pieces=0, qty_ratio=1.0):
 		return max(0, int(round(item_pieces * qty_ratio)))
 
 	return 0
+
+
+def dn_pieces_for_invoice_change(
+	entered_pieces, bundle_pieces, qty_before, qty_after, piece_weight=0
+):
+	"""Piece count to keep when a Delivery Note's billed weight changes.
+
+	An entered count never increases. A gap smaller than one piece, and a
+	missing piece weight, also leave that count alone. A real shrink is
+	scaled down only when the row still carries the whole bundle, so a
+	partial the user already counted (8 PC of a 10 PC batch) stays 8.
+	"""
+	entered = max(0, int(round(flt(entered_pieces))))
+	bundle = max(0, int(round(flt(bundle_pieces))))
+	if entered <= 0:
+		return 0
+
+	if flt(qty_after) + 0.0001 >= flt(qty_before):
+		return entered
+
+	weight = flt(piece_weight)
+	if weight <= 0 or should_preserve_pieces_for_qty_change(
+		qty_before, qty_after, piece_weight=weight
+	):
+		return entered
+
+	# The user already counted a partial. Do not scale that count again.
+	if bundle <= 0 or entered < bundle or flt(qty_before) <= 0:
+		return entered
+
+	scaled = max(0, int(round(bundle * flt(qty_after) / flt(qty_before))))
+	return min(entered, scaled)
+
+
+def invoice_qty_tolerance_result(
+	qty, invoice_qty, tolerance_percent=3, precision=3, conversion_factor=1
+):
+	"""Compare Invoice Qty with Qty using (Invoice Qty - Qty) / Qty × 100.
+
+	Invoice Qty absent or zero skips the check. Qty zero with an Invoice Qty
+	present is reported separately so the caller can avoid dividing by zero.
+	Exactly the configured percent is allowed. Both quantities are converted
+	and rounded to stock precision before the comparison.
+	"""
+	if invoice_qty in (None, "") or flt(invoice_qty) == 0:
+		return {"skip": True, "zero_qty": False, "within": True, "percent": 0.0}
+
+	prec = int(precision) if precision not in (None, "") else 3
+	prec = max(0, prec)
+	factor = flt(conversion_factor) or 1
+	qty_s = flt(flt(qty) * factor, prec)
+	inv_s = flt(flt(invoice_qty) * factor, prec)
+
+	if qty_s == 0:
+		return {"skip": False, "zero_qty": True, "within": False, "percent": None}
+
+	if qty_s == inv_s:
+		return {"skip": False, "zero_qty": False, "within": True, "percent": 0.0}
+
+	diff = inv_s - qty_s
+	percent = (diff / qty_s) * 100.0
+	allowed = abs(qty_s) * (flt(tolerance_percent) / 100.0)
+	margin = 0.5 * (10 ** (-prec))
+	return {
+		"skip": False,
+		"zero_qty": False,
+		"within": abs(diff) <= allowed + margin,
+		"percent": percent,
+	}
+
+
+def absorb_rounding_dust(amounts, target, precision=3):
+	"""Make rounded shares add up to the rounded target.
+
+	The leftover is one precision unit spread across the rows. It is applied
+	to the last positive row. A gap larger than one unit per row is left as
+	it is, so a real shortage is still visible to the caller.
+	"""
+	prec = max(0, int(precision or 0))
+	rounded = [flt(amount, prec) for amount in (amounts or [])]
+	target = flt(target, prec)
+	dust = flt(target - sum(rounded), prec)
+	if dust == 0 or not rounded:
+		return rounded
+
+	step = flt(10 ** (-prec), prec) if prec else 1
+	if abs(dust) > flt(step * max(len(rounded), 1), prec):
+		return rounded
+
+	for index in range(len(rounded) - 1, -1, -1):
+		if rounded[index] <= 0:
+			continue
+		updated = flt(rounded[index] + dust, prec)
+		if updated < 0:
+			continue
+		rounded[index] = updated
+		return rounded
+	return rounded

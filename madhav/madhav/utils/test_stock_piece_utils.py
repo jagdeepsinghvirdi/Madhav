@@ -2,8 +2,11 @@ import unittest
 
 from madhav.madhav.utils.stock_piece_utils import (
 	_entry_avail_qty,
+	absorb_rounding_dust,
 	distribute_integer_pieces,
+	dn_pieces_for_invoice_change,
 	int_pieces_from_qty,
+	invoice_qty_tolerance_result,
 	pieces_for_direct_batch_delivery,
 	preserve_entry_pieces,
 	resolve_entry_pieces,
@@ -98,6 +101,8 @@ class TestStockPieceUtilsPartialDelivery(unittest.TestCase):
 		self.assertAlmostEqual(resolve_weighted_length_from_entries(entries), 7.25)
 
 	def test_resolve_entry_pieces_scales_stored_pieces_for_partial_delivery(self):
+		# Stored pieces are for full reserved qty and are not reduced when
+		# delivered_qty moves. Remaining 0.3 of 0.5 → round(10 * 0.3/0.5) = 6.
 		row = {
 			"qty": 0.5,
 			"delivered_qty": 0.2,
@@ -105,11 +110,7 @@ class TestStockPieceUtilsPartialDelivery(unittest.TestCase):
 			"length": 6.0,
 			"section_weight": 9.0,
 		}
-		avail = 0.3
-		# proportional: round(10 * 0.3 / 0.3) = 10, but orig avail is 0.3 from 0.5 total
-		# stored 10 for 0.5 qty, avail 0.3 -> round(10 * 0.3/0.3) wait orig_avail = 0.5-0.2=0.3, avail=0.3
-		# full stored pieces since all undelivered
-		self.assertEqual(resolve_entry_pieces(row, avail, 6.0, 9.0), 10)
+		self.assertEqual(resolve_entry_pieces(row, 0.3, 6.0, 9.0), 6)
 
 		row2 = {
 			"qty": 0.5,
@@ -119,6 +120,26 @@ class TestStockPieceUtilsPartialDelivery(unittest.TestCase):
 			"section_weight": 9.0,
 		}
 		self.assertEqual(resolve_entry_pieces(row2, 0.25, 6.0, 9.0), 5)
+
+	def test_resolve_entry_pieces_after_partial_sre_delivery(self):
+		# MAT-SRE style: 74 PC reserved, 10.825 delivered → remaining 5.519
+		# must become 25 PC on the next DN, not the original 74.
+		length, section_weight = 11.2, 19.72
+		row = {
+			"qty": 16.344,
+			"delivered_qty": 10.825,
+			"pieces": 74,
+			"length": length,
+			"section_weight": section_weight,
+		}
+		self.assertEqual(
+			resolve_entry_pieces(row, 5.519, length, section_weight),
+			25,
+		)
+		self.assertEqual(
+			sum_undelivered_pieces_from_sre_rows([row]),
+			25,
+		)
 
 	def test_small_weight_change_does_not_drop_a_piece(self):
 		# 40 PC at 12m x 8 kg/m. One piece weighs 0.096. A 0.05 cut used to
@@ -181,12 +202,109 @@ class TestDirectBatchPiecesStayPhysical(unittest.TestCase):
 			32,
 		)
 
+	def test_issue_2i_qty_increase_of_one_piece_keeps_entered_pc(self):
+		# Light section: one piece is 0.25. Qty 1.00 → 4 PC implied. Raising
+		# qty by a full piece to 1.25 used to ceiling PC to 5. Entered 4 stays.
+		length, section_weight = 10.0, 25.0
+		piece_weight = length * section_weight / 1000
+		self.assertAlmostEqual(piece_weight, 0.25)
+		qty_before = 1.0
+		qty_after = 1.25
+		self.assertEqual(int_pieces_from_qty(qty_after, length, section_weight), 5)
+		self.assertEqual(
+			pieces_for_direct_batch_delivery(4, qty_after, length, section_weight),
+			4,
+		)
+		self.assertEqual(
+			dn_pieces_for_invoice_change(
+				4, 4, qty_before, qty_after, piece_weight=piece_weight
+			),
+			4,
+		)
+
 	def test_missing_pieces_still_derive_from_weight(self):
 		length, section_weight = 6.0, 10.0
 		qty = 32.0004 * length * section_weight / 1000
 		self.assertEqual(
 			pieces_for_direct_batch_delivery(0, qty, length, section_weight),
 			33,
+		)
+
+
+class TestDeliveryPieceAndToleranceRules(unittest.TestCase):
+	def test_entered_pieces_do_not_increase_when_invoice_qty_rises(self):
+		# Qty 2, Invoice Qty 2.5, PC 4. One piece is 0.5, so the old scale
+		# became round(4 * 2.5 / 2) = 5. The entered 4 stays 4.
+		self.assertEqual(
+			dn_pieces_for_invoice_change(4, 4, 2, 2.5, piece_weight=0.5),
+			4,
+		)
+
+	def test_partial_count_is_not_ceiled_or_scaled_down(self):
+		# Batch 5 qty / 10 PC, delivery 4.12 qty / 8 PC. 4.12 / 0.5 = 8.24,
+		# which used to ceiling to 9. The typed 8 stays 8.
+		self.assertEqual(
+			dn_pieces_for_invoice_change(8, 10, 5, 4.12, piece_weight=0.5),
+			8,
+		)
+
+	def test_full_bundle_still_scales_down_for_a_real_partial(self):
+		self.assertEqual(
+			dn_pieces_for_invoice_change(30, 30, 6, 3, piece_weight=0.2),
+			15,
+		)
+
+	def test_small_weight_gap_keeps_five_pieces(self):
+		self.assertEqual(
+			dn_pieces_for_invoice_change(5, 5, 1.189, 1.190, piece_weight=0.2378),
+			5,
+		)
+
+	def test_missing_piece_weight_keeps_entered_pieces(self):
+		self.assertEqual(dn_pieces_for_invoice_change(8, 8, 4, 5, piece_weight=0), 8)
+
+	def test_tolerance_examples(self):
+		# Classic 2(ii): 0.084% inside 3% → allow; PC must stay 5 (piece path).
+		inside = invoice_qty_tolerance_result(1.189, 1.190, 3, precision=3)
+		self.assertTrue(inside["within"])
+		self.assertLess(inside["percent"], 3)
+		self.assertAlmostEqual(inside["percent"], (0.001 / 1.189) * 100, places=4)
+
+		# At 2 decimals both become 1.19 → no shortfall / 0%.
+		equal_after_two_decimals = invoice_qty_tolerance_result(
+			1.189, 1.190, 3, precision=2
+		)
+		self.assertTrue(equal_after_two_decimals["within"])
+		self.assertEqual(equal_after_two_decimals["percent"], 0)
+
+		# Classic outside: 7.150 → 7.650 ≈ 6.99% must fail at 3%.
+		large_gap = invoice_qty_tolerance_result(7.150, 7.650, 3, precision=3)
+		self.assertFalse(large_gap["within"])
+
+		outside = invoice_qty_tolerance_result(2, 2.5, 3, precision=3)
+		self.assertFalse(outside["within"])
+		self.assertAlmostEqual(outside["percent"], 25, places=2)
+
+		exact = invoice_qty_tolerance_result(100, 103, 3, precision=3)
+		self.assertTrue(exact["within"])
+
+		blank = invoice_qty_tolerance_result(2, None, 3, precision=3)
+		self.assertTrue(blank["skip"])
+
+		zero_qty = invoice_qty_tolerance_result(0, 1.5, 3, precision=3)
+		self.assertTrue(zero_qty["zero_qty"])
+
+	def test_rounding_dust_lands_on_the_last_row(self):
+		# 1.000 split into three shares rounds to 0.333 and loses 0.001.
+		self.assertEqual(
+			absorb_rounding_dust([0.333, 0.333, 0.333], 1, precision=3),
+			[0.333, 0.333, 0.334],
+		)
+
+	def test_rounding_dust_does_not_hide_a_real_gap(self):
+		self.assertEqual(
+			absorb_rounding_dust([1, 1, 1], 10, precision=3),
+			[1, 1, 1],
 		)
 
 
