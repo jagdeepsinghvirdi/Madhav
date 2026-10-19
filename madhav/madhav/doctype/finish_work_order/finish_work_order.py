@@ -31,6 +31,23 @@ def _round_qty(value, precision=3):
 	return round(flt(value), prec)
 
 
+def _stock_qty_dust(precision=3):
+	"""One Stock Entry qty precision unit (usually 0.001)."""
+	prec = max(0, int(precision or 0))
+	if not prec:
+		return 0.001
+	return _round_qty(10 ** (-prec), prec)
+
+
+def _is_qty_rounding_dust(remaining, precision=3):
+	"""True when a pool shortfall is only share/FIFO round-off.
+
+	Multi-WO RM splits and Ready vs Calculated (e.g. 0.925 vs 0.926) often
+	leave Still need 0.001 on the last row. That is not a real shortage.
+	"""
+	return _round_qty(remaining, precision) <= _stock_qty_dust(precision)
+
+
 class FinishWorkOrder(Document):
     def on_cancel(self):
         for row in self.pending_work_orders:
@@ -817,7 +834,6 @@ class FinishWorkOrder(Document):
         ]
         rm_index = 0
         scrap_index = 0
-        dust = _round_qty(10 ** (-precision), precision) if precision else 0.001
 
         for pwo in self.pending_work_orders:
             fg_qty = flt(pwo.consumption or 0, precision)
@@ -900,7 +916,9 @@ class FinishWorkOrder(Document):
                     rm_row["remaining_qty"] = 0
                     rm_index += 1
 
-            if _round_qty(remaining_fg_qty, precision) > dust:
+            if _is_qty_rounding_dust(remaining_fg_qty, precision):
+                remaining_fg_qty = 0
+            else:
                 frappe.throw(
                     frappe._(
                         "Row {0}: Raw material pool exhausted for Work Order {1}. "
@@ -933,7 +951,9 @@ class FinishWorkOrder(Document):
                     sc_row["remaining_qty"] = 0
                     scrap_index += 1
 
-            if flt(remaining_scrap, precision) > 0:
+            if _is_qty_rounding_dust(remaining_scrap, precision):
+                remaining_scrap = 0
+            elif flt(remaining_scrap, precision) > 0:
                 frappe.throw(
                     frappe._(
                         "Row {0}: Scrap is still short by {1}. "
@@ -978,7 +998,7 @@ class FinishWorkOrder(Document):
         scrap_pool = self._build_scrap_pool()
         scrap_index = 0
 
-        precision = frappe.get_precision("Stock Entry Detail", "qty")
+        precision = frappe.get_precision("Stock Entry Detail", "qty") or 3
 
         # ==============================
         # ITERATE PENDING WORK ORDERS
@@ -1094,10 +1114,11 @@ class FinishWorkOrder(Document):
                         rm_row["remaining_qty"] = 0
                         rm_index += 1
 
-                # One precision unit is rounding dust from share allocation —
-                # validate_stock_readiness already enforced real shortfalls.
-                dust = _round_qty(10 ** (-(precision or 0)), precision) if precision else 0.001
-                if _round_qty(remaining_fg_qty, precision) > dust:
+                # One precision unit is share/FIFO round-off (e.g. Still need
+                # 0.001) — not a real RM shortage. Clear it and continue.
+                if _is_qty_rounding_dust(remaining_fg_qty, precision):
+                    remaining_fg_qty = 0
+                else:
                     frappe.throw(
                         frappe._(
                             "Row {0}: Raw material pool exhausted for Work Order {1}. "
@@ -1147,7 +1168,9 @@ class FinishWorkOrder(Document):
                         sc_row["remaining_qty"] = 0
                         scrap_index += 1
 
-                if flt(remaining_scrap, precision or 3) > 0:
+                if _is_qty_rounding_dust(remaining_scrap, precision):
+                    remaining_scrap = 0
+                elif flt(remaining_scrap, precision) > 0:
                     frappe.throw(
                         frappe._(
                             "Row {0}: Scrap is still short by {1}. "

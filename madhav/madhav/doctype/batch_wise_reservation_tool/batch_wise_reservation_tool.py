@@ -330,6 +330,25 @@ def calc_proportional_pieces(reserve_qty, batch_no):
 	return pieces
 
 
+def remaining_qty_within_production_plan_bucket(
+	pending_stock_qty, production_plan_qty, base_reserved_qty, already_staged_qty=0
+):
+	"""Base qty still reservable when Production Plans own a bucket on the SO.
+
+	SO 140, submitted PP 60, reserved 39.120 → 20.880 left for the next BWRT
+	against that plan. The unplanned 80 stays for a new Production Plan, not
+	for this reservation fetch. With no submitted plan yet, the full
+	pending-minus-reserved line balance is allowed (legacy / pre-PP reserve).
+	"""
+	reserved = flt(base_reserved_qty) + flt(already_staged_qty)
+	line_left = max(0, flt(pending_stock_qty) - reserved)
+	planned = flt(production_plan_qty)
+	if planned <= 0:
+		return line_left
+	planned_left = max(0, planned - reserved)
+	return min(line_left, planned_left)
+
+
 def get_so_line_allowance(
 	sales_order, sales_order_item, is_tolerance=0, exclude_sre=None,
 	already_staged_qty=0, already_staged_tolerance_qty=0, already_staged_total_qty=0,
@@ -342,6 +361,10 @@ def get_so_line_allowance(
 	remaining allowable qty so the pool can never be spent twice:
 
 		remaining allowable = pending SO qty + tolerance - already reserved
+
+	When submitted Production Plans have allocated ``production_plan_qty``,
+	base reservations only fill that planned bucket (planned − reserved) so
+	the unplanned balance stays free for the next Production Plan.
 
 	This is what keeps BWRT usable after an FWO: the FWO consumes the line's
 	own base qty, but the shared tolerance it did not touch stays available.
@@ -368,20 +391,32 @@ def get_so_line_allowance(
 		return max(0, floor_qty(min(tolerance_remaining, so_remaining), 3))
 
 	so_item = frappe.db.get_value(
-		"Sales Order Item", sales_order_item,
-		["stock_qty", "qty", "conversion_factor", "delivered_qty"], as_dict=True,
+		"Sales Order Item",
+		sales_order_item,
+		[
+			"stock_qty",
+			"qty",
+			"conversion_factor",
+			"delivered_qty",
+			"production_plan_qty",
+		],
+		as_dict=True,
 	) or frappe._dict()
 	conversion_factor = flt(so_item.conversion_factor) or 1
 	pending_stock_qty = (
 		(flt(so_item.stock_qty) or flt(so_item.qty) * conversion_factor)
 		- flt(so_item.delivered_qty) * conversion_factor
 	)
-	line_remaining = max(0, floor_qty(
-		pending_stock_qty
-		- get_base_reserved_qty(sales_order_item, exclude_sre=exclude_sre)
-		- flt(already_staged_qty),
+	base_reserved = get_base_reserved_qty(sales_order_item, exclude_sre=exclude_sre)
+	line_remaining = floor_qty(
+		remaining_qty_within_production_plan_bucket(
+			pending_stock_qty,
+			so_item.get("production_plan_qty"),
+			base_reserved,
+			already_staged_qty=already_staged_qty,
+		),
 		3,
-	))
+	)
 
 	return max(0, floor_qty(min(line_remaining + tolerance_remaining, so_remaining), 3))
 

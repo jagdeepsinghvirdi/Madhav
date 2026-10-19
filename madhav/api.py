@@ -914,7 +914,7 @@ def get_so_item_pcs(sales_order, item_code, sales_order_item, row_id=None):
             "item_code": item_code,
             "name": sales_order_item
         },
-        [ "length_size", "pieces", "total_weight", "stock_reserved_qty","assorted_length"],
+        ["length_size", "pieces", "total_weight", "assorted_length"],
         as_dict=True,
     ) or {}
     so = frappe.db.get_value(
@@ -923,16 +923,14 @@ def get_so_item_pcs(sales_order, item_code, sales_order_item, row_id=None):
         ["po_no", "customer", "customer_name"],
         as_dict=True
     ) or {}
-    
-    reserved = flt(so_item.get("stock_reserved_qty"))
+
+    # Get Items already set planned_qty = SO pending − production_plan_qty.
+    # Do not subtract stock_reserved_qty here — that leftover belongs to the
+    # already-planned PP bucket and is reserved via BWRT, not this new plan.
     planned_qty = flt(frappe.form_dict.get("planned_qty"))
 
-    adjusted_planned_qty = planned_qty - reserved
-    if adjusted_planned_qty < 0:
-        adjusted_planned_qty = 0
-        
     so_item.update({
-        "planned_qty": adjusted_planned_qty,
+        "planned_qty": max(0, planned_qty),
         "po_no": so.get("po_no", ""),
         "customer": so.get("customer", ""),
         "customer_name": so.get("customer_name", ""),
