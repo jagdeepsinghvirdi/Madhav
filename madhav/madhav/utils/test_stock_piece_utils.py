@@ -6,6 +6,7 @@ from madhav.madhav.utils.stock_piece_utils import (
 	distribute_integer_pieces,
 	dn_pieces_for_invoice_change,
 	int_pieces_from_qty,
+	pieces_for_weight_reconciliation,
 	invoice_qty_tolerance_result,
 	pieces_for_direct_batch_delivery,
 	preserve_entry_pieces,
@@ -232,6 +233,26 @@ class TestDirectBatchPiecesStayPhysical(unittest.TestCase):
 
 
 class TestDeliveryPieceAndToleranceRules(unittest.TestCase):
+	def test_weight_reconciliation_does_not_add_pieces(self):
+		# MUBIT-13721: 10.250 → 10.340 at 9.350 m × 9.60 kg/m is 1.003 pieces
+		# of weight. That used to post +1 and leave a bar on an empty batch.
+		raw = (10.340 - 10.250) * 1000 / (9.350 * 9.60)
+		self.assertGreater(raw, 1)
+		self.assertEqual(
+			pieces_for_weight_reconciliation(10.250, 10.340, 9.350, 9.60),
+			0,
+		)
+		# A gap smaller than one piece, and a gap of several pieces of
+		# weight, are also not new bars.
+		self.assertEqual(
+			pieces_for_weight_reconciliation(6.000, 6.010, 6.0, 10.0),
+			0,
+		)
+		self.assertEqual(
+			pieces_for_weight_reconciliation(1.0, 2.5, 10.0, 25.0),
+			0,
+		)
+
 	def test_entered_pieces_do_not_increase_when_invoice_qty_rises(self):
 		# Qty 2, Invoice Qty 2.5, PC 4. One piece is 0.5, so the old scale
 		# became round(4 * 2.5 / 2) = 5. The entered 4 stays 4.

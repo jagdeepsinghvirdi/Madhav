@@ -2403,6 +2403,100 @@ def _row_sales_order(row):
     return None
 
 
+def _link_so_from_sales_invoice(row):
+    """Fill against_sales_order / so_detail from the Sales Invoice line.
+
+    Delivery Notes made from a Sales Invoice sometimes lose the Sales Order
+    link. Reservation release keys off that link, so a missing so_detail
+    left the batch reserved and the shortfall reconciliation threw
+    "please un-reserve to submit".
+    """
+    if getattr(row, "so_detail", None) and getattr(row, "against_sales_order", None):
+        return
+    si_detail = row.get("si_detail") if hasattr(row, "get") else getattr(row, "si_detail", None)
+    if si_detail:
+        linked = frappe.db.get_value(
+            "Sales Invoice Item",
+            si_detail,
+            ["sales_order", "so_detail"],
+            as_dict=True,
+        ) or frappe._dict()
+        if linked.so_detail and not getattr(row, "so_detail", None):
+            row.so_detail = linked.so_detail
+        if linked.sales_order and not getattr(row, "against_sales_order", None):
+            row.against_sales_order = linked.sales_order
+    if getattr(row, "so_detail", None) and not getattr(row, "against_sales_order", None):
+        row.against_sales_order = frappe.db.get_value(
+            "Sales Order Item", row.so_detail, "parent"
+        )
+
+
+def _clear_custom_sre_link(doc, sre_name):
+    """Drop the link once the SRE is cancelled.
+
+    Delivery Note Item.custom_sre is a Link. Leaving it pointed at a
+    cancelled reservation makes the DN re-validate inside reconciliation
+    throw "Cannot link cancelled document".
+    """
+    for row in doc.get("items") or []:
+        if _custom_sre_name(row) == sre_name:
+            row.custom_sre = None
+
+
+def _release_undelivered_reservation(sre, batch_nos):
+    """Drop undelivered qty on the batches a reconciliation has to post.
+
+    Used when the SRE was already partly delivered by an earlier Delivery
+    Note. Cancelling the whole entry would wipe that delivery. Returns the
+    qty released.
+    """
+    batch_nos = set(batch_nos or [])
+    released = 0.0
+    entries = list(sre.get("sb_entries") or [])
+    if sre.reservation_based_on == "Serial and Batch" and entries:
+        for entry in entries:
+            if batch_nos and entry.batch_no not in batch_nos:
+                continue
+            open_qty = flt(entry.qty) - flt(entry.get("delivered_qty"))
+            if open_qty <= 0.001:
+                continue
+            entry.qty = flt(entry.get("delivered_qty"))
+            entry.db_set("qty", entry.qty, update_modified=False)
+            released += open_qty
+        if released <= 0.001:
+            return 0.0
+        new_reserved = sum(flt(entry.qty) for entry in entries)
+    else:
+        new_reserved = flt(sre.delivered_qty)
+        released = flt(sre.reserved_qty) - new_reserved
+        if released <= 0.001:
+            return 0.0
+    new_reserved = max(new_reserved, flt(sre.delivered_qty))
+    sre.reserved_qty = new_reserved
+    sre.db_set("reserved_qty", new_reserved, update_modified=False)
+    _refresh_sre_totals(sre.name)
+    return released
+
+
+def _release_sre_open_qty(doc, sre, batch_nos):
+    """Free the open qty that would block a shortfall Stock Reconciliation.
+
+    Returns "cancelled", "trimmed", or None.
+    """
+    if sre.docstatus != 1:
+        return None
+    if flt(sre.reserved_qty) - flt(sre.delivered_qty) <= 0.001:
+        return None
+    if flt(sre.delivered_qty) <= 0.001:
+        sre.flags.ignore_permissions = True
+        sre.cancel()
+        _clear_custom_sre_link(doc, sre.name)
+        return "cancelled"
+    if _release_undelivered_reservation(sre, batch_nos):
+        return "trimmed"
+    return None
+
+
 def _sres_used_by_dn_row(row, sales_order, docstatus=1):
     """The Stock Reservation Entries this DN row actually draws on.
 
@@ -2411,15 +2505,18 @@ def _sres_used_by_dn_row(row, sales_order, docstatus=1):
     entries needed for THIS row's qty/batch must be touched. Matching every
     SRE on the SO line would let one Delivery Note cancel/deliver a sibling
     reservation the user left unused on the DN.
+
+    custom_sre is preferred, not exclusive. Returning only that link left
+    the batch's real reservation active, and Stock Reconciliation then
+    refused the Deliver-as-Qty shortfall ("please un-reserve to submit").
     """
-    # Custom mapper writes this exact source SRE. Prefer it over a batch
-    # overlap: multiple DNs can legitimately ship the same batch from
-    # different reservations, and an overlap is not ownership.
     explicit_sre = row.get("custom_sre") if hasattr(row, "get") else None
-    if explicit_sre and frappe.db.exists(
-        "Stock Reservation Entry", {"name": explicit_sre, "docstatus": docstatus}
-    ):
-        return [explicit_sre]
+    explicit_active = bool(
+        explicit_sre
+        and frappe.db.exists(
+            "Stock Reservation Entry", {"name": explicit_sre, "docstatus": docstatus}
+        )
+    )
 
     sre_rows = frappe.get_all(
         "Stock Reservation Entry",
@@ -2432,6 +2529,19 @@ def _sres_used_by_dn_row(row, sales_order, docstatus=1):
         fields=["name", "reservation_based_on", "reserved_qty", "delivered_qty"],
         order_by="creation asc",
     )
+
+    if explicit_active:
+        if explicit_sre not in {sre.name for sre in sre_rows}:
+            extra = frappe.db.get_value(
+                "Stock Reservation Entry",
+                explicit_sre,
+                ["name", "reservation_based_on", "reserved_qty", "delivered_qty"],
+                as_dict=True,
+            )
+            if extra:
+                sre_rows.insert(0, extra)
+        else:
+            sre_rows.sort(key=lambda sre: 0 if sre.name == explicit_sre else 1)
 
     row_qty = flt(row.stock_qty)
     if row_qty <= 0:
@@ -2504,6 +2614,7 @@ def cancel_stock_reservations_from_so(doc):
     cancel_errors = []
 
     for row in doc.items:
+        _link_so_from_sales_invoice(row)
         sales_order = _row_sales_order(row)
         if not sales_order or not row.so_detail:
             continue
@@ -2518,17 +2629,18 @@ def cancel_stock_reservations_from_so(doc):
                 sre = frappe.get_doc("Stock Reservation Entry", sre_name)
                 if sre.docstatus != 1:
                     continue
-                snapshots.append(_snapshot_sre(sre))
+                snap = _snapshot_sre(sre)
+                snapshots.append(snap)
 
-                # This DN has not delivered anything yet, so any delivered
-                # qty already sitting on the entry belongs to an earlier
-                # Delivery Note. Cancelling it would destroy that DN's
-                # reservation, so the overage has to come from elsewhere.
-                # Only cancel when THIS row has Deliver-as-Qty overage —
-                # a sibling row's difference_qty must not wipe unused SREs.
-                if row_needs_cancel and flt(sre.delivered_qty) <= 0:
-                    sre.flags.ignore_permissions = True
-                    sre.cancel()
+                # Only the row that is short and needs a reconciliation
+                # may release stock. A partly delivered SRE is trimmed down
+                # to what an earlier Delivery Note already took — cancelling
+                # it would wipe that delivery. A sibling row's overage must
+                # not release an SRE this row does not use.
+                if row_needs_cancel:
+                    outcome = _release_sre_open_qty(doc, sre, _dn_row_batch_nos(row))
+                    if outcome == "trimmed":
+                        snap["trimmed"] = 1
             except Exception:
                 frappe.log_error(
                     title="SRE Snapshot/Cancel Error",
@@ -2923,6 +3035,32 @@ def _fallback_snapshots_from_cancelled_sres(doc):
 	return snapshots
 
 
+def _restore_trimmed_reservation(snapshot):
+	"""Put back qty that submit trimmed off a partly delivered reservation."""
+	sre_name = snapshot.get("name")
+	if not sre_name:
+		return
+	if cint(frappe.db.get_value("Stock Reservation Entry", sre_name, "docstatus")) != 1:
+		return
+	sre = frappe.get_doc("Stock Reservation Entry", sre_name)
+	by_batch = {
+		entry.get("batch_no"): entry
+		for entry in (snapshot.get("sb_entries") or [])
+		if entry.get("batch_no")
+	}
+	for entry in sre.get("sb_entries") or []:
+		snap_entry = by_batch.get(entry.batch_no)
+		if not snap_entry:
+			continue
+		target_qty = flt(snap_entry.get("qty"))
+		if flt(entry.qty) + 0.001 < target_qty:
+			entry.db_set("qty", target_qty, update_modified=False)
+	sre.db_set(
+		"reserved_qty", flt(snapshot.get("reserved_qty")), update_modified=False
+	)
+	_refresh_sre_totals(sre_name)
+
+
 def restore_stock_reservations_after_cancel(doc):
 	"""Restore Stock Reservation Entries from the submit-time snapshot.
 
@@ -2945,6 +3083,8 @@ def restore_stock_reservations_after_cancel(doc):
 	for snapshot in prepared:
 		try:
 			if _snapshot_sre_still_active(snapshot):
+				if cint(snapshot.get("trimmed")):
+					_restore_trimmed_reservation(snapshot)
 				continue
 			_recreate_stock_reservation_from_snapshot(snapshot, exclude_dn=doc.name)
 		except Exception as e:
@@ -3354,70 +3494,135 @@ def create_sr_from_dn(delivery_note):
     return "done"
 
 
-def _post_reconciliation_piece_delta(sr, sr_item, prior_qty, target_qty):
-    """Post the piece movement matching a Delivery Note auto-reconciliation.
+def _open_reservations_for_batches(keys, sales_orders=None):
+    """Active per-batch open qty for the item/warehouse/batch triples in keys."""
+    if not keys:
+        return []
+    params = {
+        "item_codes": list({key[0] for key in keys}),
+        "warehouses": list({key[1] for key in keys}),
+        "batch_nos": list({key[2] for key in keys}),
+    }
+    sales_order_filter = ""
+    if sales_orders:
+        sales_order_filter = "AND sre.voucher_no IN %(sales_orders)s"
+        params["sales_orders"] = list(sales_orders)
+    rows = frappe.db.sql(
+        f"""
+        SELECT
+            sre.name,
+            sre.item_code,
+            sre.warehouse,
+            sre.voucher_no,
+            sbe.batch_no
+        FROM `tabStock Reservation Entry` sre
+        INNER JOIN `tabSerial and Batch Entry` sbe
+            ON sbe.parent = sre.name
+           AND sbe.parenttype = 'Stock Reservation Entry'
+        WHERE sre.docstatus = 1
+          AND sre.voucher_type = 'Sales Order'
+          AND IFNULL(sre.status, '') NOT IN ('Delivered', 'Cancelled')
+          AND sre.item_code IN %(item_codes)s
+          AND sre.warehouse IN %(warehouses)s
+          AND sbe.batch_no IN %(batch_nos)s
+          AND (IFNULL(sbe.qty, 0) - IFNULL(sbe.delivered_qty, 0)) > 0.001
+          {sales_order_filter}
+        """,
+        params,
+        as_dict=True,
+    )
+    return [
+        row for row in rows
+        if (row.item_code, row.warehouse, row.batch_no) in keys
+    ]
 
-    The reconciliation writes an absolute target QUANTITY for the batch.
-    The piece equivalent of that target is derived from the batch's physical
-    dimensions, and only the difference against what the batch already held
-    is posted, so the Piece Stock Ledger stays the single source of truth
-    and cancelling the Stock Reconciliation reverses this row too (the
-    is_cancelled branch of create_piece_stock_ledger_entry cancels Piece
-    SLEs by voucher, before its Stock Reconciliation early-return).
+
+def _release_shortfall_batch_reservations(doc, rows):
+    """Release reservations that would block this DN's shortfall reconciliation.
+
+    The check is per batch, so any open qty on that item/warehouse/batch
+    still throws even after the row's own custom_sre was cancelled. Only
+    reservations on this Delivery Note's Sales Orders are released. When
+    the DN has no Sales Order link and exactly one Sales Order holds the
+    batch, that reservation is the stock being shipped and is released too.
     """
-    from madhav.madhav.utils.stock_piece_utils import int_pieces_from_qty
+    for row in doc.items or []:
+        _link_so_from_sales_invoice(row)
 
-    length = flt(sr_item.get("average_length")) or flt(sr_item.get("length"))
-    section_weight = flt(sr_item.get("section_weight"))
-    if not length or not section_weight:
-        batch_dims = frappe.db.get_value(
-            "Batch", sr_item.batch_no, ["average_length", "section_weight"], as_dict=True
-        ) or frappe._dict()
-        length = length or flt(batch_dims.get("average_length"))
-        section_weight = section_weight or flt(batch_dims.get("section_weight"))
-
-    if not length or not section_weight:
-        # Without dimensions the piece equivalent is unknowable; leaving the
-        # ledger untouched is safer than writing a fabricated count.
+    keys = set()
+    for row in rows or []:
+        warehouse = row.warehouse
+        if not warehouse and getattr(row, "serial_and_batch_bundle", None):
+            warehouse = frappe.db.get_value(
+                "Serial and Batch Bundle", row.serial_and_batch_bundle, "warehouse"
+            )
+        for batch_no in _dn_row_batch_nos(row):
+            if row.item_code and warehouse and batch_no:
+                keys.add((row.item_code, warehouse, batch_no))
+    if not keys:
         return
 
-    # Size the piece movement from the QUANTITY DIFFERENCE this reconciliation
-    # applies, truncated to whole pieces.  Converting the absolute target with
-    # int_pieces_from_qty() instead used that helper's ceiling, so topping a
-    # 6.000 Kg / 4 PC batch up to 6.010 Kg - a weight adjustment far smaller
-    # than one 1.5 Kg piece - invented a whole extra piece, which the delivery
-    # then could not consume and left stranded on the batch.  A batch only
-    # gains or loses a piece when it gains or loses a whole piece's weight.
-    piece_weight = flt(length) * flt(section_weight) / 1000.0
-    if piece_weight <= 0:
+    sales_orders = {
+        so for so in (_row_sales_order(row) for row in (doc.items or [])) if so
+    }
+    if sales_orders:
+        open_rows = _open_reservations_for_batches(keys, sales_orders)
+    else:
+        open_rows = _open_reservations_for_batches(keys)
+        owners = {row.voucher_no for row in open_rows if row.voucher_no}
+        if len(owners) != 1:
+            return
+
+    if not open_rows:
         return
 
-    delta = int(flt(flt(target_qty) - flt(prior_qty)) / piece_weight)
-    if not delta:
-        return
+    by_sre = {}
+    for row in open_rows:
+        by_sre.setdefault(row.name, set()).add(row.batch_no)
 
-    piece_doc = frappe.new_doc("Piece Stock Ledger Entry")
-    piece_doc.update({
-        "posting_date": sr.posting_date,
-        "posting_time": sr.posting_time,
-        "item_code": sr_item.item_code,
-        "warehouse": sr_item.warehouse,
-        "voucher_type": "Stock Reconciliation",
-        "voucher_no": sr.name,
-        "actual_qty": delta,
-        "incoming_rate": flt(sr_item.valuation_rate),
-        "company": sr.company,
-        "unit_of_measure": "Piece",
-        "is_cancelled": 0,
-        "batch_no": sr_item.batch_no,
-        "docstatus": 1,
-    })
-    piece_doc.flags.ignore_permissions = True
-    piece_doc.insert()
+    existing = []
+    if doc.name:
+        existing, _comment_name = _load_cancelled_sre_snapshot(doc.name)
+    existing_by_name = {snap.get("name"): snap for snap in existing}
+    changed = False
+    errors = []
 
-    from madhav.doc_events.stock_ledger_entry import recalculate_batch_pieces
+    for sre_name, batch_nos in by_sre.items():
+        try:
+            sre = frappe.get_doc("Stock Reservation Entry", sre_name)
+            if sre.docstatus != 1:
+                continue
+            snap = existing_by_name.get(sre_name)
+            if snap is None:
+                snap = _snapshot_sre(sre)
+                existing.append(snap)
+                existing_by_name[sre_name] = snap
+            outcome = _release_sre_open_qty(doc, sre, batch_nos)
+            if outcome == "trimmed":
+                snap["trimmed"] = 1
+                changed = True
+            elif outcome == "cancelled":
+                changed = True
+        except Exception:
+            frappe.log_error(
+                title="DN Shortfall - SRE Release Error",
+                message=f"{doc.name} / {sre_name}\n{frappe.get_traceback()}",
+            )
+            errors.append(sre_name)
 
-    recalculate_batch_pieces(sr_item.batch_no)
+    if changed and doc.name:
+        _store_cancelled_sre_snapshot(doc.name, existing)
+
+    if errors:
+        frappe.throw(
+            _(
+                "Failed to un-reserve stock for Delivery Note {0} before reconciliation:<br>{1}"
+            ).format(
+                frappe.bold(doc.name),
+                "<br>".join(frappe.bold(name) for name in errors),
+            ),
+            title=_("Stock Reservation Error"),
+        )
 
 
 def create_stock_reconciliation(self):
@@ -3466,10 +3671,6 @@ def create_stock_reconciliation(self):
 
     if self.set_warehouse:
         sr.set_warehouse = self.set_warehouse
-
-    # Absolute post-reconciliation qty per batch, kept because ERPNext
-    # rewrites Stock Reconciliation Item.qty to the difference on submit.
-    sr_targets = {}
 
     for row in items_with_invoice_qty:
         total_qty = flt(row.qty) + flt(row.difference_qty)
@@ -3547,9 +3748,6 @@ def create_stock_reconciliation(self):
                         or (flt(row.get("pieces")) * ratio if row.get("pieces") else 0)
                     )
 
-                    sr_targets[entry.batch_no] = (
-                        flt(sr_targets.get(entry.batch_no, 0)) + flt(entry_invoice_qty)
-                    )
                     sr.append(
                         "items",
                         {
@@ -3598,11 +3796,6 @@ def create_stock_reconciliation(self):
             flt(row.get("section_weight"))
             or flt(batch_dims.get("section_weight"))
         )
-
-        if row.batch_no:
-            sr_targets[row.batch_no] = (
-                flt(sr_targets.get(row.batch_no, 0)) + flt(row.invoice_qty)
-            )
 
         sr.append(
             "items",
@@ -3662,16 +3855,6 @@ def create_stock_reconciliation(self):
 
     sr.save(ignore_permissions=True)
 
-    # Batch quantities as they stand BEFORE this reconciliation posts - the
-    # piece adjustment below is sized from the qty difference, not from a
-    # ceiling of the target.
-    original_batch_qty = {}
-    for sr_item in sr.items:
-        if sr_item.batch_no and sr_item.batch_no not in original_batch_qty:
-            original_batch_qty[sr_item.batch_no] = get_batch_qty_from_sle(
-                sr_item.item_code, sr_item.warehouse, sr_item.batch_no
-            )
-
     for sr_item in sr.items:
         if flt(sr_item.qty) and not flt(sr_item.valuation_rate):
             sr_item.valuation_rate = (
@@ -3680,6 +3863,11 @@ def create_stock_reconciliation(self):
             sr_item.amount = flt(sr_item.qty) * flt(sr_item.valuation_rate)
             sr_item.db_set("valuation_rate", sr_item.valuation_rate, update_modified=False)
             sr_item.db_set("amount", sr_item.amount, update_modified=False)
+
+    # Deliver-as-Qty tops the batch up by the invoice shortfall. The
+    # reservation for that same batch (the 6.09 the DN is shipping) blocks
+    # Stock Reconciliation unless it is released first.
+    _release_shortfall_batch_reservations(self, sr.items)
 
     sr.submit()
 
@@ -3719,22 +3907,12 @@ def create_stock_reconciliation(self):
             # sort it out.
             starting_pieces = original_batch_pieces.get(sr_item.batch_no, 0)
             batch_update["pieces"] = max(starting_pieces - flt(sr_item.pieces), 0)
-        elif piece_tracked:
-            # A piece-tracked batch gets its pieces exclusively from the
-            # Piece Stock Ledger, and create_piece_stock_ledger_entry
-            # deliberately posts nothing for a Stock Reconciliation. So when
-            # this reconciliation tops a batch's QUANTITY up to the invoice
-            # qty, the matching PIECES were never added, and the delivery
-            # that follows then took the batch's piece count negative
-            # (5 PC batch, invoice 6 -> reconcile qty to 6, deliver 6 PC,
-            # ledger lands on -1). Post the piece side of the same
-            # adjustment so quantity and pieces stay in step.
-            target_qty = sr_targets.get(sr_item.batch_no)
-            if target_qty is not None:
-                _post_reconciliation_piece_delta(
-                    sr, sr_item, original_batch_qty.get(sr_item.batch_no, 0),
-                    target_qty,
-                )
+        # Piece-tracked items get pieces only from the Delivery Note piece
+        # ledger. This reconciliation tops up weight and must not add bars.
+        # pieces_for_weight_reconciliation() is 0 for any qty gap, including
+        # one that is a whole piece of weight (10.250 → 10.340). The note
+        # already keeps the entered count and caps it to the batch, so a
+        # full delivery leaves Batch.pieces at 0.
         if batch_update:
             frappe.db.set_value(
                 "Batch", sr_item.batch_no, batch_update, update_modified=False
