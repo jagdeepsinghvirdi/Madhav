@@ -73,21 +73,37 @@ def get_already_reserved_pieces(sales_order_item):
 	return total_pieces
 
 
-def get_remaining_unreserved_stock_qty(sales_order_item):
-	"""SO demand left after delivery and active *base* reservations.
+def remaining_qty_for_new_production_plan(
+	pending_stock_qty, production_plan_qty
+):
+	"""Qty still free to put on a *new* Production Plan.
 
-	Production Plan used ERPNext's work-order pending quantity and then
-	subtracted SREs.  An FWO/Stock Transfer reservation represents output of
-	that same work order, so that double-subtracted it.  BWRT, FWO and Stock
-	Transfer all converge on the active SRE quantity here.
+	Already-submitted Production Plans own ``production_plan_qty`` on the SO
+	line. Partial reservation against that bucket must not open the same
+	tonnage for another plan (e.g. SO 140, PP 60, reserved 39.120 → next PP
+	gets 80, not 100.880).
 	"""
-	from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
-		get_base_reserved_qty,
-	)
+	return max(0, flt(pending_stock_qty) - flt(production_plan_qty))
 
+
+def get_remaining_unreserved_stock_qty(sales_order_item):
+	"""SO stock still available to plan on a new Production Plan.
+
+	Uses submitted ``production_plan_qty``, not live reservations. Reservations
+	fill an already-planned bucket and are offered again on BWRT for that
+	leftover; they must not inflate the next plan's Get Items qty.
+	"""
 	so_item = frappe.db.get_value(
-		"Sales Order Item", sales_order_item,
-		["stock_qty", "qty", "conversion_factor", "delivered_qty"], as_dict=True,
+		"Sales Order Item",
+		sales_order_item,
+		[
+			"stock_qty",
+			"qty",
+			"conversion_factor",
+			"delivered_qty",
+			"production_plan_qty",
+		],
+		as_dict=True,
 	)
 	if not so_item:
 		return 0
@@ -96,7 +112,9 @@ def get_remaining_unreserved_stock_qty(sales_order_item):
 		(flt(so_item.stock_qty) or flt(so_item.qty) * conversion_factor)
 		- flt(so_item.delivered_qty) * conversion_factor
 	)
-	return max(0, pending_stock_qty - get_base_reserved_qty(sales_order_item))
+	return remaining_qty_for_new_production_plan(
+		pending_stock_qty, so_item.production_plan_qty
+	)
 
 
 class CustomProductionPlan(ERPNextProductionPlan):
@@ -310,12 +328,12 @@ class CustomProductionPlan(ERPNextProductionPlan):
 				if so_item_row:
 					row.pending_pieces = so_item_row.production_plan_pieces or 0
 
-					already_reserved_pieces = get_already_reserved_pieces(row.sales_order_item)
+					# Same bucket rule as qty: pieces already on submitted PPs
+					# stay with those plans. Do not subtract reserved pieces here.
 					row.pieces = max(
 						0,
 						flt(so_item_row.pieces or 0)
-						- flt(so_item_row.production_plan_pieces or 0)
-						- already_reserved_pieces,
+						- flt(so_item_row.production_plan_pieces or 0),
 					)
 
 					row.assorted_length = so_item_row.assorted_length
@@ -328,10 +346,8 @@ class CustomProductionPlan(ERPNextProductionPlan):
 						row.length = meters_to_inches(so_item_row.length_size)
 						row.length_size_m = so_item_row.length_size or 0.0
 
-					# Do not start from core's work_order-adjusted planned qty and
-					# subtract the SRE again: FWO/Stock Transfer reservations are
-					# generated from those work orders.  Active base reservations
-					# are the shared source of truth for BWRT and production output.
+					# Remaining = SO pending − already planned on submitted PPs.
+					# Reservations do not open that tonnage for a new plan.
 					row.planned_qty = get_remaining_unreserved_stock_qty(
 						row.sales_order_item
 					)

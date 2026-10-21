@@ -3,7 +3,11 @@
 
 import unittest
 
-from madhav.madhav.doctype.finish_work_order.finish_work_order import _pwo_basis_qty
+from madhav.madhav.doctype.finish_work_order.finish_work_order import (
+	_is_qty_rounding_dust,
+	_pwo_basis_qty,
+	_stock_qty_dust,
+)
 from madhav.madhav.utils.stock_piece_utils import absorb_rounding_dust
 
 
@@ -23,3 +27,11 @@ class TestFinishWorkOrderRmSplit(unittest.TestCase):
 		parts = absorb_rounding_dust([0.333, 0.333, 0.333], 1.0, precision=3)
 		self.assertEqual(sum(parts), 1.0)
 		self.assertEqual(parts[-1], 0.334)
+
+	def test_still_need_0_001_is_rounding_dust(self):
+		# PEN-WO-00401 style: last WO Still need 0.001 must not block Approve.
+		self.assertEqual(_stock_qty_dust(3), 0.001)
+		self.assertTrue(_is_qty_rounding_dust(0.001, 3))
+		self.assertTrue(_is_qty_rounding_dust(0.0004, 3))
+		self.assertFalse(_is_qty_rounding_dust(0.002, 3))
+		self.assertFalse(_is_qty_rounding_dust(0.5, 3))
