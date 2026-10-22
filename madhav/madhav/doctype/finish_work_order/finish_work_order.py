@@ -8,6 +8,10 @@ from frappe.utils import flt, cint
 from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import get_available_qty_to_reserve
 from madhav.madhav.utils.stock_piece_utils import absorb_rounding_dust
 
+# Finished output is treated as 97.5% of input. Required RM is therefore
+# (Total Work Order Qty + Scrap Qty) / 0.975; entered RM must be >= that.
+RM_YIELD_FACTOR = 0.975
+
 
 def _pwo_basis_qty(row):
 	"""Qty used for both raw-material share and finished-goods output.
@@ -46,6 +50,14 @@ def _is_qty_rounding_dust(remaining, precision=3):
 	leave Still need 0.001 on the last row. That is not a real shortage.
 	"""
 	return _round_qty(remaining, precision) <= _stock_qty_dust(precision)
+
+
+def required_rm_from_wo_and_scrap(total_work_order_qty, scrap_qty, precision=3):
+	"""Minimum Raw Material qty: (Total WO Qty + Scrap) / 0.975."""
+	return flt(
+		(flt(total_work_order_qty) + flt(scrap_qty)) / RM_YIELD_FACTOR,
+		precision,
+	)
 
 
 class FinishWorkOrder(Document):
@@ -781,6 +793,31 @@ class FinishWorkOrder(Document):
                 )
         return scrap_pool
 
+    def validate_rm_yield(self, precision=None):
+        """Block Save/Submit when entered RM is below (WO Qty + Scrap) / 0.975."""
+        precision = precision or frappe.get_precision("Stock Entry Detail", "qty") or 3
+        required = required_rm_from_wo_and_scrap(
+            self.total_work_order_qty, self.scrap_qty, precision
+        )
+        entered = flt(self.total_raw_material_qty, precision)
+        if _is_qty_rounding_dust(required - entered, precision):
+            return
+        if entered >= required:
+            return
+        frappe.throw(
+            frappe._(
+                "Raw Material qty {0} is less than required {1}. "
+                "Required RM = (Total Work Order Qty {2} + Scrap Qty {3}) / 0.975. "
+                "Increase Raw Materials to at least {1} before submit."
+            ).format(
+                entered,
+                required,
+                flt(self.total_work_order_qty, precision),
+                flt(self.scrap_qty, precision),
+            ),
+            title=frappe._("Insufficient Raw Material"),
+        )
+
     def validate_stock_readiness(self):
         """All Approve-time stock checks — run on manual Save so the user
         sees every error before the workflow reaches Approve.
@@ -815,6 +852,9 @@ class FinishWorkOrder(Document):
                 ),
                 title=frappe._("Raw Materials Required"),
             )
+
+        if has_wo_to_finish:
+            self.validate_rm_yield(precision)
 
         scrap_pool = self._build_scrap_pool()
         # Deep copy remaining qtys so this dry-run does not mutate submit pools.

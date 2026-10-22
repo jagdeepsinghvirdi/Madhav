@@ -274,6 +274,22 @@ def should_preserve_pieces_for_qty_change(
 	return delta < weight
 
 
+def pieces_for_weight_reconciliation(prior_qty, target_qty, length=0, section_weight=0):
+	"""Pieces a qty-only Stock Reconciliation may add.
+
+	Deliver-as-Qty can bill more tonnes than the batch holds. That weight
+	is topped up by reconciliation. It is not a new bar, so the piece
+	count must stay whatever the Delivery Note already has — which is
+	capped to the physical batch and is not recalculated from the extra
+	quantity. A full delivery of those pieces then leaves the batch at 0.
+
+	Arguments are accepted so callers can pass the weight gap that used
+	to be converted into pieces (for example 10.250 → 10.340 at
+	9.350 m × 9.60 kg/m, which is just over one piece and used to post +1).
+	"""
+	return 0
+
+
 def pieces_for_direct_batch_delivery(existing_pieces, qty, length, section_weight):
 	"""Pieces to post on a Delivery Note row that has a batch and no bundle.
 

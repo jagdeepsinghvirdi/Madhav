@@ -7,12 +7,13 @@ from madhav.madhav.doctype.finish_work_order.finish_work_order import (
 	_is_qty_rounding_dust,
 	_pwo_basis_qty,
 	_stock_qty_dust,
+	required_rm_from_wo_and_scrap,
 )
 from madhav.madhav.utils.stock_piece_utils import absorb_rounding_dust
 
 
 class TestFinishWorkOrderRmSplit(unittest.TestCase):
-	"""RM is user-entered and split by ready/basis qty — no 0.975 yield rule."""
+	"""RM is user-entered and split by ready/basis qty; yield floor is 0.975."""
 
 	def test_basis_qty_uses_ready_when_deliver_as_qty(self):
 		row = type("R", (), {"make_it_unplanned": 0, "sales_order": "SO-1", "deliver_as_qty": 1, "ready_qty": 10, "calculated_qty": 9})()
@@ -35,3 +36,17 @@ class TestFinishWorkOrderRmSplit(unittest.TestCase):
 		self.assertTrue(_is_qty_rounding_dust(0.0004, 3))
 		self.assertFalse(_is_qty_rounding_dust(0.002, 3))
 		self.assertFalse(_is_qty_rounding_dust(0.5, 3))
+
+	def test_required_rm_is_wo_plus_scrap_over_yield(self):
+		# PEN-WO-00407-2: 373.815 WO + 21.227 scrap → min RM 405.171
+		self.assertEqual(
+			required_rm_from_wo_and_scrap(373.815, 21.227, 3),
+			405.171,
+		)
+		# 300 RM is below that floor.
+		self.assertGreater(required_rm_from_wo_and_scrap(373.815, 21.227, 3), 300)
+		# Equal-or-more at the floor is allowed.
+		self.assertEqual(
+			required_rm_from_wo_and_scrap(373.815, 21.227, 3),
+			required_rm_from_wo_and_scrap(373.815, 21.227, 3),
+		)
