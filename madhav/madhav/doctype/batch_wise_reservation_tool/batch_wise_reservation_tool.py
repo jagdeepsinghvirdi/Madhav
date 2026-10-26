@@ -808,7 +808,6 @@ class BatchWiseReservationTool(Document):
 		)
 
 
-@frappe.whitelist()
 def get_reserved_pieces_map(so_details):
 	if not so_details:
 		return {}
@@ -833,6 +832,7 @@ def get_reserved_pieces_map(so_details):
 	return {d.sales_order_item: cint(d.pieces) for d in rows}
 
 
+@frappe.whitelist()
 def fetch_sales_order_items(filters):
 	if isinstance(filters, str):
 		filters = json.loads(filters)
@@ -907,6 +907,8 @@ def fetch_sales_order_items(filters):
 			"pending_qty": pending_stock_qty,
 			"reserve_qty": remaining,
 			"pieces": max(cint(row.pieces) - reserved_pieces.get(row.name, 0), 0),
+			"ordered_pieces": cint(row.pieces),
+			"reserved_pieces": reserved_pieces.get(row.name, 0),
 			"length": row.length_size,
 			"section_weight": weight_map.get(row.item_code, 0),
 		})
