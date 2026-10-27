@@ -269,6 +269,38 @@ class TestDeliveryPieceAndToleranceRules(unittest.TestCase):
 			8,
 		)
 
+	def test_inside_tolerance_keeps_entered_pieces(self):
+		self.assertEqual(
+			dn_pieces_for_invoice_change(
+				168, 168, 31.103, 30.735,
+				piece_weight=31.103 / 168, tolerance_percent=3,
+			),
+			168,
+		)
+		self.assertEqual(
+			dn_pieces_for_invoice_change(
+				100, 100, 18.480, 18.0,
+				piece_weight=18.480 / 100, tolerance_percent=3,
+			),
+			100,
+		)
+
+	def test_outside_tolerance_still_scales_down(self):
+		self.assertEqual(
+			dn_pieces_for_invoice_change(
+				30, 30, 6, 3, piece_weight=0.2, tolerance_percent=3,
+			),
+			15,
+		)
+
+	def test_without_tolerance_argument_behaviour_is_unchanged(self):
+		self.assertEqual(
+			dn_pieces_for_invoice_change(
+				168, 168, 31.103, 30.735, piece_weight=31.103 / 168,
+			),
+			166,
+		)
+
 	def test_full_bundle_still_scales_down_for_a_real_partial(self):
 		self.assertEqual(
 			dn_pieces_for_invoice_change(30, 30, 6, 3, piece_weight=0.2),

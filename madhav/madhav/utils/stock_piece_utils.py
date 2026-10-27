@@ -366,7 +366,8 @@ def preserve_entry_pieces(entry, item_pieces=0, qty_ratio=1.0):
 
 
 def dn_pieces_for_invoice_change(
-	entered_pieces, bundle_pieces, qty_before, qty_after, piece_weight=0
+	entered_pieces, bundle_pieces, qty_before, qty_after, piece_weight=0,
+	tolerance_percent=None,
 ):
 	"""Piece count to keep when a Delivery Note's billed weight changes.
 
@@ -382,6 +383,13 @@ def dn_pieces_for_invoice_change(
 
 	if flt(qty_after) + 0.0001 >= flt(qty_before):
 		return entered
+
+	if tolerance_percent is not None:
+		result = invoice_qty_tolerance_result(
+			qty_before, qty_after, flt(tolerance_percent)
+		)
+		if not result.get("skip") and not result.get("zero_qty") and result.get("within"):
+			return entered
 
 	weight = flt(piece_weight)
 	if weight <= 0 or should_preserve_pieces_for_qty_change(
