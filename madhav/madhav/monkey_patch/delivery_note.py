@@ -59,6 +59,7 @@ def _allowed_warehouses_for_dn_item(item):
 	still allows the physical warehouse after Deliver-as-Qty cancel.
 	"""
 	from madhav.doc_events.delivery_note import (
+		_dn_row_batch_nos,
 		_sre_warehouse_for_batch_including_cancelled,
 		_warehouse_from_custom_sre,
 	)
@@ -73,9 +74,9 @@ def _allowed_warehouses_for_dn_item(item):
 	if sre_wh and sre_wh not in allowed:
 		allowed.append(sre_wh)
 
-	if item.batch_no:
+	for batch_no in _dn_row_batch_nos(item):
 		batch_wh = _sre_warehouse_for_batch_including_cancelled(
-			item.against_sales_order, item.so_detail, item.batch_no
+			item.against_sales_order, item.so_detail, batch_no
 		)
 		if batch_wh and batch_wh not in allowed:
 			allowed.append(batch_wh)

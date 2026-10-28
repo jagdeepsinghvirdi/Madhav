@@ -808,6 +808,30 @@ class BatchWiseReservationTool(Document):
 		)
 
 
+def get_reserved_pieces_map(so_details):
+	if not so_details:
+		return {}
+
+	rows = frappe.db.sql(
+		"""
+		SELECT sre.voucher_detail_no AS sales_order_item,
+		       SUM(sbe.pieces) AS pieces
+		FROM `tabStock Reservation Entry` sre
+		INNER JOIN `tabSerial and Batch Entry` sbe
+			ON sbe.parent = sre.name
+			AND sbe.parenttype = 'Stock Reservation Entry'
+		WHERE sre.docstatus = 1
+		  AND sre.voucher_type = 'Sales Order'
+		  AND IFNULL(sre.status, '') NOT IN ('Delivered', 'Cancelled')
+		  AND sre.voucher_detail_no IN %(so_details)s
+		GROUP BY sre.voucher_detail_no
+		""",
+		{"so_details": tuple(so_details)},
+		as_dict=True,
+	)
+	return {d.sales_order_item: cint(d.pieces) for d in rows}
+
+
 @frappe.whitelist()
 def fetch_sales_order_items(filters):
 	if isinstance(filters, str):
@@ -858,6 +882,7 @@ def fetch_sales_order_items(filters):
 
 	rows = []
 	so_allowance_cache = {}
+	reserved_pieces = get_reserved_pieces_map([d.name for d in items])
 	for row in items:
 		conversion_factor = flt(row.conversion_factor) or 1
 		delivered_stock_qty = flt(row.delivered_qty) * conversion_factor
@@ -881,7 +906,9 @@ def fetch_sales_order_items(filters):
 			"conversion_factor": conversion_factor,
 			"pending_qty": pending_stock_qty,
 			"reserve_qty": remaining,
-			"pieces": row.pieces,
+			"pieces": max(cint(row.pieces) - reserved_pieces.get(row.name, 0), 0),
+			"ordered_pieces": cint(row.pieces),
+			"reserved_pieces": reserved_pieces.get(row.name, 0),
 			"length": row.length_size,
 			"section_weight": weight_map.get(row.item_code, 0),
 		})

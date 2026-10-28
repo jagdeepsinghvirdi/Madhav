@@ -1515,6 +1515,7 @@ def change_qty_serial_and_batch(self):
                 total_original_qty,
                 target_qty,
                 piece_weight=piece_weight,
+                tolerance_percent=_delivery_tolerance_percent(),
             )
             desired_pieces = distribute_integer_pieces(kept, desired_qty)
         else:
@@ -2179,6 +2180,7 @@ def update_bundle_to_invoice_qty(item, invoice_qty, qty, deliver_as_qty, already
             total_original_qty,
             target_qty,
             piece_weight=piece_weight,
+            tolerance_percent=_delivery_tolerance_percent(),
         )
     else:
         item_pieces = 0

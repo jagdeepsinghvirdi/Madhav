@@ -25,11 +25,32 @@ def meters_to_inches(value):
 
 
 def get_already_reserved_qty(sales_order_item):
-	from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
-		get_base_reserved_qty,
-	)
+	"""Undelivered base qty reserved from free stock via Batch Wise Reservation Tool.
 
-	return flt(get_base_reserved_qty(sales_order_item))
+	Finish Work Order and Stock Transfer reservations are the output of a Work
+	Order that ``production_plan_qty`` already accounts for, so counting them
+	here would subtract the same tonnage twice.
+	"""
+	tolerance_filter = (
+		"and ifnull(custom_is_tolerance, 0) = 0"
+		if frappe.db.has_column("Stock Reservation Entry", "custom_is_tolerance")
+		else ""
+	)
+	return flt(
+		frappe.db.sql(
+			f"""
+			select sum(reserved_qty - delivered_qty)
+			from `tabStock Reservation Entry`
+			where voucher_type = 'Sales Order'
+				and voucher_detail_no = %s
+				and docstatus = 1
+				and from_voucher_type = 'Batch Wise Reservation Tool'
+				{tolerance_filter}
+			""",
+			sales_order_item,
+		)[0][0]
+		or 0
+	)
 
 
 def get_already_reserved_pieces(sales_order_item):
@@ -48,7 +69,7 @@ def get_already_reserved_pieces(sales_order_item):
 	rows = frappe.db.sql(
 		f"""
 		select sbr.name, sbr.reserved_qty as staged_qty, sbr.reserved_pieces as staged_pieces,
-			sre.reserved_qty as actual_qty
+			sre.reserved_qty as actual_qty, sre.delivered_qty as delivered_qty
 		from `tabStaged Batch Reservations Verification` sbr
 		inner join `tabBatch Wise Reservation Tool` bwrt on bwrt.name = sbr.parent
 		left join `tabStock Reservation Entry` sre
@@ -66,15 +87,15 @@ def get_already_reserved_pieces(sales_order_item):
 	total_pieces = 0.0
 	for r in rows:
 		staged_qty = flt(r.staged_qty)
-		actual_qty = flt(r.actual_qty)
-		if staged_qty <= 0 or not actual_qty:
+		open_qty = flt(r.actual_qty) - flt(r.delivered_qty)
+		if staged_qty <= 0 or open_qty <= 0:
 			continue
-		total_pieces += flt(r.staged_pieces) * min(1, actual_qty / staged_qty)
+		total_pieces += flt(r.staged_pieces) * min(1, open_qty / staged_qty)
 	return total_pieces
 
 
 def remaining_qty_for_new_production_plan(
-	pending_stock_qty, production_plan_qty
+	pending_stock_qty, production_plan_qty, reserved_qty=0
 ):
 	"""Qty still free to put on a *new* Production Plan.
 
@@ -82,8 +103,15 @@ def remaining_qty_for_new_production_plan(
 	line. Partial reservation against that bucket must not open the same
 	tonnage for another plan (e.g. SO 140, PP 60, reserved 39.120 → next PP
 	gets 80, not 100.880).
+
+	Batch Wise Reservation Tool quantity comes from free stock, so it is a
+	separate commitment and subtracts on top (SO 10, PP 5, reserved 2 → next
+	PP gets 3).
 	"""
-	return max(0, flt(pending_stock_qty) - flt(production_plan_qty))
+	return max(
+		0,
+		flt(pending_stock_qty) - flt(production_plan_qty) - flt(reserved_qty),
+	)
 
 
 def get_remaining_unreserved_stock_qty(sales_order_item):
@@ -113,7 +141,9 @@ def get_remaining_unreserved_stock_qty(sales_order_item):
 		- flt(so_item.delivered_qty) * conversion_factor
 	)
 	return remaining_qty_for_new_production_plan(
-		pending_stock_qty, so_item.production_plan_qty
+		pending_stock_qty,
+		so_item.production_plan_qty,
+		get_already_reserved_qty(sales_order_item),
 	)
 
 
@@ -328,12 +358,10 @@ class CustomProductionPlan(ERPNextProductionPlan):
 				if so_item_row:
 					row.pending_pieces = so_item_row.production_plan_pieces or 0
 
-					# Same bucket rule as qty: pieces already on submitted PPs
-					# stay with those plans. Do not subtract reserved pieces here.
-					row.pieces = max(
-						0,
-						flt(so_item_row.pieces or 0)
-						- flt(so_item_row.production_plan_pieces or 0),
+					row.pieces = remaining_qty_for_new_production_plan(
+						flt(so_item_row.pieces or 0),
+						flt(so_item_row.production_plan_pieces or 0),
+						get_already_reserved_pieces(row.sales_order_item),
 					)
 
 					row.assorted_length = so_item_row.assorted_length
