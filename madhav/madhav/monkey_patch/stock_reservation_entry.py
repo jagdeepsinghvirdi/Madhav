@@ -348,6 +348,7 @@ def _update_sb_entries_custom_fields(doc):
         return
 
     from madhav.madhav.utils.stock_piece_utils import (
+        cap_resolved_pieces_for_batch,
         int_pieces_from_qty,
         resolve_entry_length,
         resolve_entry_section_weight,
@@ -368,6 +369,9 @@ def _update_sb_entries_custom_fields(doc):
             row.pieces = int_pieces_from_qty(entry_qty, length, section_weight)
         else:
             row.pieces = cint(so_item.get("pieces"))
+        # Ceil from weight can be one bar above FWO/Batch (21 → 22).
+        # Cap pieces only; reserved qty stays the reservation weight.
+        row.pieces = cap_resolved_pieces_for_batch(row.pieces, row.batch_no)
 
 def auto_reserve_serial_and_batch(self, based_on=None):
     """

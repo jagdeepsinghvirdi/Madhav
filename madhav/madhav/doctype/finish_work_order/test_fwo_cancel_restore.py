@@ -67,6 +67,21 @@ class TestFwoCancelRestore(FrappeTestCase):
 		wo = _restore(row, _wo(pending_qty=29.509))
 		self.assertEqual(wo.pending_qty, 32.009)
 
+	def test_shrinks_mill_expanded_wo_qty_on_cancel(self):
+		row = _row(
+			deliver_as_qty=0,
+			qty=0.2,
+			ready_qty=0.2,
+			calculated_qty=0.218,
+			ready_pieces=1,
+		)
+		wo = _restore(
+			row,
+			_wo(qty=0.218, pending_qty=0, produced_qty=0, pieces=1, completed_pcs=1, pending_pcs=0),
+		)
+		self.assertEqual(wo.qty, 0.2)
+		self.assertEqual(wo.pending_qty, 0.2)
+
 	def test_completed_pieces_never_negative(self):
 		wo = _restore(_row(ready_pieces=100), _wo(completed_pcs=61))
 		self.assertEqual(wo.completed_pcs, 0)

@@ -249,6 +249,11 @@ doc_events = {
     "Sales Order":{
         "before_validate":"madhav.doc_events.sales_order.calculate_qty_in_tonne"
     },
+    "Stock Reservation Entry": {
+        "on_submit": "madhav.doc_events.stock_reservation_entry.on_submit",
+        "on_update": "madhav.doc_events.stock_reservation_entry.on_update",
+        "on_cancel": "madhav.doc_events.stock_reservation_entry.on_cancel",
+    },
 
     "Delivery Note": {
         "before_insert":"madhav.doc_events.delivery_note.before_insert",

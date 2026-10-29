@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 
 import frappe
-from frappe.utils import flt
+from frappe.utils import cint, flt
 
 
 def int_pieces_from_qty(qty, length, section_weight):
@@ -236,6 +236,50 @@ def resolve_entry_pieces(entry, avail_qty, length, section_weight):
 		return int_pieces_from_qty(avail_qty, length, section_weight)
 
 	return max(0, int(round(stored))) if stored > 0 else 0
+
+
+def physical_batch_pieces(batch_no):
+	"""Piece count stamped on Batch (FWO / piece ledger), else 0."""
+	if not batch_no:
+		return 0
+	return cint(frappe.db.get_value("Batch", batch_no, "pieces") or 0)
+
+
+def cap_pieces_to_physical_batch(pieces, physical_pieces):
+	"""Never stamp more pieces than the batch physically holds.
+
+	SO auto-reserve ceils reserved weight (21 bars → 22 PC) while FWO
+	left 21 on the batch. Cap the count only — reserved qty (tonnes)
+	stays untouched so Sales remaining-qty math does not move.
+	A missing / zero physical count is left as-is (batch not stamped yet).
+	"""
+	pieces = cint(pieces)
+	physical = cint(physical_pieces)
+	if physical > 0 and pieces > physical:
+		return physical
+	return max(0, pieces)
+
+
+def cap_resolved_pieces_for_batch(pieces, batch_no):
+	return cap_pieces_to_physical_batch(pieces, physical_batch_pieces(batch_no))
+
+
+def cap_pieces_using_sre_batches(pieces, sre_rows, physical_lookup=None):
+	"""Cap a DN/SRE piece total against the unique batches on those rows."""
+	lookup = physical_lookup or physical_batch_pieces
+	seen = set()
+	physical_total = 0
+	for row in sre_rows or []:
+		batch_no = (
+			row.get("batch_no") if isinstance(row, dict) else getattr(row, "batch_no", None)
+		)
+		if not batch_no or batch_no in seen:
+			continue
+		seen.add(batch_no)
+		physical_total += cint(lookup(batch_no) or 0)
+	if not seen:
+		return cint(pieces)
+	return cap_pieces_to_physical_batch(pieces, physical_total)
 
 
 def qty_from_pieces(pieces, length, section_weight):

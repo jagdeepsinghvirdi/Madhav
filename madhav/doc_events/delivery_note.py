@@ -4,6 +4,8 @@ from frappe.utils import flt, cint, nowtime, nowdate
 from frappe import _
 
 from madhav.madhav.utils.stock_piece_utils import (
+	cap_pieces_using_sre_batches,
+	cap_resolved_pieces_for_batch,
 	distribute_integer_pieces,
 	dn_pieces_for_invoice_change,
 	int_pieces_from_qty,
@@ -134,6 +136,7 @@ from frappe.utils import flt, get_datetime, add_to_date, nowtime
 def before_insert(self, method):
     fix_group_cost_center(self)
     populate_missing_batch_bundle(self)
+    apply_dn_qty_from_pcs_formula(self)
     change_qty_serial_and_batch(self)
     populate_missing_batch_bundle_from_si(self)
 
@@ -160,6 +163,10 @@ def before_validate(self, method):
     # can carry a FIFO batch_no that is not the reserved batch; clear +
     # rebuild from SRE and stamp custom_sre so WH pin survives validate.
     populate_missing_batch_bundle(self)
+    apply_dn_qty_from_pcs_formula(self)
+    # Keep bundle weight in line with formula Qty when Pcs changes on a draft.
+    # Previous flow ran change_qty_serial_and_batch only on insert (reserved weight).
+    change_qty_serial_and_batch(self)
     _sync_dn_item_warehouse_to_reservation(self)
 
 
@@ -1312,6 +1319,7 @@ def get_ssb_bundle_for_voucher_from_sre(sre):
 			row, item_code, length, row.batch_no
 		)
 		pieces = resolve_entry_pieces(row, avail_qty, length, section_weight)
+		pieces = cap_resolved_pieces_for_batch(pieces, row.batch_no)
 
 		bundle.append(
 			"entries",
@@ -1356,6 +1364,7 @@ def _apply_reserved_dims_to_dn_item(dn_item, so_item, sre):
 
 	# Prefer undelivered pieces on SRE batch rows (skip fully delivered batches).
 	sre_pieces = 0
+	sre_rows = []
 	if sre_name and frappe.db.has_column("Serial and Batch Entry", "pieces"):
 		sre_rows = frappe.db.sql(
 			"""
@@ -1397,6 +1406,10 @@ def _apply_reserved_dims_to_dn_item(dn_item, so_item, sre):
 		else:
 			scaled_pieces = so_pieces
 
+	# Existing SREs may still hold a ceiled extra bar (22 vs Batch 21).
+	# Cap the DN piece stamp only — reserved qty on the row is unchanged.
+	scaled_pieces = cap_pieces_using_sre_batches(scaled_pieces, sre_rows)
+
 	if hasattr(dn_item, "lengthpieces_so") and scaled_pieces:
 		dn_item.lengthpieces_so = scaled_pieces
 	if hasattr(dn_item, "pieces") and scaled_pieces:
@@ -1409,6 +1422,43 @@ def _apply_reserved_dims_to_dn_item(dn_item, so_item, sre):
 			dn_item.section_weight = (reserved_stock_qty * 1000) / (
 				scaled_pieces * reserved_length
 			)
+
+
+def _dn_qty_from_pcs_length_sw(item):
+	"""Qty = (Pcs × Length × Section Weight) / 1000.
+
+	Length prefers the Sales Order reference (length_sizeso), then the live
+	row length. Returns 0 when any input is missing so callers can fall back.
+	"""
+	pieces = flt(getattr(item, "pieces", 0))
+	length = (
+		flt(getattr(item, "length_sizeso", 0) or 0)
+		or flt(getattr(item, "average_length", 0) or 0)
+		or flt(getattr(item, "length_size", 0) or 0)
+	)
+	section_weight = flt(getattr(item, "section_weight", 0))
+	if pieces <= 0 or length <= 0 or section_weight <= 0:
+		return 0
+	return flt((pieces * length * section_weight) / 1000, 4)
+
+
+def apply_dn_qty_from_pcs_formula(doc, method=None):
+	"""Stamp DN row Qty from Pcs × Length × SW (client Oct 2026).
+
+	Previous flow kept reserved-weight Qty and skipped this formula on
+	reserved / Deliver-as-Qty / bundle rows (0.445 → 0.443 drift). To
+	restore that, comment out the calls to this function in before_insert
+	and before_validate, and restore ``dn_item.qty = available_reserved …``
+	in make_delivery_note_custom.
+	"""
+	if cint(getattr(doc, "is_return", 0)):
+		return
+	for item in doc.items or []:
+		qty = _dn_qty_from_pcs_length_sw(item)
+		if qty <= 0:
+			continue
+		item.qty = qty
+		item.stock_qty = qty * flt(item.conversion_factor or 1)
 
 
 def change_qty_serial_and_batch(self):
@@ -4085,11 +4135,18 @@ def make_delivery_note_custom(source_name, target_doc=None, kwargs=None):
                 ignore_permissions=True,
             )
 
-            # qty from undelivered reserved stock for this SRE
-            dn_item.qty = available_reserved / flt(dn_item.conversion_factor or 1)
+            # Previous flow: Qty = undelivered reserved stock for this SRE.
+            # Restore the next line (and skip apply_dn_qty_from_pcs_formula)
+            # to return to reservation-weight Qty.
+            # dn_item.qty = available_reserved / flt(dn_item.conversion_factor or 1)
             dn_item.warehouse = sre.warehouse
             dn_item.custom_deliver_as_qty = so.deliver_as_qty
             _apply_reserved_dims_to_dn_item(dn_item, so_item, sre)
+            formula_qty = _dn_qty_from_pcs_length_sw(dn_item)
+            if formula_qty > 0:
+                dn_item.qty = formula_qty
+            else:
+                dn_item.qty = available_reserved / flt(dn_item.conversion_factor or 1)
             if sre.reservation_based_on == "Serial and Batch":
                 dn_item.serial_and_batch_bundle = get_ssb_bundle_for_voucher_from_sre(sre)
                 if dn_item.serial_and_batch_bundle:

@@ -11,6 +11,7 @@ from madhav.madhav.doctype.finish_work_order.finish_work_order import (
 	_is_qty_rounding_dust,
 	_pwo_basis_qty,
 	_stock_qty_dust,
+	qty_needed_to_cover_fg,
 )
 from madhav.madhav.override.production_plan import remaining_qty_for_new_production_plan
 from madhav.madhav.utils.stock_piece_utils import (
@@ -72,6 +73,8 @@ class TestE2EChangeMatrix(FrappeTestCase):
 		)()
 		self.assertEqual(_pwo_basis_qty(dav), 0.925)
 		self.assertEqual(_pwo_basis_qty(calc), 0.926)
+		# PEN-WO-00430: mill FG 0.218 must raise WO remaining 0.2, not block.
+		self.assertEqual(qty_needed_to_cover_fg(0.2, 0, 0.218), 0.218)
 
 	def test_dn_tolerance_and_piece_preserve_no_block(self):
 		inside = invoice_qty_tolerance_result(1.189, 1.190, 3, precision=3)
