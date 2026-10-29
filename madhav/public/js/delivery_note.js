@@ -39,6 +39,11 @@ frappe.ui.form.on("Delivery Note", {
 								"quantityso",
 								r.message.qty
 							);
+							// SO length just arrived — stamp Qty from Pcs
+							// so the user does not have to touch Pcs again.
+							if (flt(row.pieces) > 0) {
+								calculate_qty(row.doctype, row.name);
+							}
 						},
 					});
 				}
@@ -165,7 +170,8 @@ frappe.ui.form.on('Delivery Note Item', {
 		frappe.db.get_value("Item", d.item_code, "weight_per_meter", (r) => {
 			if (r && r.weight_per_meter) {
 				frappe.model.set_value(cdt, cdn, "section_weight", r.weight_per_meter);
-				calculate_qty(cdt, cdn);
+				// Recalc only when Pcs changes (client Oct 2026). Previous:
+				// calculate_qty(cdt, cdn);
 			}
 		});
 	},
@@ -174,10 +180,12 @@ frappe.ui.form.on('Delivery Note Item', {
 		enforce_delivery_note_piece_limits(frm, false, cdt, cdn);
 	},
 	average_length(frm, cdt, cdn) {
-		calculate_qty(cdt, cdn);
+		// Recalc only when Pcs changes (client Oct 2026). Previous:
+		// calculate_qty(cdt, cdn);
 	},
 	section_weight(frm, cdt, cdn) {
-		calculate_qty(cdt, cdn);
+		// Recalc only when Pcs changes (client Oct 2026). Previous:
+		// calculate_qty(cdt, cdn);
 	}
 });
 
@@ -223,6 +231,8 @@ function preserve_entered_dn_pieces_on_qty_change(frm, cdt, cdn) {
 
 function calculate_qty(cdt, cdn) {
 	let row = locals[cdt][cdn];
+
+	// --- PREVIOUS FLOW (restore this block to skip reserved rows) ---
 	// Reserved / Deliver-as-Qty rows: physical Qty comes from reservation weight.
 	// Do not rebuild Qty from pieces×length×section_weight (that drifts 0.445→0.443).
 	//
@@ -231,17 +241,21 @@ function calculate_qty(cdt, cdn) {
 	// validate, so on a Delivery Note mapped from a Sales Invoice it is still
 	// 0 in the browser while the user picks the batch. Relying on it alone let
 	// the freshly stamped batch pieces overwrite the Qty that was typed in.
-	if (
-		(row.against_sales_order || row.against_sales_invoice) &&
-		(cint(row.custom_deliver_as_qty) ||
-			flt(row.invoice_qty) > 0 ||
-			row.serial_and_batch_bundle)
-	) {
-		return;
-	}
+	// if (
+	// 	(row.against_sales_order || row.against_sales_invoice) &&
+	// 	(cint(row.custom_deliver_as_qty) ||
+	// 		flt(row.invoice_qty) > 0 ||
+	// 		row.serial_and_batch_bundle)
+	// ) {
+	// 	return;
+	// }
+	// let avg_len = flt(row.average_length || row.length_size);
+	// --- END PREVIOUS FLOW ---
 
+	// Client: Qty = (Pcs × Length × Section Weight) / 1000.
+	// Length from Sales Order (length_sizeso) first, then live row length.
 	let pieces = flt(row.pieces);
-	let avg_len = flt(row.average_length || row.length_size);
+	let avg_len = flt(row.length_sizeso || row.average_length || row.length_size);
 	let section_weight = flt(row.section_weight);
 
 	let qty = (pieces * avg_len * section_weight) / 1000;
@@ -526,6 +540,11 @@ function open_sales_order_items_selector_for_delivery_note(frm) {
 					}
 				});
 				frm.refresh_field("items");
+				(frm.doc.items || []).forEach((row) => {
+					if (flt(row.pieces) > 0) {
+						calculate_qty(row.doctype, row.name);
+					}
+				});
 				frm.refresh();
 			});
 		},

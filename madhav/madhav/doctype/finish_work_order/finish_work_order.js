@@ -161,6 +161,7 @@ frappe.ui.form.on("Finish Work Order", {
                     });
 
                     frm.refresh_field("pending_work_orders");
+                    update_fwo_work_order_totals(frm);
                     // Explicitly leave Raw Materials untouched / empty — never
                     // auto-fill from BOM on this button (cached clients used to).
                     frm.clear_table("raw_materials");
@@ -213,6 +214,10 @@ frappe.ui.form.on("Finish Work Order", {
                 }
             }
         });
+    },
+
+    pending_work_orders_remove(frm) {
+        update_fwo_work_order_totals(frm);
     }
 });
 
@@ -368,6 +373,7 @@ function fetch_missing_titles(frm) {
 frappe.ui.form.on("Pending Work Orders", {
     ready_qty(frm, cdt, cdn) {
         let row = locals[cdt][cdn];
+        update_fwo_work_order_totals(frm);
 
         frappe.db.get_single_value("Manufacturing Settings",
             "overproduction_percentage_for_work_order"
@@ -384,6 +390,7 @@ frappe.ui.form.on("Pending Work Orders", {
             }
 
             check_weight_variance(frm, cdt, cdn);
+            update_fwo_work_order_totals(frm);
         });
     },
 
@@ -405,8 +412,10 @@ frappe.ui.form.on("Pending Work Orders", {
             }
 
             check_weight_variance(frm, cdt, cdn);
+            update_fwo_work_order_totals(frm);
         });
         frappe.model.set_value(cdt, cdn, "calculated_qty", row.ready_pieces * row.length_size * row.standard_weight / 1000);
+        update_fwo_work_order_totals(frm);
     },
 
     length_size(frm, cdt, cdn) {
@@ -443,8 +452,31 @@ frappe.ui.form.on("Pending Work Orders", {
 
     pending_work_orders_add: function(frm, cdt, cdn) {
         frappe.model.set_value(cdt, cdn, 'target_warehouse', null);
+        update_fwo_work_order_totals(frm);
+    },
+
+    pending_work_orders_remove: function(frm) {
+        update_fwo_work_order_totals(frm);
     }
 });
+
+function update_fwo_work_order_totals(frm) {
+    // Mirror server update_totals(): header Total WO Qty/Pieces = sum of
+    // Actual Ready Qty / Ready Pieces. Display only — Save still overwrites
+    // from the same formula. Do not use calculated_qty (that is Sales FG qty).
+    // Direct assign so Fetch silent-autosave sees the totals immediately
+    // (frm.set_value is async and would race the 400ms autosave).
+    let total_qty = 0;
+    let total_pieces = 0;
+    (frm.doc.pending_work_orders || []).forEach((row) => {
+        total_qty += flt(row.ready_qty);
+        total_pieces += flt(row.ready_pieces);
+    });
+    frm.doc.total_work_order_qty = total_qty;
+    frm.doc.total_work_order_pieces = total_pieces;
+    frm.refresh_field("total_work_order_qty");
+    frm.refresh_field("total_work_order_pieces");
+}
 
 function check_weight_variance(frm, cdt, cdn) {
     let row = locals[cdt][cdn];

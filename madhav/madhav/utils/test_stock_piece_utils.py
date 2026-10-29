@@ -3,6 +3,8 @@ import unittest
 from madhav.madhav.utils.stock_piece_utils import (
 	_entry_avail_qty,
 	absorb_rounding_dust,
+	cap_pieces_to_physical_batch,
+	cap_pieces_using_sre_batches,
 	distribute_integer_pieces,
 	dn_pieces_for_invoice_change,
 	int_pieces_from_qty,
@@ -358,6 +360,83 @@ class TestDeliveryPieceAndToleranceRules(unittest.TestCase):
 		self.assertEqual(
 			absorb_rounding_dust([1, 1, 1], 10, precision=3),
 			[1, 1, 1],
+		)
+
+
+class TestCapPiecesToPhysicalBatch(unittest.TestCase):
+	def test_ceiled_pieces_capped_to_batch(self):
+		# FWO produced 21; SO reserve ceiled reserved weight to 22.
+		self.assertEqual(cap_pieces_to_physical_batch(22, 21), 21)
+
+	def test_does_not_raise_when_under_batch(self):
+		self.assertEqual(cap_pieces_to_physical_batch(10, 21), 10)
+
+	def test_equal_count_unchanged(self):
+		self.assertEqual(cap_pieces_to_physical_batch(21, 21), 21)
+
+	def test_zero_physical_does_not_cap(self):
+		# Batch not stamped yet — keep the calculated count.
+		self.assertEqual(cap_pieces_to_physical_batch(22, 0), 22)
+
+	def test_sre_batches_cap_uses_sum_of_unique_batches(self):
+		rows = [{"batch_no": "B1"}, {"batch_no": "B1"}, {"batch_no": "B2"}]
+		lookup = {"B1": 10, "B2": 11}.get
+		self.assertEqual(
+			cap_pieces_using_sre_batches(22, rows, physical_lookup=lookup),
+			21,
+		)
+
+	def test_sre_batches_no_rows_leaves_pieces(self):
+		self.assertEqual(cap_pieces_using_sre_batches(22, [], physical_lookup=lambda _: 21), 22)
+
+
+class TestSreSourceLabel(unittest.TestCase):
+	def test_from_voucher_type_wins(self):
+		from madhav.doc_events.stock_reservation_entry import sre_source_label
+		from types import SimpleNamespace
+
+		self.assertEqual(
+			sre_source_label(
+				SimpleNamespace(
+					from_voucher_type="Finish Work Order",
+					from_voucher_no="FWO-0001",
+					voucher_type="Sales Order",
+					voucher_no="SAL-ORD-0001",
+				)
+			),
+			"Finish Work Order FWO-0001",
+		)
+
+	def test_sales_order_when_from_voucher_blank(self):
+		from madhav.doc_events.stock_reservation_entry import sre_source_label
+		from types import SimpleNamespace
+
+		self.assertEqual(
+			sre_source_label(
+				SimpleNamespace(
+					from_voucher_type="",
+					from_voucher_no="",
+					voucher_type="Sales Order",
+					voucher_no="SAL-ORD-0001",
+				)
+			),
+			"Sales Order SAL-ORD-0001",
+		)
+
+	def test_manual_when_no_voucher(self):
+		from madhav.doc_events.stock_reservation_entry import sre_source_label
+		from types import SimpleNamespace
+
+		self.assertEqual(
+			sre_source_label(
+				SimpleNamespace(
+					from_voucher_type="",
+					from_voucher_no="",
+					voucher_type="",
+					voucher_no="",
+				)
+			),
+			"Manual",
 		)
 
 

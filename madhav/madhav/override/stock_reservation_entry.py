@@ -3,6 +3,7 @@ from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry impor
 from frappe import _
 from frappe.utils import cint, flt
 from erpnext.stock.utils import get_stock_balance
+from madhav.madhav.utils.stock_piece_utils import cap_resolved_pieces_for_batch
 
 class StockReservationEntry(_StockReservationEntry):
     def update_status(self, status: str | None = None, update_modified: bool = True) -> None:
@@ -246,6 +247,13 @@ class StockReservationEntry(_StockReservationEntry):
                             frappe.throw(msg)
                         else:
                             selected_batch_nos.append(entry.batch_no)
+
+                        # Cap pieces to Batch.pieces. Do not change entry.qty —
+                        # reserved tonnes must stay the reservation weight.
+                        if getattr(entry, "pieces", None):
+                            entry.pieces = cap_resolved_pieces_for_batch(
+                                entry.pieces, entry.batch_no
+                            )
     
                     qty_to_be_reserved += entry.qty
     

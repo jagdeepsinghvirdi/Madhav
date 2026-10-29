@@ -7,7 +7,9 @@ from madhav.madhav.doctype.finish_work_order.finish_work_order import (
 	_is_qty_rounding_dust,
 	_pwo_basis_qty,
 	_stock_qty_dust,
+	qty_needed_to_cover_fg,
 	required_rm_from_wo_and_scrap,
+	restored_wo_qty_after_fwo_cancel,
 )
 from madhav.madhav.utils.stock_piece_utils import absorb_rounding_dust
 
@@ -22,6 +24,20 @@ class TestFinishWorkOrderRmSplit(unittest.TestCase):
 	def test_basis_qty_uses_calculated_when_deliver_as_qty_off(self):
 		row = type("R", (), {"make_it_unplanned": 0, "sales_order": "SO-1", "deliver_as_qty": 0, "ready_qty": 10, "calculated_qty": 9})()
 		self.assertEqual(_pwo_basis_qty(row), 9)
+
+	def test_wo_qty_covers_mill_calculated_fg(self):
+		# PEN-WO-00430: mill 0.218 vs planned remaining 0.2.
+		self.assertEqual(qty_needed_to_cover_fg(0.2, 0, 0.218), 0.218)
+		self.assertEqual(qty_needed_to_cover_fg(0.2, 0, 0.2), 0.2)
+		self.assertEqual(qty_needed_to_cover_fg(1.0, 0.5, 0.52), 1.02)
+		self.assertEqual(qty_needed_to_cover_fg(1.0, 0.5, 0.4), 1.0)
+
+	def test_cancel_restores_expanded_wo_qty(self):
+		self.assertEqual(restored_wo_qty_after_fwo_cancel(0.218, 0, 0.2), 0.2)
+		self.assertEqual(restored_wo_qty_after_fwo_cancel(1.02, 0.5, 0.5), 1.0)
+		self.assertEqual(restored_wo_qty_after_fwo_cancel(0.2, 0, 0.2), 0.2)
+		# No planned remaining → do not wipe WO qty.
+		self.assertEqual(restored_wo_qty_after_fwo_cancel(32.009, 0, 0), 32.009)
 
 	def test_rounding_dust_lands_on_last_row(self):
 		# Same split used when RM is shared across Pending WO rows.

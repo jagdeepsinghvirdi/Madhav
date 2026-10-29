@@ -65,6 +65,21 @@ class CustomStockEntry(_StockEntry):
             )
         return bool(changed)
 
+    def validate_finished_goods(self):
+        # FWO posts mill Calculated Qty, which can exceed planned WO qty.
+        # Expand the Work Order first so core "allowed quantity" matches.
+        if (
+            self.flags.get("madhav_fwo_manufacture")
+            and self.purpose == "Manufacture"
+            and self.work_order
+        ):
+            from madhav.madhav.doctype.finish_work_order.finish_work_order import (
+                ensure_work_order_covers_fg,
+            )
+
+            ensure_work_order_covers_fg(self.work_order, self.fg_completed_qty)
+        super().validate_finished_goods()
+
     def _restore_fg_completed_qty_for_manual_manufacture(self):
         if self.purpose != "Manufacture" or cint(self.from_bom):
             return
