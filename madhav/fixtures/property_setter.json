@@ -30,5 +30,21 @@
   "property_type": "Small Text",
   "row_name": null,
   "value": "\nPick List\nPurchase Receipt\nStock Entry\nStock Transfer\nFinish Work Order\nBatch Wise Reservation Tool"
+ },
+ {
+  "default_value": null,
+  "doc_type": "Stock Reservation Entry",
+  "docstatus": 0,
+  "doctype": "Property Setter",
+  "doctype_or_field": "DocType",
+  "field_name": null,
+  "is_system_generated": 0,
+  "modified": "2026-10-30 13:05:00.000000",
+  "module": "Madhav",
+  "name": "Stock Reservation Entry-main-hide_toolbar",
+  "property": "hide_toolbar",
+  "property_type": "Check",
+  "row_name": null,
+  "value": "0"
  }
 ]

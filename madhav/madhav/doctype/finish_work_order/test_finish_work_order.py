@@ -3,7 +3,10 @@
 
 import unittest
 
+import frappe
+
 from madhav.madhav.doctype.finish_work_order.finish_work_order import (
+	FinishWorkOrder,
 	_is_qty_rounding_dust,
 	_pwo_basis_qty,
 	_stock_qty_dust,
@@ -66,3 +69,70 @@ class TestFinishWorkOrderRmSplit(unittest.TestCase):
 			required_rm_from_wo_and_scrap(373.815, 21.227, 3),
 			required_rm_from_wo_and_scrap(373.815, 21.227, 3),
 		)
+
+
+class TestFwoSaveAndSubmitValidations(unittest.TestCase):
+	"""Save collects every error; Submit throws the first (original backstop)."""
+
+	def _doc(self, action="save", silent=False):
+		doc = FinishWorkOrder.__new__(FinishWorkOrder)
+		doc.flags = frappe._dict()
+		doc._action = action
+		if silent:
+			doc.flags.fwo_silent_autosave = True
+		silent_flag = bool(doc.flags.get("fwo_silent_autosave"))
+		submitting = getattr(doc, "_action", None) == "submit"
+		doc._set_validation_mode(collect=not silent_flag and not submitting)
+		return doc
+
+	def test_manual_save_collects_errors(self):
+		doc = self._doc(action="save")
+		self.assertTrue(doc.flags.fwo_collect_errors)
+
+	def test_submit_does_not_collect(self):
+		doc = self._doc(action="submit")
+		self.assertFalse(doc.flags.fwo_collect_errors)
+
+	def test_fetch_autosave_does_not_collect(self):
+		doc = self._doc(action="save", silent=True)
+		self.assertFalse(doc.flags.fwo_collect_errors)
+
+	def test_before_submit_forces_throw_mode(self):
+		doc = self._doc(action="save")
+		self.assertTrue(doc.flags.fwo_collect_errors)
+		doc._set_validation_mode(collect=False)
+		self.assertFalse(doc.flags.fwo_collect_errors)
+
+	def _patch_throw(self):
+		raised = []
+		orig = frappe.throw
+
+		def fake_throw(msg, title=None, **kwargs):
+			raised.append(str(msg))
+			exc = frappe.ValidationError(msg)
+			exc.title = title
+			raise exc
+
+		frappe.throw = fake_throw
+		self.addCleanup(setattr, frappe, "throw", orig)
+		return raised
+
+	def test_save_shows_all_errors_together(self):
+		doc = self._doc(action="save")
+		raised = self._patch_throw()
+		doc._collect_save_error("Missing batch")
+		doc._collect_save_error("Raw material short")
+		with self.assertRaises(frappe.ValidationError):
+			doc._raise_collected_save_errors()
+		self.assertEqual(len(raised), 1)
+		self.assertIn("Missing batch", raised[0])
+		self.assertIn("Raw material short", raised[0])
+
+	def test_submit_throws_on_first_error(self):
+		doc = self._doc(action="submit")
+		raised = self._patch_throw()
+		with self.assertRaises(frappe.ValidationError):
+			doc._collect_save_error("Missing batch")
+		self.assertEqual(raised, ["Missing batch"])
+		# Second error is never queued — original first-throw behaviour.
+		self.assertFalse(doc.flags.get("fwo_save_errors"))
