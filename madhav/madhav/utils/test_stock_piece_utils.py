@@ -440,5 +440,59 @@ class TestSreSourceLabel(unittest.TestCase):
 		)
 
 
+class _FakeSre:
+	def __init__(self, reserved_qty, before_qty=None, docstatus=1, action="update_after_submit", sb=None, before_sb=None):
+		self.docstatus = docstatus
+		self._action = action
+		self.reserved_qty = reserved_qty
+		self.sb_entries = sb or []
+		self.flags = type("Flags", (), {"get": lambda _s, k, d=None: None})()
+		self._before = None
+		if before_qty is not None or before_sb is not None:
+			self._before = _FakeSre(
+				reserved_qty if before_qty is None else before_qty,
+				docstatus=1,
+				action="save",
+				sb=before_sb if before_sb is not None else sb,
+			)
+			self._before._before = None
+
+	def has_value_changed(self, field):
+		if field != "reserved_qty" or self._before is None:
+			return False
+		return self.reserved_qty != self._before.reserved_qty
+
+	def get_doc_before_save(self):
+		return self._before
+
+
+class TestSreMeaningfulEdit(unittest.TestCase):
+	def test_qty_change_on_submitted_sre_is_edit(self):
+		from madhav.doc_events.stock_reservation_entry import _is_meaningful_edit
+
+		self.assertTrue(_is_meaningful_edit(_FakeSre(10, before_qty=9)))
+
+	def test_submit_is_not_edit(self):
+		from madhav.doc_events.stock_reservation_entry import _is_meaningful_edit
+
+		doc = _FakeSre(10, before_qty=0, action="submit")
+		self.assertFalse(_is_meaningful_edit(doc))
+
+	def test_batch_row_change_is_edit(self):
+		from madhav.doc_events.stock_reservation_entry import _is_meaningful_edit
+		from types import SimpleNamespace
+
+		old = [SimpleNamespace(batch_no="B1", qty=10, serial_no="", warehouse="WH")]
+		new = [SimpleNamespace(batch_no="B2", qty=10, serial_no="", warehouse="WH")]
+		self.assertTrue(_is_meaningful_edit(_FakeSre(10, before_qty=10, sb=new, before_sb=old)))
+
+	def test_no_change_is_not_edit(self):
+		from madhav.doc_events.stock_reservation_entry import _is_meaningful_edit
+		from types import SimpleNamespace
+
+		rows = [SimpleNamespace(batch_no="B1", qty=10, serial_no="", warehouse="WH")]
+		self.assertFalse(_is_meaningful_edit(_FakeSre(10, before_qty=10, sb=rows, before_sb=rows)))
+
+
 if __name__ == "__main__":
 	unittest.main()

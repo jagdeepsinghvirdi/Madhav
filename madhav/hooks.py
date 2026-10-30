@@ -58,7 +58,8 @@ doctype_js = {
     "Purchase Order": "public/js/purchase_order.js",
     "Purchase Invoice": "public/js/purchase_invoice.js",
     "Journal Entry": "public/js/journal_entry.js",
-    "Purchase Receipt": "public/js/purchase_receipt.js"
+    "Purchase Receipt": "public/js/purchase_receipt.js",
+    "Stock Reservation Entry": "public/js/stock_reservation_entry.js",
 }
 # doctype_list_js = {"doctype" : "public/js/doctype_list.js"}
 doctype_list_js = {
@@ -252,6 +253,7 @@ doc_events = {
     "Stock Reservation Entry": {
         "on_submit": "madhav.doc_events.stock_reservation_entry.on_submit",
         "on_update": "madhav.doc_events.stock_reservation_entry.on_update",
+        "before_update_after_submit": "madhav.doc_events.stock_reservation_entry.before_update_after_submit",
         "on_cancel": "madhav.doc_events.stock_reservation_entry.on_cancel",
     },
 

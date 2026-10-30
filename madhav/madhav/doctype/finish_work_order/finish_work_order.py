@@ -183,7 +183,13 @@ class FinishWorkOrder(Document):
             self.create_unplanned_work_orders()
 
     def _collect_save_error(self, message, title=None):
-        """Queue a manual-Save error; Fetch auto-save never calls this path."""
+        """Queue every error on manual Save; throw immediately on Submit.
+
+        Fetch auto-save never reaches this. Submit keeps the original
+        first-error ``frappe.throw`` so Approve still behaves as before.
+        """
+        if not self.flags.get("fwo_collect_errors"):
+            frappe.throw(message, title=title)
         errors = self.flags.setdefault("fwo_save_errors", [])
         text = str(message or "").strip()
         if text and text not in errors:
@@ -192,6 +198,8 @@ class FinishWorkOrder(Document):
             self.flags.fwo_save_error_title = title
 
     def _raise_collected_save_errors(self):
+        if not self.flags.get("fwo_collect_errors"):
+            return
         errors = self.flags.get("fwo_save_errors") or []
         if not errors:
             return
@@ -206,11 +214,18 @@ class FinishWorkOrder(Document):
             title=title or frappe._("Please correct the following before Save"),
         )
 
-    def validate(self):
-        # Fetch auto-save only persists QI warehouse / row calcs. Business
-        # errors wait for the user's manual Save click — all of them at once.
+    def _set_validation_mode(self, collect):
+        """Save collects every error; Submit throws the first one (original)."""
         self.flags.fwo_save_errors = []
+        self.flags.fwo_collect_errors = bool(collect)
+
+    def validate(self):
+        # Fetch auto-save only persists QI warehouse / row calcs.
+        # Manual Save collects every business error at once.
+        # Submit still uses the original first-error throws.
         silent = bool(self.flags.get("fwo_silent_autosave"))
+        submitting = getattr(self, "_action", None) == "submit"
+        self._set_validation_mode(collect=not silent and not submitting)
         self.apply_quality_inspection_warehouses()
         for row in self.pending_work_orders:
             if row.ready_qty and row.ready_pieces and row.length_size:
@@ -885,25 +900,32 @@ class FinishWorkOrder(Document):
             return
         if entered >= required:
             return
+        when = (
+            frappe._("Save")
+            if self.flags.get("fwo_collect_errors")
+            else frappe._("submit")
+        )
         self._collect_save_error(
             frappe._(
                 "Raw Material qty {0} is less than required {1}. "
                 "Required RM = (Total Work Order Qty {2} + Scrap Qty {3}) / 0.975. "
-                "Increase Raw Materials to at least {1} before Save."
+                "Increase Raw Materials to at least {1} before {4}."
             ).format(
                 entered,
                 required,
                 flt(self.total_work_order_qty, precision),
                 flt(self.scrap_qty, precision),
+                when,
             ),
             title=frappe._("Insufficient Raw Material"),
         )
 
     def validate_stock_readiness(self):
-        """All stock-readiness checks — run on every manual Save.
+        """Stock-readiness checks for Save and Submit.
 
-        Errors are collected and shown together. Fetch auto-save never
-        reaches this method. Submit re-runs it as a backstop before posting.
+        Manual Save collects every error and shows them together.
+        Submit throws on the first error (original Approve behaviour).
+        Fetch auto-save never reaches this method.
         """
         precision = frappe.get_precision("Stock Entry Detail", "qty") or 3
         rm_pool = self._build_rm_consume_pool()
@@ -1011,16 +1033,25 @@ class FinishWorkOrder(Document):
                         validate_length_for_so_reservation,
                     )
 
-                    try:
+                    if self.flags.get("fwo_collect_errors"):
+                        try:
+                            validate_length_for_so_reservation(
+                                so_item,
+                                pwo.length_size,
+                                sales_order=pwo.sales_order,
+                                item_code=pwo.item,
+                            )
+                        except frappe.ValidationError as exc:
+                            self._collect_save_error(
+                                str(exc).strip()
+                                or frappe._("Row {0}: length is outside the Sales Order window.").format(pwo.idx)
+                            )
+                    else:
                         validate_length_for_so_reservation(
                             so_item,
                             pwo.length_size,
                             sales_order=pwo.sales_order,
                             item_code=pwo.item,
-                        )
-                    except frappe.ValidationError as exc:
-                        self._collect_save_error(
-                            str(exc).strip() or frappe._("Row {0}: length is outside the Sales Order window.").format(pwo.idx)
                         )
 
             if skip_consume:
@@ -1122,9 +1153,10 @@ class FinishWorkOrder(Document):
         self._raise_collected_save_errors()
 
     def before_submit(self):
-        # Re-run Save readiness as a backstop. Stock Entry / reservation
-        # failures still throw from the posting loop below.
-        self.flags.fwo_save_errors = []
+        # Original submit validations: throw on the first error.
+        # Save already collected the same checks; this is the Approve backstop.
+        # Stock Entry / reservation failures still throw from the posting loop.
+        self._set_validation_mode(collect=False)
         self.apply_quality_inspection_warehouses()
         self.update_remarks_from_so()
         # Refresh consumption / scrap shares before building the SE pool.
