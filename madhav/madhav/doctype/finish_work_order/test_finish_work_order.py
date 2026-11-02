@@ -204,6 +204,58 @@ class TestFwoEntryValues(unittest.TestCase):
 		self.assertTrue(any("overproduction" in e and "Qty" in e for e in errs))
 		self.assertTrue(any("overproduction" in e and "Pieces" in e for e in errs))
 
+	def test_calculated_qty_over_allowance_rejected(self):
+		# PEN-WO-00475 row 4: Qty 0.462, 100% → max 0.924. Ready 0.924 / 2 pcs
+		# is inside, but Calculated Qty 2 × 10.15 × 45.6 / 1000 = 0.926 is posted.
+		row = self._row(
+			qty=0.462, pieces=1, ready_qty=0.924, ready_pieces=2, length_size=10.15,
+			standard_weight=45.6, calculated_qty=0.926, sales_order="SO-1", deliver_as_qty=0,
+		)
+		errs = self._errors([row])
+		self.assertEqual(len(errs), 1)
+		self.assertIn("Calculated Qty 0.926", errs[0])
+
+	def test_calculated_qty_one_gram_over_is_rejected(self):
+		# 0.925 vs max 0.924 — no rounding allowance on the overproduction cap.
+		row = self._row(
+			qty=0.462, pieces=1, ready_qty=0.924, ready_pieces=2, length_size=10.15,
+			standard_weight=45.6, calculated_qty=0.925, sales_order="SO-1", deliver_as_qty=0,
+		)
+		errs = self._errors([row])
+		self.assertEqual(len(errs), 1)
+		self.assertIn("Calculated Qty 0.925", errs[0])
+
+	def test_calculated_qty_exactly_at_cap_passes(self):
+		row = self._row(
+			qty=0.462, pieces=1, ready_qty=0.924, ready_pieces=2, length_size=10.15,
+			standard_weight=45.5, calculated_qty=0.924, sales_order="SO-1", deliver_as_qty=0,
+		)
+		self.assertEqual(self._errors([row]), [])
+
+	def test_ready_qty_one_gram_over_is_rejected(self):
+		row = self._row(
+			qty=0.462, pieces=1, ready_qty=0.925, ready_pieces=2, length_size=10.15,
+			standard_weight=45.6, sales_order="SO-1", deliver_as_qty=1,
+		)
+		errs = self._errors([row])
+		self.assertEqual(len(errs), 1)
+		self.assertIn("Actual Ready Qty 0.925", errs[0])
+
+	def test_calculated_qty_ignored_when_deliver_as_qty(self):
+		# Deliver as Qty posts Actual Ready Qty, so Calculated Qty is not capped.
+		row = self._row(
+			qty=0.462, pieces=1, ready_qty=0.924, ready_pieces=2, length_size=10.15,
+			standard_weight=45.6, calculated_qty=0.926, sales_order="SO-1", deliver_as_qty=1,
+		)
+		self.assertEqual(self._errors([row]), [])
+
+	def test_calculated_qty_within_allowance_passes(self):
+		row = self._row(
+			qty=0.462, pieces=1, ready_qty=0.9, ready_pieces=2, length_size=10.15,
+			standard_weight=45.5, calculated_qty=0.924, sales_order="SO-1", deliver_as_qty=0,
+		)
+		self.assertEqual(self._errors([row]), [])
+
 	def test_unplanned_row_skips_overproduction(self):
 		errs = self._errors([self._row(make_it_unplanned=1, ready_qty=30, ready_pieces=150)])
 		self.assertEqual(errs, [])
