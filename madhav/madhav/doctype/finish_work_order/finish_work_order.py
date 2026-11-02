@@ -268,10 +268,154 @@ class FinishWorkOrder(Document):
                         ),
                         title=frappe._("Batch / Item Mismatch"),
                     )
+        # Row-level entry checks. The browser shows some of these as popups /
+        # red rows only; enforce them here so Save lists them and Submit
+        # (validate runs again) still blocks anything that slipped through.
+        self.validate_entry_values()
         # RM is user-entered and split by ready/basis qty. All stock-readiness
         # errors (RM pool, scrap, WH, dimensions) run on manual Save below —
         # not on Fetch auto-save, and not delayed until Approve.
         self.validate_stock_readiness()
+
+    def validate_entry_values(self):
+        """Reject invalid user entries on Pending WO, Raw Material and Scrap rows.
+
+        Mirrors the client-side rules in finish_work_order.js (overproduction
+        cap, ±20% section-weight band) and adds the basic sanity checks that
+        were missing (negative / fractional pieces, qty without pieces).
+        Rows with no Ready Qty and no Ready Pieces are not being finished and
+        are skipped.
+        """
+        precision = frappe.get_precision("Stock Entry Detail", "qty") or 3
+        dust = _stock_qty_dust(precision)
+        over_pct = flt(
+            frappe.db.get_single_value(
+                "Manufacturing Settings", "overproduction_percentage_for_work_order"
+            )
+        )
+        multiplier = 1 + over_pct / 100.0
+
+        for row in self.pending_work_orders or []:
+            ready_qty = flt(row.ready_qty)
+            ready_pcs = flt(row.ready_pieces)
+            length = flt(row.length_size)
+            label = frappe._("Pending Work Orders Row {0} ({1})").format(
+                row.idx, frappe.bold(row.item or row.work_order or "")
+            )
+
+            negatives = [
+                frappe._(field_label)
+                for field_label, value in (
+                    ("Actual Ready Qty", ready_qty),
+                    ("Ready Pieces", ready_pcs),
+                    ("Length Size", length),
+                )
+                if value < 0
+            ]
+            if negatives:
+                self._collect_save_error(
+                    frappe._("{0}: {1} cannot be negative.").format(
+                        label, ", ".join(negatives)
+                    ),
+                    title=frappe._("Invalid Entry"),
+                )
+                continue
+
+            if ready_qty <= 0 and ready_pcs <= 0:
+                continue
+
+            if ready_pcs != int(ready_pcs):
+                self._collect_save_error(
+                    frappe._("{0}: Ready Pieces must be a whole number, got {1}.").format(
+                        label, ready_pcs
+                    ),
+                    title=frappe._("Invalid Entry"),
+                )
+            if ready_qty > 0 and ready_pcs <= 0:
+                self._collect_save_error(
+                    frappe._(
+                        "{0}: Actual Ready Qty is {1} but Ready Pieces is 0. Enter Ready Pieces."
+                    ).format(label, ready_qty),
+                    title=frappe._("Invalid Entry"),
+                )
+            if ready_pcs > 0 and ready_qty <= 0:
+                self._collect_save_error(
+                    frappe._(
+                        "{0}: Ready Pieces is {1} but Actual Ready Qty is 0. Enter Actual Ready Qty."
+                    ).format(label, ready_pcs),
+                    title=frappe._("Invalid Entry"),
+                )
+            if length <= 0:
+                self._collect_save_error(
+                    frappe._("{0}: Length Size must be greater than 0.").format(label),
+                    title=frappe._("Invalid Entry"),
+                )
+
+            if not cint(row.make_it_unplanned):
+                max_qty = flt(row.qty) * multiplier
+                if flt(row.qty) > 0 and ready_qty - max_qty > dust:
+                    self._collect_save_error(
+                        frappe._(
+                            "{0}: Actual Ready Qty {1} is more than Qty {2} + {3}% overproduction (max {4})."
+                        ).format(label, ready_qty, flt(row.qty), over_pct, flt(max_qty, precision)),
+                        title=frappe._("Invalid Entry"),
+                    )
+                max_pcs = flt(row.pieces) * multiplier
+                if flt(row.pieces) > 0 and ready_pcs > max_pcs:
+                    self._collect_save_error(
+                        frappe._(
+                            "{0}: Ready Pieces {1} is more than Pieces {2} + {3}% overproduction (max {4})."
+                        ).format(label, ready_pcs, flt(row.pieces), over_pct, flt(max_pcs, 2)),
+                        title=frappe._("Invalid Entry"),
+                    )
+
+            standard = flt(row.standard_weight)
+            if ready_qty > 0 and ready_pcs > 0 and length > 0 and standard > 0:
+                section_weight = ready_qty * 1000 / (ready_pcs * length)
+                low, high = standard * 0.80, standard * 1.20
+                if section_weight < low or section_weight > high:
+                    self._collect_save_error(
+                        frappe._(
+                            "{0}: Calculated section weight {1} kg/m is outside ±20% of standard "
+                            "{2} kg/m (allowed {3} – {4}). Check Actual Ready Qty, Ready Pieces "
+                            "and Length Size."
+                        ).format(
+                            label,
+                            flt(section_weight, 3),
+                            standard,
+                            flt(low, 3),
+                            flt(high, 3),
+                        ),
+                        title=frappe._("Invalid Entry"),
+                    )
+
+        for row in self.raw_materials or []:
+            label = frappe._("Raw Materials Row {0}").format(row.idx)
+            if flt(row.qty) < 0 or flt(row.pieces) < 0:
+                self._collect_save_error(
+                    frappe._("{0}: Qty and Pieces cannot be negative.").format(label),
+                    title=frappe._("Invalid Entry"),
+                )
+            elif flt(row.qty) > 0 and not row.item_code:
+                self._collect_save_error(
+                    frappe._("{0}: Item is required when Qty is entered.").format(label),
+                    title=frappe._("Invalid Entry"),
+                )
+
+        for row in self.scrap_items or []:
+            label = frappe._("Scrap Items Row {0}").format(row.idx)
+            if flt(row.qty) < 0:
+                self._collect_save_error(
+                    frappe._("{0}: Qty cannot be negative.").format(label),
+                    title=frappe._("Invalid Entry"),
+                )
+            elif flt(row.qty) > 0 and (not row.item or not row.warehouse):
+                self._collect_save_error(
+                    frappe._("{0}: Item and Warehouse are required when Qty is entered.").format(
+                        label
+                    ),
+                    title=frappe._("Invalid Entry"),
+                )
 
     def update_totals(self):
         total_wo_qty = 0
