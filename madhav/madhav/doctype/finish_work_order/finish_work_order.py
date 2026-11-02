@@ -287,7 +287,6 @@ class FinishWorkOrder(Document):
         are skipped.
         """
         precision = frappe.get_precision("Stock Entry Detail", "qty") or 3
-        dust = _stock_qty_dust(precision)
         over_pct = flt(
             frappe.db.get_single_value(
                 "Manufacturing Settings", "overproduction_percentage_for_work_order"
@@ -352,12 +351,45 @@ class FinishWorkOrder(Document):
                 )
 
             if not cint(row.make_it_unplanned):
-                max_qty = flt(row.qty) * multiplier
-                if flt(row.qty) > 0 and ready_qty - max_qty > dust:
+                # Strict cap, compared at stock precision: anything above
+                # Qty × (1 + overproduction %) is rejected, even 0.001
+                # (e.g. 0.462 at 100% → 0.924 allowed, 0.925 rejected).
+                max_qty = flt(flt(row.qty) * multiplier, precision)
+                if flt(row.qty) > 0 and flt(ready_qty, precision) > max_qty:
                     self._collect_save_error(
                         frappe._(
                             "{0}: Actual Ready Qty {1} is more than Qty {2} + {3}% overproduction (max {4})."
                         ).format(label, ready_qty, flt(row.qty), over_pct, flt(max_qty, precision)),
+                        title=frappe._("Invalid Entry"),
+                    )
+                # Sales Order row with Deliver as Qty off posts Calculated Qty
+                # (pieces × length × standard weight), not Actual Ready Qty.
+                # That posted qty must respect the same overproduction cap,
+                # otherwise ensure_work_order_covers_fg silently raises WO.qty
+                # past the allowance (e.g. 0.462 → 0.926 with 100% = max 0.924).
+                posted_qty = flt(_pwo_basis_qty(row), precision)
+                if (
+                    flt(row.qty) > 0
+                    and row.sales_order
+                    and not cint(row.deliver_as_qty)
+                    and posted_qty > max_qty
+                ):
+                    self._collect_save_error(
+                        frappe._(
+                            "{0}: Calculated Qty {1} (Ready Pieces {2} × Length {3} × Standard "
+                            "Weight {4} / 1000) is more than Qty {5} + {6}% overproduction "
+                            "(max {7}). This row posts Calculated Qty to stock because Deliver "
+                            "as Qty is off. Reduce Ready Pieces."
+                        ).format(
+                            label,
+                            flt(posted_qty, precision),
+                            ready_pcs,
+                            length,
+                            flt(row.standard_weight),
+                            flt(row.qty),
+                            over_pct,
+                            flt(max_qty, precision),
+                        ),
                         title=frappe._("Invalid Entry"),
                     )
                 max_pcs = flt(row.pieces) * multiplier
