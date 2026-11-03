@@ -151,6 +151,8 @@ frappe.ui.form.on("Finish Work Order", {
 
                         row.sales_order = wo.sales_order;
 
+                        set_fwo_row_calculations(row);
+
                         if (wo.customer && wo.customer_name) {
                             frappe.utils.add_link_title(
                                 "Customer",
@@ -459,6 +461,20 @@ frappe.ui.form.on("Pending Work Orders", {
         update_fwo_work_order_totals(frm);
     }
 });
+
+function set_fwo_row_calculations(row) {
+    // Mirror server validate() (finish_work_order.py): same formula and the
+    // same guard, so Fetch shows Calculated Qty / Section Weight at once
+    // instead of 0 until a save. Direct assign - no set_value, so no
+    // overproduction popup or other row triggers fire here. Save recomputes.
+    if (!flt(row.ready_qty) || !flt(row.ready_pieces) || !flt(row.length_size)) {
+        return;
+    }
+    row.calculated_section_weight =
+        (flt(row.ready_qty) * 1000) / (flt(row.ready_pieces) * flt(row.length_size));
+    row.calculated_qty =
+        (flt(row.ready_pieces) * flt(row.standard_weight) * flt(row.length_size)) / 1000;
+}
 
 function update_fwo_work_order_totals(frm) {
     // Mirror server update_totals(): header Total WO Qty/Pieces = sum of

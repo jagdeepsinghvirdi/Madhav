@@ -264,6 +264,7 @@ frappe.ui.form.on("Batch Wise Reservation Tool", {
 						row.qty = item.qty;
 						row.pending_qty = item.pending_qty;
 						row.pieces = item.pieces;
+						row.reserved_pieces = item.reserved_pieces;
 						row.length = item.length;
 						row.section_weight = item.section_weight;
 						row.reserve_qty = item.reserve_qty;
@@ -325,6 +326,9 @@ frappe.ui.form.on("Sales Order Pending Line Items", {
 					d.pieces = batch.pieces;
 					d.length = batch.length;
 					d.section_weight = batch.section_weight;
+					// "-" when the batch has none: Frappe hides empty read-only
+					// fields, so a blank would make the field vanish. Display only.
+					d.assorted_length = batch.assorted_length || "-";
 					d.available_qty = batch.available_qty;
 					// store the pending row reference for exact matching in Reserve
 					d.sales_order_item = row.sales_order_item;

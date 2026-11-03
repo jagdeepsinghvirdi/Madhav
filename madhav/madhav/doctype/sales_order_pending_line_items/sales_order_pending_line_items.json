@@ -12,6 +12,7 @@
         "qty",
         "pending_qty",
         "pieces",
+        "reserved_pieces",
         "length",
         "column_break_hqvg",
         "section_weight",
@@ -69,6 +70,14 @@
         },
         {
             "columns": 1,
+            "fieldname": "reserved_pieces",
+            "fieldtype": "Int",
+            "in_list_view": 1,
+            "label": "Reserved Pcs",
+            "read_only": 1
+        },
+        {
+            "columns": 1,
             "fieldname": "fetch_batch",
             "fieldtype": "Button",
             "in_list_view": 1,
@@ -106,7 +115,7 @@
     "index_web_pages_for_search": 1,
     "istable": 1,
     "links": [],
-    "modified": "2026-08-06 17:30:17.994975",
+    "modified": "2026-11-03 12:00:00.000000",
     "modified_by": "Administrator",
     "module": "Madhav",
     "name": "Sales Order Pending Line Items",

@@ -906,7 +906,10 @@ def fetch_sales_order_items(filters):
 			"conversion_factor": conversion_factor,
 			"pending_qty": pending_stock_qty,
 			"reserve_qty": remaining,
-			"pieces": max(cint(row.pieces) - reserved_pieces.get(row.name, 0), 0),
+			# Pieces as entered on the Sales Order; what is already reserved is
+			# shown separately in "Reserved Pcs". Display only - reservation
+			# pieces always come from the batch.
+			"pieces": cint(row.pieces),
 			"ordered_pieces": cint(row.pieces),
 			"reserved_pieces": reserved_pieces.get(row.name, 0),
 			"length": row.length_size,
@@ -1054,9 +1057,16 @@ def fetch_available_batches(item_code, warehouse, pending_qty=0, reserve_qty=0):
 
 	batch_names = [d.batch for d in batch_stock]
 
+	batch_fields = ["name", "pieces", "average_length", "section_weight", "batch_qty"]
+	# Batch.assorted_length (T/L, F/L, R/L) is a site-level column, not defined
+	# in this app - only read it where it exists so the fetch never breaks.
+	has_assorted = frappe.db.has_column("Batch", "assorted_length")
+	if has_assorted:
+		batch_fields.append("assorted_length")
+
 	batch_details = frappe.db.get_all(
 		"Batch", filters={"name": ["in", batch_names], "disabled": 0},
-		fields=["name", "pieces", "average_length", "section_weight", "batch_qty"],
+		fields=batch_fields,
 	)
 	batch_map = {d.name: d for d in batch_details}
 
@@ -1096,6 +1106,7 @@ def fetch_available_batches(item_code, warehouse, pending_qty=0, reserve_qty=0):
 			"pieces": available_pieces,
 			"length": batch.average_length if batch else 0,
 			"section_weight": batch.section_weight if batch else 0,
+			"assorted_length": (batch.get("assorted_length") or "") if (batch and has_assorted) else "",
 			"actual_qty": actual_qty,
 			"reserved_qty": reserved_qty,
 			"available_qty": available_qty,
