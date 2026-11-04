@@ -1002,7 +1002,15 @@ def add_to_reservation_batches(
 	if available_pieces and final_pieces > available_pieces:
 		final_pieces = available_pieces
 
+	# Assorted Length straight from the batch (server-side, display only).
+	# "-" when the batch has none, same as Available Stock Batches: Frappe
+	# hides empty read-only fields. The DN reads the Batch itself, not this.
+	assorted_length = "-"
+	if batch_no and frappe.db.has_column("Batch", "assorted_length"):
+		assorted_length = frappe.db.get_value("Batch", batch_no, "assorted_length") or "-"
+
 	doc.append("reservation_batches", {
+		"assorted_length": assorted_length,
 		"sales_order": sales_order,
 		"sales_order_item": sales_order_item,
 		"sales_order_item_qty": sales_order_item_qty,
@@ -1032,6 +1040,7 @@ def add_to_reservation_batches(
 		"reserved_qty": flt(new_row.reserved_qty),
 		"reserved_pieces": flt(new_row.reserved_pieces),
 		"length": flt(new_row.length),
+		"assorted_length": new_row.get("assorted_length") or "",
 		"section_weight": flt(new_row.section_weight),
 		"is_tolerance": cint(new_row.is_tolerance),
 	}
