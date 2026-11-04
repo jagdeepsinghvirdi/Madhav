@@ -228,8 +228,47 @@ function fetch_batch_details_for_repack(frm, cdt, cdn) {
                 updates.qty = flt((pieces * avg_len * section_weight) / 1000, 4);
             }
 
-            Object.keys(updates).forEach((field) => {
-                frappe.model.set_value(cdt, cdn, field, updates[field]);
+            const apply = () => {
+                Object.keys(updates).forEach((field) => {
+                    frappe.model.set_value(cdt, cdn, field, updates[field]);
+                });
+            };
+
+            // Source (consumed) rows: Qty = the batch's actual free qty in the
+            // Source Warehouse (stock minus active reservations), not the
+            // pieces × length × weight formula. Target rows, rows without a
+            // Source Warehouse, or no free qty keep the formula (old flow).
+            if (!child.s_warehouse || !child.item_code) {
+                apply();
+                return;
+            }
+            frappe.call({
+                method: "madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool.get_batch_reservation_limits",
+                args: {
+                    item_code: child.item_code,
+                    warehouse: child.s_warehouse,
+                    batch_no: child.batch_no,
+                },
+                callback: (res) => {
+                    const free_qty = flt(res && res.message && res.message.qty);
+                    // Batch changed again while waiting: ignore stale reply.
+                    if (locals[cdt][cdn].batch_no !== child.batch_no) {
+                        return;
+                    }
+                    if (free_qty > 0) {
+                        updates.qty = free_qty;
+                    } else {
+                        frappe.show_alert({
+                            message: __("Batch {0} has no free qty in {1} (stock is reserved or empty).", [
+                                child.batch_no,
+                                child.s_warehouse,
+                            ]),
+                            indicator: "orange",
+                        });
+                    }
+                    apply();
+                },
+                error: () => apply(),
             });
         }
     );

@@ -168,6 +168,8 @@ def before_validate(self, method):
     # Previous flow ran change_qty_serial_and_batch only on insert (reserved weight).
     change_qty_serial_and_batch(self)
     _sync_dn_item_warehouse_to_reservation(self)
+    # Display only: reserved batch's Assorted Length on blank rows.
+    _fill_dn_assorted_length_from_reservations(self)
 
 
 def _custom_sre_name(row):
@@ -1337,6 +1339,62 @@ def get_ssb_bundle_for_voucher_from_sre(sre):
 	bundle.flags.ignore_permissions = True
 	bundle.save(ignore_permissions=True)
 	return bundle.name
+
+
+def _assorted_length_from_sre(sre_name):
+	"""Assorted Length (T/L, F/L, R/L) of the batch reserved on this SRE.
+
+	Several batches on one SRE: the one with the most undelivered qty wins.
+	Batch.assorted_length is a site-level column, so guard its existence.
+	"""
+	if not sre_name or not frappe.db.has_column("Batch", "assorted_length"):
+		return None
+	row = frappe.db.sql(
+		"""
+		select b.assorted_length
+		from `tabSerial and Batch Entry` sbe
+		inner join `tabBatch` b on b.name = sbe.batch_no
+		where sbe.parent = %s and sbe.parenttype = 'Stock Reservation Entry'
+		  and ifnull(b.assorted_length, '') != ''
+		order by (sbe.qty - ifnull(sbe.delivered_qty, 0)) desc, sbe.idx asc
+		limit 1
+		""",
+		sre_name,
+	)
+	return row[0][0] if row else None
+
+
+def _set_dn_assorted_length_from_sre(dn_item, sre_name, override=False):
+	"""Show the reserved batch's Assorted Length on the DN row.
+
+	override=True (Get Items from reserved stock): reserved batch value wins
+	over the SO value. override=False (every save): only fills a blank, so a
+	manual edit is never overwritten. Display field only - no qty/stock logic
+	reads it. Skips values the DN Item Select does not offer (e.g. R/L before
+	the ensure_assorted_length_rl_option patch) instead of failing the save.
+	"""
+	meta = frappe.get_meta("Delivery Note Item")
+	df = meta.get_field("assorted_length")
+	if not df:
+		return
+	if not override and dn_item.get("assorted_length"):
+		return
+	value = _assorted_length_from_sre(sre_name)
+	if not value:
+		return
+	if df.fieldtype == "Select" and value not in (df.options or "").split("\n"):
+		return
+	dn_item.assorted_length = value
+
+
+def _fill_dn_assorted_length_from_reservations(self):
+	"""Fill blank Assorted Length on draft DN rows from their linked SRE."""
+	if cint(self.docstatus) != 0 or cint(self.get("is_return")):
+		return
+	for row in self.get("items") or []:
+		sre_name = _custom_sre_name(row)
+		if sre_name:
+			_set_dn_assorted_length_from_sre(row, sre_name, override=False)
 
 
 def _apply_reserved_dims_to_dn_item(dn_item, so_item, sre):
@@ -4142,6 +4200,7 @@ def make_delivery_note_custom(source_name, target_doc=None, kwargs=None):
             dn_item.warehouse = sre.warehouse
             dn_item.custom_deliver_as_qty = so.deliver_as_qty
             _apply_reserved_dims_to_dn_item(dn_item, so_item, sre)
+            _set_dn_assorted_length_from_sre(dn_item, sre.name, override=True)
             formula_qty = _dn_qty_from_pcs_length_sw(dn_item)
             if formula_qty > 0:
                 dn_item.qty = formula_qty
