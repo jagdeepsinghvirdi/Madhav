@@ -3117,8 +3117,9 @@ def _fallback_snapshots_from_cancelled_sres(doc):
 	missing comment must not mean a permanently lost reservation.
 
 	Over-restoring is not a risk here: each snapshot is still capped by
-	_voucher_reservation_headroom, so entries whose qty is already covered
-	by an active reservation are skipped.
+	_snapshot_allowed_qty (the same SO allowance + free stock rule the
+	reservation was created under), so qty already covered by an active
+	reservation is not reserved twice.
 	"""
 	snapshots = []
 	seen_sre = set()
@@ -3190,13 +3191,20 @@ def restore_stock_reservations_after_cancel(doc):
 	prepared = _sort_snapshots_for_restore(prepared)
 
 	errors = []
+	# Reservations that could not come back in full - shown to the user after
+	# cancel instead of silently shrinking (they can re-reserve from BWRT).
+	short = []
 	for snapshot in prepared:
 		try:
 			if _snapshot_sre_still_active(snapshot):
 				if cint(snapshot.get("trimmed")):
 					_restore_trimmed_reservation(snapshot)
 				continue
-			_recreate_stock_reservation_from_snapshot(snapshot, exclude_dn=doc.name)
+			restored = flt(
+				_recreate_stock_reservation_from_snapshot(snapshot, exclude_dn=doc.name)
+			)
+			if restored + 0.001 < flt(snapshot.get("reserved_qty")):
+				short.append((snapshot, restored))
 		except Exception as e:
 			# Same item reserved from multiple SEs / warehouses can leave the
 			# SO line at or over capacity after reverse_sre_delivery. Blocking
@@ -3204,6 +3212,7 @@ def restore_stock_reservations_after_cancel(doc):
 			# BWRT) row — user can re-reserve from BWRT / Stock Transfer.
 			# Expected capacity skips must not write Error Log (slow + noisy).
 			if _is_reservation_capacity_error(e):
+				short.append((snapshot, 0))
 				continue
 			frappe.log_error(
 				title="DN Cancel - SRE Restore Error",
@@ -3226,6 +3235,42 @@ def restore_stock_reservations_after_cancel(doc):
 	# Only drop the snapshot after a full successful restore (retry-safe).
 	if comment_name:
 		frappe.delete_doc("Comment", comment_name, ignore_permissions=True, force=True)
+
+	if short:
+		_notify_partial_reservation_restore(doc.name, short)
+
+
+def _notify_partial_reservation_restore(delivery_note, short):
+	"""Tell the user which reservations came back short on DN cancel."""
+	rows = []
+	for snapshot, restored in short:
+		batches = ", ".join(
+			e.get("batch_no") for e in (snapshot.get("sb_entries") or []) if e.get("batch_no")
+		)
+		rows.append(
+			"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+				frappe.utils.escape_html(snapshot.get("voucher_no") or ""),
+				frappe.utils.escape_html(snapshot.get("item_code") or ""),
+				frappe.utils.escape_html(batches or "-"),
+				flt(snapshot.get("reserved_qty"), 3),
+				flt(restored, 3),
+			)
+		)
+	frappe.msgprint(
+		_(
+			"Delivery Note {0} is cancelled, but these reservations could not be "
+			"restored in full because the stock or the Sales Order allowance was "
+			"used by another entry after this Delivery Note was submitted. "
+			"Reserve the balance again from Batch Wise Reservation Tool."
+		).format(frappe.bold(delivery_note))
+		+ "<br><br><table class='table table-bordered'><tr><th>{}</th><th>{}</th>"
+		"<th>{}</th><th>{}</th><th>{}</th></tr>{}</table>".format(
+			_("Sales Order"), _("Item"), _("Batch"), _("Reserved Before"), _("Restored"),
+			"".join(rows),
+		),
+		title=_("Reservation Partly Restored"),
+		indicator="orange",
+	)
 
 
 def _sort_snapshots_for_restore(snapshots):
@@ -3354,6 +3399,33 @@ def _snapshot_qty_within_allowed_qty(
 	reserved_qty = flt(reserved_qty)
 	if reserved_qty <= 0 or not item_code or not warehouse:
 		return False
+	allowed_qty = _snapshot_allowed_qty(
+		item_code, warehouse, sales_order, so_detail, from_voucher_type, is_tolerance
+	)
+	return reserved_qty <= allowed_qty + 1e-9
+
+
+def _snapshot_allowed_qty(
+	item_code,
+	warehouse,
+	sales_order,
+	so_detail,
+	from_voucher_type,
+	is_tolerance,
+):
+	"""Max qty a restored SRE may take - the SAME rule the reservation was
+	created under (override StockReservationEntry.validate_with_allowed_qty):
+
+	- BWRT tolerance: free warehouse stock only.
+	- FWO / Stock Transfer: SO-wide Total SO Qty + allowance %.
+	- BWRT base / other: shared-pool SO line allowance (get_so_line_allowance).
+
+	Always capped by free warehouse stock. On a DN cancel nothing else changed,
+	so this equals the snapshot qty; it is only lower when stock or SO
+	allowance was used by something else between DN submit and cancel.
+	"""
+	if not item_code or not warehouse:
+		return 0
 
 	from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
 		get_available_qty_to_reserve,
@@ -3381,13 +3453,17 @@ def _snapshot_qty_within_allowed_qty(
 			)
 		allowed_qty = min(available_qty, flt(so_available_qty))
 
-	return reserved_qty <= allowed_qty + 1e-9
+	return max(flt(allowed_qty), 0)
 
 
 def _recreate_stock_reservation_from_snapshot(snapshot, exclude_dn=None):
+	"""Recreate one cancelled SRE from its DN-submit snapshot.
+
+	Returns the qty actually restored (0 when nothing could be restored).
+	"""
 	reserved_qty = flt(snapshot.get("reserved_qty"))
 	if reserved_qty <= 0:
-		return
+		return 0
 
 	sales_order = snapshot.get("voucher_no")
 	so_detail = snapshot.get("voucher_detail_no")
@@ -3407,35 +3483,31 @@ def _recreate_stock_reservation_from_snapshot(snapshot, exclude_dn=None):
 				flt(soi.qty) * flt(soi.conversion_factor or 1)
 			)
 
-	# Voucher capacity is SO-line-wide (all warehouses). BWRT rows are restored
-	# last (_sort_snapshots_for_restore) so primary FG/FWO reclaim capacity
-	# first. Skipping headroom for BWRT let recreate throw Allowed Qty and
-	# block DN cancel when the line was already full (same item, FG + Mill
-	# EXTRA / multiple Stock Entries).
+	# Restore exactly what was reserved before the DN (client rule), capped
+	# only by the SAME allowance the reservation was created under (shared SO
+	# pool for BWRT, SO-wide % for FWO / Stock Transfer) and free stock.
+	# The old per-line cap (_voucher_reservation_headroom: line qty x 1.2)
+	# was stricter than BWRT's shared pool, so a BWRT reservation above its
+	# own line qty came back cut down (2.55 -> 0.7716) or not at all (1.18).
+	# BWRT rows are still restored last (_sort_snapshots_for_restore) so
+	# primary FG/FWO reservations reclaim the pool first.
 	from_voucher_type = snapshot.get("from_voucher_type")
 	is_tolerance = cint(snapshot.get("custom_is_tolerance"))
-	if not (from_voucher_type == "Batch Wise Reservation Tool" and is_tolerance):
-		remaining_capacity = _voucher_reservation_headroom(
-			sales_order, so_detail, voucher_qty, exclude_dn=exclude_dn
-		)
-		if remaining_capacity <= 0:
-			return
-		if reserved_qty > remaining_capacity:
-			reserved_qty = remaining_capacity
-
-	# Match StockReservationEntry.validate_with_allowed_qty — if this qty
-	# cannot clear Allowed Qty, skip before insert/submit (same end state
-	# as the capacity-error catch in restore_stock_reservations_after_cancel).
-	if not _snapshot_qty_within_allowed_qty(
-		snapshot.get("item_code"),
-		warehouse,
-		sales_order,
-		so_detail,
-		reserved_qty,
-		from_voucher_type,
-		is_tolerance,
-	):
-		return
+	allowed_qty = flt(
+		_snapshot_allowed_qty(
+			snapshot.get("item_code"),
+			warehouse,
+			sales_order,
+			so_detail,
+			from_voucher_type,
+			is_tolerance,
+		),
+		3,
+	)
+	if allowed_qty <= 0:
+		return 0
+	if reserved_qty > allowed_qty:
+		reserved_qty = allowed_qty
 
 	delivered_qty = min(delivered_qty, reserved_qty)
 
@@ -3480,6 +3552,8 @@ def _recreate_stock_reservation_from_snapshot(snapshot, exclude_dn=None):
 			else 1.0
 		)
 
+		# Free stock still left per (warehouse, batch) while building entries.
+		batch_free_left = {}
 		# Preserve snapshot length/pieces on restore — these reflect the
 		# reservation state at DN submit/cancel, not a fresh batch pick.
 		for entry in sb_entries:
@@ -3488,11 +3562,38 @@ def _recreate_stock_reservation_from_snapshot(snapshot, exclude_dn=None):
 			entry_qty = flt(entry.get("qty")) * scale
 			if entry_qty <= 0:
 				continue
+			entry_scale = scale
 			entry_delivered = min(flt(entry.get("delivered_qty")) * scale, entry_qty)
-			# Scale pieces with qty when capacity capped a multi-batch restore.
+			# Never hold more of a batch open than is physically free in its
+			# warehouse now (another SO may have taken it after DN submit).
+			# Only the open part (qty - delivered) needs free stock; several
+			# rows of the same batch share one free figure.
+			if entry.get("batch_no"):
+				from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
+					get_batch_available_qty,
+				)
+
+				batch_key = (entry.get("warehouse") or warehouse, entry.get("batch_no"))
+				if batch_key not in batch_free_left:
+					batch_free_left[batch_key] = flt(
+						get_batch_available_qty(
+							snapshot.get("item_code"), batch_key[0], batch_key[1]
+						)
+					)
+				open_qty = entry_qty - entry_delivered
+				free = max(batch_free_left[batch_key], 0)
+				if open_qty > free + 1e-9:
+					orig_qty = flt(entry.get("qty"))
+					entry_qty = entry_delivered + free
+					entry_scale = (entry_qty / orig_qty) if orig_qty > 0 else 0
+					if entry_qty <= 0:
+						continue
+					open_qty = free
+				batch_free_left[batch_key] -= open_qty
+			# Scale pieces with qty when a cap reduced this batch's restore.
 			entry_pieces = flt(entry.get("pieces"))
-			if scale != 1.0 and entry_pieces:
-				entry_pieces = max(0, int(round(entry_pieces * scale)))
+			if abs(entry_scale - 1.0) > 1e-9 and entry_pieces:
+				entry_pieces = max(0, int(round(entry_pieces * entry_scale)))
 			sre.append(
 				"sb_entries",
 				{
@@ -3508,7 +3609,7 @@ def _recreate_stock_reservation_from_snapshot(snapshot, exclude_dn=None):
 			)
 
 		if not sre.sb_entries:
-			return
+			return 0
 
 		reserved_qty = sum(flt(e.qty) for e in sre.sb_entries)
 		sre.reserved_qty = reserved_qty
@@ -3555,6 +3656,8 @@ def _recreate_stock_reservation_from_snapshot(snapshot, exclude_dn=None):
 		sre.update_status()
 		sre.update_reserved_qty_in_voucher()
 		sre.update_reserved_stock_in_bin()
+
+	return flt(sre.reserved_qty)
 
 
 def cancel_stock_reconciliations_for_delivery_note(delivery_note, delete=False):
