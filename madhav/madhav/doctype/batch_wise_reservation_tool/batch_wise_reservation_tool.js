@@ -354,12 +354,32 @@ frappe.ui.form.on("Available Stock Batches", {
 			return;
 		}
 
-		// Match pending line by sales_order_item (exact), fallback to item_code
-		let pending = frm.doc.pending_line_items.find(r =>
-			batch.sales_order_item
-				? r.sales_order_item == batch.sales_order_item
-				: r.item_code == batch.item_code
-		);
+		// Match the pending line this batch was fetched for (sales_order_item,
+		// persisted on the row so a Save/reload cannot drop it). Fall back to
+		// item_code ONLY when the item is on a single pending line - picking
+		// the first of several lines reserved against the wrong SO line.
+		let pending = null;
+		if (batch.sales_order_item) {
+			pending = frm.doc.pending_line_items.find(
+				(r) => r.sales_order_item == batch.sales_order_item
+			);
+		} else {
+			const same_item = frm.doc.pending_line_items.filter(
+				(r) => r.item_code == batch.item_code
+			);
+			if (same_item.length > 1) {
+				frappe.msgprint({
+					title: __("Fetch Batch Again"),
+					indicator: "orange",
+					message: __(
+						"Item {0} is on {1} Sales Order lines, and this batch row does not say which line it was fetched for. Click Fetch Batch on the correct pending line again, then Reserve.",
+						[batch.item_code, same_item.length]
+					),
+				});
+				return;
+			}
+			pending = same_item[0];
+		}
 
 		if (!pending) {
 			frappe.msgprint(__("No matching pending line found for item {0}.", [batch.item_code]));
