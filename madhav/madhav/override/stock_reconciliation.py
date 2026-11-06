@@ -49,6 +49,14 @@ class StockReconciliation(_StockReconciliation):
             as_dict=True,
         )
 
+        if self._action == "cancel" and self.flags.get("madhav_dn_cancel"):
+            # Delivery Note cancel reverses its own shortfall reconciliation.
+            # The DN cancel has just put the delivered stock back, so taking
+            # out this SR's top-up leaves the batch exactly where it was
+            # before the DN. Reservations re-opened by that cancel are not a
+            # reason to block - only a real shortage is.
+            return self._validate_reserved_stock_for_dn_cancel(sre_rows, reco_keys)
+
         data = []
         for row in sre_rows:
             key = (row.item_code, row.warehouse, row.batch_no)
@@ -82,3 +90,78 @@ class StockReconciliation(_StockReconciliation):
             ).format(self._action, items_html)
 
         frappe.throw(msg, title=_("Stock Reservation"))
+
+    def _validate_reserved_stock_for_dn_cancel(self, sre_rows, reco_keys):
+        """Cancel of a Delivery Note's shortfall SR: block only a real shortage.
+
+        Stock left in the batch after this cancel = current batch qty minus
+        what this SR added (qty - current_qty on its row). The cancel may go
+        ahead when that still covers every open reservation on the batch.
+        """
+        reserved_by_key = {
+            (r.item_code, r.warehouse, r.batch_no): r for r in sre_rows
+        }
+
+        added_by_key = {}
+        for item in self.items:
+            if not item.batch_no:
+                continue
+            key = (item.item_code, item.warehouse, item.batch_no)
+            added_by_key[key] = added_by_key.get(key, 0) + (
+                flt(item.qty) - flt(item.current_qty)
+            )
+
+        data = []
+        for key in reco_keys:
+            res = reserved_by_key.get(key)
+            reserved_qty = flt(res.reserved_qty) if res else 0
+            if reserved_qty <= 0.001:
+                continue
+            item_code, warehouse, batch_no = key
+            batch_qty = flt(
+                frappe.db.sql(
+                    """
+                    select sum(sign(sle.actual_qty) * abs(sbe.qty))
+                    from `tabStock Ledger Entry` sle
+                    inner join `tabSerial and Batch Entry` sbe
+                        on sbe.parent = sle.serial_and_batch_bundle
+                    where sle.item_code = %s and sle.warehouse = %s
+                      and sle.is_cancelled = 0 and sbe.batch_no = %s
+                    """,
+                    (item_code, warehouse, batch_no),
+                )[0][0]
+                or 0
+            )
+            left_after_cancel = batch_qty - flt(added_by_key.get(key))
+            if reserved_qty > left_after_cancel + 0.001:
+                data.append([
+                    item_code,
+                    warehouse,
+                    batch_no,
+                    reserved_qty,
+                    left_after_cancel,
+                    res.sales_orders or "",
+                ])
+
+        if not data:
+            return
+
+        items_html = "".join(
+            "<li>{}</li>".format(
+                _(
+                    "Item {0} Batch {1} in Warehouse {2}: {3} reserved (Sales Order {4}) "
+                    "but only {5} would be left after this cancel"
+                ).format(
+                    bold(d[0]), bold(d[2]), bold(d[1]), bold(flt(d[3], 3)),
+                    bold(d[5] or "-"), bold(flt(d[4], 3)),
+                )
+            )
+            for d in data
+        )
+        frappe.throw(
+            _(
+                "This batch stock is reserved and would fall short after cancelling. "
+                "Un-reserve the extra qty, then cancel:<br><br>{0}"
+            ).format("<ul>" + items_html + "</ul>"),
+            title=_("Stock Reservation"),
+        )
