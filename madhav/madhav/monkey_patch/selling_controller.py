@@ -181,6 +181,110 @@ def _dn_item_delivered_batches(item):
 	return delivered
 
 
+SRE_DELIVERED_COMMENT_PREFIX = "MADHAV_DN_SRE_DELIVERED::"
+
+
+def _store_dn_sre_delivered_log(dn_name, log):
+	"""Record exactly what this Delivery Note delivered on each SRE.
+
+	Written on every submit (an empty list too) so cancel can tell a DN that
+	delivered nothing apart from a DN submitted before this record existed.
+	"""
+	import json
+
+	frappe.get_doc(
+		{
+			"doctype": "Comment",
+			"comment_type": "Info",
+			"reference_doctype": "Delivery Note",
+			"reference_name": dn_name,
+			"content": SRE_DELIVERED_COMMENT_PREFIX + json.dumps(log),
+		}
+	).insert(ignore_permissions=True)
+
+
+def _load_dn_sre_delivered_log(dn_name):
+	"""Return (log, comment_name), or (None, None) when the DN has no record."""
+	import json
+
+	rows = frappe.get_all(
+		"Comment",
+		filters={
+			"reference_doctype": "Delivery Note",
+			"reference_name": dn_name,
+			"comment_type": "Info",
+			"content": ["like", SRE_DELIVERED_COMMENT_PREFIX + "%"],
+		},
+		fields=["name", "content"],
+		order_by="creation desc",
+		limit=1,
+	)
+	if not rows:
+		return None, None
+	try:
+		log = json.loads(rows[0].content[len(SRE_DELIVERED_COMMENT_PREFIX):])
+	except Exception:
+		return None, None
+	return (log if isinstance(log, list) else None), rows[0].name
+
+
+def _undeliver_from_log(log):
+	"""Reverse exactly the deliveries this DN recorded on submit."""
+	by_sre = {}
+	for rec in log or []:
+		by_sre.setdefault(rec.get("sre"), []).append(rec)
+
+	for sre_name, recs in by_sre.items():
+		if not sre_name or cint(
+			frappe.db.get_value("Stock Reservation Entry", sre_name, "docstatus")
+		) != 1:
+			continue
+		sre_doc = frappe.get_doc("Stock Reservation Entry", sre_name)
+		entries = {e.name: e for e in (sre_doc.get("sb_entries") or [])}
+		total = 0.0
+		for rec in recs:
+			qty = flt(rec.get("qty"))
+			if qty <= 0:
+				continue
+			entry = entries.get(rec.get("entry")) if rec.get("entry") else None
+			if entry is not None:
+				undo = min(flt(entry.delivered_qty), qty)
+				if undo <= 0:
+					continue
+				entry.delivered_qty = flt(entry.delivered_qty) - undo
+				entry.db_update()
+				total += undo
+			elif not rec.get("entry"):
+				total += qty
+		total = min(total, flt(sre_doc.delivered_qty))
+		if total <= 0:
+			continue
+		sre_doc.delivered_qty = flt(sre_doc.delivered_qty) - total
+		sre_doc.db_update()
+		sre_doc.update_status()
+		sre_doc.update_reserved_stock_in_bin()
+
+
+def _reversible_line_delivery(so_detail, dn_name):
+	"""Old DNs (no delivered record): most this DN can have delivered on the
+	SO line's reservations = SRE delivered on the line - other DNs' delivery.
+	Stops a cancel from wiping an earlier Delivery Note's delivery."""
+	from madhav.doc_events.delivery_note import _delivered_qty_excluding_dn
+
+	line_delivered = flt(
+		frappe.db.sql(
+			"""
+			select coalesce(sum(delivered_qty), 0)
+			from `tabStock Reservation Entry`
+			where docstatus = 1 and voucher_type = 'Sales Order'
+			  and voucher_detail_no = %s
+			""",
+			so_detail,
+		)[0][0]
+	)
+	return max(line_delivered - flt(_delivered_qty_excluding_dn(so_detail, dn_name)), 0)
+
+
 def _sre_batch_nos(sre_doc):
 	if getattr(sre_doc, "reservation_based_on", None) != "Serial and Batch":
 		return set()
@@ -212,7 +316,12 @@ def update_stock_reservation_entries(self) -> None:
 
 	so_field = "sales_order" if self.doctype == "Sales Invoice" else "against_sales_order"
 
+	is_dn = self.doctype == "Delivery Note"
+
 	if self._action == "submit":
+		# Exactly what this DN delivers on each SRE, so cancel can reverse
+		# only that (and never an earlier Delivery Note's delivery).
+		delivered_log = []
 		for item in self.get("items"):
 			if not item.get(so_field) or not item.so_detail:
 				continue
@@ -251,6 +360,7 @@ def update_stock_reservation_entries(self) -> None:
 
 				sre_doc = frappe.get_doc("Stock Reservation Entry", sre)
 				qty_can_be_deliver = 0
+				log_len = len(delivered_log)
 
 				if sre_doc.reservation_based_on == "Serial and Batch":
 					sre_batches = _sre_batch_nos(sre_doc)
@@ -267,6 +377,7 @@ def update_stock_reservation_entries(self) -> None:
 							if entry.serial_no in serials_left:
 								entry.delivered_qty = 1
 								entry.db_update()
+								delivered_log.append({"sre": sre_doc.name, "entry": entry.name, "qty": 1})
 								qty_can_be_deliver += 1
 								qty_to_deliver -= 1
 								serials_left.remove(entry.serial_no)
@@ -289,6 +400,9 @@ def update_stock_reservation_entries(self) -> None:
 								continue
 							entry.delivered_qty = flt(entry.delivered_qty) + delivered_qty
 							entry.db_update()
+							delivered_log.append(
+								{"sre": sre_doc.name, "entry": entry.name, "qty": delivered_qty}
+							)
 							qty_can_be_deliver += delivered_qty
 							qty_to_deliver -= delivered_qty
 							delivered_batch_qty[entry.batch_no] = batch_left - delivered_qty
@@ -315,12 +429,33 @@ def update_stock_reservation_entries(self) -> None:
 				if qty_can_be_deliver <= 0:
 					continue
 
+				if len(delivered_log) == log_len:
+					# Header-only delivery (Qty-based SRE / no batch on row).
+					delivered_log.append(
+						{"sre": sre_doc.name, "entry": None, "qty": qty_can_be_deliver}
+					)
+
 				sre_doc.delivered_qty = flt(sre_doc.delivered_qty) + qty_can_be_deliver
 				sre_doc.db_update()
 				sre_doc.update_status()
 				sre_doc.update_reserved_stock_in_bin()
 
+		if is_dn and self.name:
+			_store_dn_sre_delivered_log(self.name, delivered_log)
+
 	if self._action == "cancel":
+		if is_dn:
+			log, comment_name = _load_dn_sre_delivered_log(self.name)
+			if log is not None:
+				_undeliver_from_log(log)
+				frappe.delete_doc("Comment", comment_name, ignore_permissions=True, force=True)
+				# Madhav reverse_sre_delivery_for_dn must not undo it again.
+				self.flags.madhav_sre_undelivered_from_log = True
+				return
+
+		# DN submitted before the delivered record existed: cap per SO line so
+		# an earlier Delivery Note's delivery is never reversed.
+		reversible_by_detail = {}
 		for item in self.get("items"):
 			if not item.get(so_field) or not item.so_detail:
 				continue
@@ -346,6 +481,13 @@ def update_stock_reservation_entries(self) -> None:
 				continue
 
 			qty_to_undelivered = flt(item.stock_qty)
+			if is_dn:
+				if item.so_detail not in reversible_by_detail:
+					reversible_by_detail[item.so_detail] = _reversible_line_delivery(
+						item.so_detail, self.name
+					)
+				qty_to_undelivered = min(qty_to_undelivered, reversible_by_detail[item.so_detail])
+				qty_before = qty_to_undelivered
 			batch_qty_to_undelivered = _dn_item_delivered_batches(item)
 			dn_batches = set(batch_qty_to_undelivered.keys())
 			serial_nos_to_undelivered = []
@@ -417,3 +559,8 @@ def update_stock_reservation_entries(self) -> None:
 				sre_doc.db_update()
 				sre_doc.update_status()
 				sre_doc.update_reserved_stock_in_bin()
+
+			if is_dn:
+				reversible_by_detail[item.so_detail] = max(
+					reversible_by_detail[item.so_detail] - (qty_before - qty_to_undelivered), 0
+				)

@@ -136,9 +136,11 @@ from frappe.utils import flt, get_datetime, add_to_date, nowtime
 def before_insert(self, method):
     fix_group_cost_center(self)
     populate_missing_batch_bundle(self)
-    apply_dn_qty_from_pcs_formula(self)
+    # Qty stays the reserved weight (previous flow restored, client Nov 2026).
+    # The Pcs × Length × SW formula now only fills the SW Qty column.
     change_qty_serial_and_batch(self)
     populate_missing_batch_bundle_from_si(self)
+    set_dn_sw_qty(self)
 
 def before_validate(self, method):
     """
@@ -163,11 +165,11 @@ def before_validate(self, method):
     # can carry a FIFO batch_no that is not the reserved batch; clear +
     # rebuild from SRE and stamp custom_sre so WH pin survives validate.
     populate_missing_batch_bundle(self)
-    apply_dn_qty_from_pcs_formula(self)
-    # Keep bundle weight in line with formula Qty when Pcs changes on a draft.
-    # Previous flow ran change_qty_serial_and_batch only on insert (reserved weight).
-    change_qty_serial_and_batch(self)
+    # Previous flow restored (client Nov 2026): Qty is not rebuilt from
+    # Pcs × Length × SW, and change_qty_serial_and_batch runs on insert only
+    # (reserved weight). The formula value is shown in SW Qty instead.
     _sync_dn_item_warehouse_to_reservation(self)
+    set_dn_sw_qty(self)
     # Display only: reserved batch's Assorted Length on blank rows.
     _fill_dn_assorted_length_from_reservations(self)
 
@@ -1500,14 +1502,35 @@ def _dn_qty_from_pcs_length_sw(item):
 	return flt((pieces * length * section_weight) / 1000, 4)
 
 
-def apply_dn_qty_from_pcs_formula(doc, method=None):
-	"""Stamp DN row Qty from Pcs × Length × SW (client Oct 2026).
+def _dn_sw_qty(item):
+	"""SW Qty = Pcs × row Length Size × Section Weight / 1000 (display only)."""
+	pieces = flt(getattr(item, "pieces", 0))
+	length = flt(getattr(item, "length_size", 0) or 0)
+	section_weight = flt(getattr(item, "section_weight", 0))
+	if pieces <= 0 or length <= 0 or section_weight <= 0:
+		return 0
+	return flt((pieces * length * section_weight) / 1000, 3)
 
-	Previous flow kept reserved-weight Qty and skipped this formula on
-	reserved / Deliver-as-Qty / bundle rows (0.445 → 0.443 drift). To
-	restore that, comment out the calls to this function in before_insert
-	and before_validate, and restore ``dn_item.qty = available_reserved …``
-	in make_delivery_note_custom.
+
+def set_dn_sw_qty(doc, method=None):
+	"""Fill Delivery Note Item.sw_qty from the row's Pcs, Length and SW.
+
+	Display only: Qty, stock, Invoice Qty tolerance and reconciliation keep
+	using Qty (reserved weight). Mirrored live in public/js/delivery_note.js.
+	"""
+	if not frappe.get_meta("Delivery Note Item").has_field("sw_qty"):
+		return
+	for item in doc.get("items") or []:
+		item.sw_qty = _dn_sw_qty(item)
+
+
+def apply_dn_qty_from_pcs_formula(doc, method=None):
+	"""NOT CALLED since Nov 2026 - kept so the Oct 2026 flow can be restored.
+
+	Stamped DN row Qty from Pcs × Length × SW (client Oct 2026). The client
+	then asked for the previous flow back (Qty = reserved weight) with the
+	formula shown separately in SW Qty (set_dn_sw_qty). To go back to the
+	Oct 2026 flow, call this again in before_insert / before_validate.
 	"""
 	if cint(getattr(doc, "is_return", 0)):
 		return
@@ -3674,6 +3697,10 @@ def cancel_stock_reconciliations_for_delivery_note(delivery_note, delete=False):
             sr = frappe.get_doc("Stock Reconciliation", sr_name)
             if sr.docstatus == 1:
                 sr.flags.ignore_permissions = True
+                # This SR only topped up stock for this DN; the DN cancel has
+                # put the delivered stock back. Let the reserved-stock check
+                # block only a real shortage (override StockReconciliation).
+                sr.flags.madhav_dn_cancel = True
                 sr.cancel()
 
             if delete and frappe.db.exists("Stock Reconciliation", sr_name):
@@ -4296,19 +4323,15 @@ def make_delivery_note_custom(source_name, target_doc=None, kwargs=None):
                 ignore_permissions=True,
             )
 
-            # Previous flow: Qty = undelivered reserved stock for this SRE.
-            # Restore the next line (and skip apply_dn_qty_from_pcs_formula)
-            # to return to reservation-weight Qty.
-            # dn_item.qty = available_reserved / flt(dn_item.conversion_factor or 1)
+            # qty from undelivered reserved stock for this SRE (previous flow,
+            # restored Nov 2026). Pcs × Length × SW goes to SW Qty only.
+            dn_item.qty = available_reserved / flt(dn_item.conversion_factor or 1)
             dn_item.warehouse = sre.warehouse
             dn_item.custom_deliver_as_qty = so.deliver_as_qty
             _apply_reserved_dims_to_dn_item(dn_item, so_item, sre)
             _set_dn_assorted_length_from_sre(dn_item, sre.name, override=True)
-            formula_qty = _dn_qty_from_pcs_length_sw(dn_item)
-            if formula_qty > 0:
-                dn_item.qty = formula_qty
-            else:
-                dn_item.qty = available_reserved / flt(dn_item.conversion_factor or 1)
+            if frappe.get_meta("Delivery Note Item").has_field("sw_qty"):
+                dn_item.sw_qty = _dn_sw_qty(dn_item)
             if sre.reservation_based_on == "Serial and Batch":
                 dn_item.serial_and_batch_bundle = get_ssb_bundle_for_voucher_from_sre(sre)
                 if dn_item.serial_and_batch_bundle:
