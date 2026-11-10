@@ -82,3 +82,37 @@ class TestProductionPlanQtyBuckets(FrappeTestCase):
 			remaining_qty_within_production_plan_bucket(140, 60, 60),
 			0,
 		)
+
+
+class TestPendingForNewProductionPlan(FrappeTestCase):
+	"""Delivery is subtracted once, not on top of what was already planned."""
+
+	def _pending(self, *args, **kwargs):
+		from madhav.madhav.override.production_plan import pending_for_new_production_plan
+
+		return pending_for_new_production_plan(*args, **kwargs)
+
+	def test_delivered_from_planned_production_not_double_counted(self):
+		self.assertEqual(self._pending(100, 60, 60), 40)
+
+	def test_planned_nothing_delivered(self):
+		self.assertEqual(self._pending(100, 60, 0), 40)
+
+	def test_bwrt_delivered_and_rest_planned(self):
+		self.assertEqual(self._pending(100, 70, 30, bwrt_open=0, bwrt_delivered=30), 0)
+
+	def test_bwrt_open_reservation(self):
+		self.assertEqual(self._pending(10, 5, 0, bwrt_open=2), 3)
+
+	def test_delivered_from_stock_without_plan(self):
+		self.assertEqual(self._pending(100, 0, 20), 80)
+
+	def test_fully_delivered_line(self):
+		self.assertEqual(self._pending(100, 0, 100), 0)
+		self.assertEqual(self._pending(100, 100, 100), 0)
+
+	def test_delivered_beyond_plan(self):
+		self.assertEqual(self._pending(100, 60, 80), 20)
+
+	def test_over_delivery_floors_at_zero(self):
+		self.assertEqual(self._pending(100, 0, 103), 0)
