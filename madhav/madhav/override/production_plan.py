@@ -94,6 +94,125 @@ def get_already_reserved_pieces(sales_order_item):
 	return total_pieces
 
 
+def get_bwrt_delivered_qty(sales_order_item):
+	"""Base qty already delivered out of Batch Wise Reservation Tool SREs.
+
+	That stock came from free stock, not from a Production Plan, so it must
+	not be matched against ``production_plan_qty``.
+	"""
+	tolerance_filter = (
+		"and ifnull(custom_is_tolerance, 0) = 0"
+		if frappe.db.has_column("Stock Reservation Entry", "custom_is_tolerance")
+		else ""
+	)
+	return flt(
+		frappe.db.sql(
+			f"""
+			select sum(delivered_qty)
+			from `tabStock Reservation Entry`
+			where voucher_type = 'Sales Order'
+				and voucher_detail_no = %s
+				and docstatus = 1
+				and from_voucher_type = 'Batch Wise Reservation Tool'
+				{tolerance_filter}
+			""",
+			sales_order_item,
+		)[0][0]
+		or 0
+	)
+
+
+def get_bwrt_delivered_pieces(sales_order_item):
+	"""Pieces already delivered out of Batch Wise Reservation Tool SREs."""
+	sbr_tolerance_filter = (
+		"and ifnull(sbr.is_tolerance, 0) = 0"
+		if frappe.db.has_column("Staged Batch Reservations Verification", "is_tolerance")
+		else ""
+	)
+	sre_tolerance_filter = (
+		"and ifnull(sre.custom_is_tolerance, 0) = 0"
+		if frappe.db.has_column("Stock Reservation Entry", "custom_is_tolerance")
+		else ""
+	)
+	rows = frappe.db.sql(
+		f"""
+		select sbr.reserved_qty as staged_qty, sbr.reserved_pieces as staged_pieces,
+			sre.delivered_qty as delivered_qty
+		from `tabStaged Batch Reservations Verification` sbr
+		inner join `tabBatch Wise Reservation Tool` bwrt on bwrt.name = sbr.parent
+		inner join `tabStock Reservation Entry` sre
+			on sre.from_voucher_type = 'Batch Wise Reservation Tool'
+			and sre.from_voucher_detail_no = sbr.name
+			and sre.docstatus = 1
+			{sre_tolerance_filter}
+		where sbr.sales_order_item = %s and bwrt.docstatus = 1
+			{sbr_tolerance_filter}
+		""",
+		sales_order_item,
+		as_dict=True,
+	)
+	total = 0.0
+	for r in rows:
+		staged_qty = flt(r.staged_qty)
+		if staged_qty <= 0 or flt(r.delivered_qty) <= 0:
+			continue
+		total += flt(r.staged_pieces) * min(1, flt(r.delivered_qty) / staged_qty)
+	return total
+
+
+def get_delivered_pieces(sales_order_item):
+	"""Pieces delivered against the SO line (submitted DNs and stock-updating
+	Sales Invoices), net of returns."""
+	total = 0.0
+	queries = [
+		"""
+		select sum(case when dn.is_return = 1 then -abs(ifnull(dni.pieces, 0))
+			else ifnull(dni.pieces, 0) end)
+		from `tabDelivery Note Item` dni
+		inner join `tabDelivery Note` dn on dn.name = dni.parent
+		where dni.so_detail = %s and dn.docstatus = 1
+		""",
+	]
+	if frappe.db.has_column("Sales Invoice Item", "pieces"):
+		queries.append(
+			"""
+			select sum(case when si.is_return = 1 then -abs(ifnull(sii.pieces, 0))
+				else ifnull(sii.pieces, 0) end)
+			from `tabSales Invoice Item` sii
+			inner join `tabSales Invoice` si on si.name = sii.parent
+			where sii.so_detail = %s and si.docstatus = 1
+				and si.update_stock = 1 and ifnull(sii.delivery_note, '') = ''
+			"""
+		)
+	for query in queries:
+		total += flt(frappe.db.sql(query, sales_order_item)[0][0] or 0)
+	return max(0, total)
+
+
+def pending_for_new_production_plan(
+	so_qty, production_plan_qty, delivered, bwrt_open=0, bwrt_delivered=0
+):
+	"""Qty (or pieces) of an SO line still to put on a new Production Plan.
+
+	Delivery is counted once: what left through a planned Work Order is
+	already inside ``production_plan_qty``, so only the larger of the two
+	is subtracted. Batch Wise Reservation Tool stock (open or delivered)
+	came from free stock and is subtracted on top.
+
+	SO 100, PP 60, 60 delivered from production -> 40 (not 0).
+	SO 100, BWRT 30 delivered, PP 70            -> 0.
+	SO 100, no PP, 20 delivered from stock      -> 80.
+	"""
+	delivered_outside_bwrt = max(0, flt(delivered) - flt(bwrt_delivered))
+	return max(
+		0,
+		flt(so_qty)
+		- max(flt(production_plan_qty), delivered_outside_bwrt)
+		- flt(bwrt_open)
+		- flt(bwrt_delivered),
+	)
+
+
 def remaining_qty_for_new_production_plan(
 	pending_stock_qty, production_plan_qty, reserved_qty=0
 ):
@@ -136,14 +255,23 @@ def get_remaining_unreserved_stock_qty(sales_order_item):
 	if not so_item:
 		return 0
 	conversion_factor = flt(so_item.conversion_factor) or 1
-	pending_stock_qty = (
-		(flt(so_item.stock_qty) or flt(so_item.qty) * conversion_factor)
-		- flt(so_item.delivered_qty) * conversion_factor
-	)
-	return remaining_qty_for_new_production_plan(
-		pending_stock_qty,
+	return pending_for_new_production_plan(
+		flt(so_item.stock_qty) or flt(so_item.qty) * conversion_factor,
 		so_item.production_plan_qty,
+		flt(so_item.delivered_qty) * conversion_factor,
 		get_already_reserved_qty(sales_order_item),
+		get_bwrt_delivered_qty(sales_order_item),
+	)
+
+
+def get_remaining_pieces_for_new_production_plan(sales_order_item, so_pieces, production_plan_pieces):
+	"""Pieces still to plan, using the same rule as the qty."""
+	return pending_for_new_production_plan(
+		so_pieces,
+		production_plan_pieces,
+		get_delivered_pieces(sales_order_item),
+		get_already_reserved_pieces(sales_order_item),
+		get_bwrt_delivered_pieces(sales_order_item),
 	)
 
 
@@ -358,10 +486,10 @@ class CustomProductionPlan(ERPNextProductionPlan):
 				if so_item_row:
 					row.pending_pieces = so_item_row.production_plan_pieces or 0
 
-					row.pieces = remaining_qty_for_new_production_plan(
+					row.pieces = get_remaining_pieces_for_new_production_plan(
+						row.sales_order_item,
 						flt(so_item_row.pieces or 0),
 						flt(so_item_row.production_plan_pieces or 0),
-						get_already_reserved_pieces(row.sales_order_item),
 					)
 
 					row.assorted_length = so_item_row.assorted_length
@@ -438,14 +566,20 @@ def custom_get_sales_orders(self):
 			so.name,
 			so.transaction_date,
 			so.customer,
-			so.base_grand_total
+			so.base_grand_total,
+			so_item.name.as_("so_detail"),
+			so_item.qty.as_("so_line_qty"),
+			so_item.pieces.as_("so_line_pieces"),
+			so_item.production_plan_pieces.as_("so_line_pp_pieces"),
 		)
 		.distinct()
 		.where(
 			(so.docstatus == 1)
-			& (so.status.notin(["Stopped", "Closed"]))
+			& (so.status.notin(["Stopped", "Closed", "Completed"]))
 			& (so.company == self.company)
 			& (so_item.qty > so_item.production_plan_qty)
+			# Fully delivered lines have nothing left to produce.
+			& (so_item.qty > so_item.delivered_qty)
 		)
 	)
 
@@ -482,4 +616,31 @@ def custom_get_sales_orders(self):
 
 	open_so = open_so_query.run(as_dict=True)
 
-	return open_so
+	# Keep an SO only when at least one matching line still has qty or
+	# pieces to plan after deliveries, plans and reservations - the same
+	# rule Get Items uses to keep a row.
+	result, seen = [], set()
+	for row in open_so:
+		if row.name in seen:
+			continue
+		qty_left = get_remaining_unreserved_stock_qty(row.so_detail)
+		pieces_left = (
+			get_remaining_pieces_for_new_production_plan(
+				row.so_detail, flt(row.so_line_pieces), flt(row.so_line_pp_pieces)
+			)
+			if flt(row.so_line_pieces) > 0
+			else 0
+		)
+		if qty_left <= 0 and pieces_left <= 0:
+			continue
+		seen.add(row.name)
+		result.append(
+			frappe._dict(
+				name=row.name,
+				transaction_date=row.transaction_date,
+				customer=row.customer,
+				base_grand_total=row.base_grand_total,
+			)
+		)
+
+	return result
