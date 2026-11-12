@@ -34,7 +34,8 @@ CLOSED_SO_STATUSES = ("Closed", "Completed", "On Hold", "Cancelled")
 class PartyTransfer(Document):
 	def validate(self):
 		self.set_destination_details()
-		if self.docstatus == 0:
+		if self.docstatus == 0 or self.is_new():
+			# Every open reservation is listed; keep only the rows given a qty.
 			self.set("items", [row for row in self.items if flt(row.transfer_qty) > 0])
 		if not self.items:
 			frappe.throw(_("Enter the quantity to move on at least one reservation row."))
@@ -204,6 +205,10 @@ class PartyTransfer(Document):
 		fully_moved = flt(sre.delivered_qty) <= QTY_EPSILON and abs(open_total - flt(row.transfer_qty)) <= QTY_EPSILON
 		if fully_moved:
 			sre.flags.ignore_permissions = True
+			# This transfer's own row links to the reservation; that link is
+			# the record of the move, not a reason to block it.
+			sre.flags.ignore_links = True
+			sre.ignore_linked_doctypes = ["Party Transfer"]
 			sre.cancel()
 			row.db_set("source_cancelled", 1)
 		else:

@@ -461,6 +461,12 @@ class CustomProductionPlan(ERPNextProductionPlan):
 				flt(item.qty)
 				- max(item.work_order_qty, item.delivered_qty, 0)
 			) * item.conversion_factor
+			# ERPNext's add_items() skips rows with no pending qty. A line
+			# whose Work Orders cover its whole qty can still need planning
+			# after a Work Order release or a Party Transfer, so give it the
+			# remaining qty now (the loop below sets the final figure).
+			if item.name in reduced_lines:
+				item.pending_qty = get_remaining_unreserved_stock_qty(item.name)
 
 		pi = frappe.qb.DocType("Packed Item")
 
