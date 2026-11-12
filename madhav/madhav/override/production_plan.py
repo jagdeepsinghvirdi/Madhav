@@ -250,10 +250,13 @@ def pending_for_new_production_plan(
 	delivered_outside_bwrt = max(0, flt(delivered) - flt(bwrt_delivered))
 	return max(
 		0,
-		flt(so_qty)
-		- max(flt(production_plan_qty), delivered_outside_bwrt)
-		- flt(bwrt_open)
-		- flt(bwrt_delivered),
+		flt(
+			flt(so_qty)
+			- max(flt(production_plan_qty), delivered_outside_bwrt)
+			- flt(bwrt_open)
+			- flt(bwrt_delivered),
+			6,
+		),
 	)
 
 
