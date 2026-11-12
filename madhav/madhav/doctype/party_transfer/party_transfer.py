@@ -18,6 +18,9 @@ like a Batch Wise Reservation Tool reservation.
 """
 
 import frappe
+from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
+	get_available_qty_to_reserve,
+)
 from frappe import _
 from frappe.model.document import Document
 from frappe.utils import cint, flt
@@ -236,6 +239,9 @@ class PartyTransfer(Document):
 			sre.custom_is_tolerance = 0
 		sre.reserved_qty = flt(row.transfer_qty, 3)
 		sre.available_qty_to_reserve = flt(row.transfer_qty, 3)
+		# Mandatory on Stock Reservation Entry: free stock of the item in the
+		# warehouse, which now includes what the source reservation let go.
+		sre.available_qty = flt(get_available_qty_to_reserve(self.item_code, row.warehouse), 3)
 
 		if row.batch_no:
 			sre.has_batch_no = 1
@@ -261,6 +267,17 @@ class PartyTransfer(Document):
 		sre.flags.ignore_permissions = True
 		sre.insert()
 		sre.submit()
+
+		# With partial reservation allowed, ERPNext may quietly reserve less
+		# than asked. Never take more from A than B actually received.
+		reserved = flt(frappe.db.get_value("Stock Reservation Entry", sre.name, "reserved_qty"), 3)
+		if reserved < flt(row.transfer_qty, 3) - QTY_EPSILON:
+			frappe.throw(
+				_(
+					"Row #{0}: only {1} of {2} could be reserved for {3} from batch {4}. "
+					"Nothing was moved."
+				).format(row.idx, reserved, flt(row.transfer_qty, 3), self.to_sales_order, row.batch_no or "-")
+			)
 		row.db_set("new_stock_reservation_entry", sre.name)
 
 	def report_destination_excess(self):
@@ -490,6 +507,7 @@ def recreate_reservation(cancelled_sre, row):
 	new.delivered_qty = 0
 	new.reserved_qty = flt(row.transfer_qty, 3)
 	new.available_qty_to_reserve = flt(row.transfer_qty, 3)
+	new.available_qty = flt(get_available_qty_to_reserve(new.item_code, new.warehouse), 3)
 	if new.reservation_based_on == "Serial and Batch":
 		new.set("sb_entries", [])
 		new.append(
