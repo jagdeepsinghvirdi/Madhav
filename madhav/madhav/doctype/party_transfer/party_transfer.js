@@ -5,6 +5,9 @@ const PT_METHOD = "madhav.madhav.doctype.party_transfer.party_transfer";
 
 frappe.ui.form.on("Party Transfer", {
 	setup(frm) {
+		// Cancelling the transfer cancels its reservations and gives A's back
+		// in one step; the form must not cancel the reservations on their own.
+		frm.ignore_doctypes_on_cancel_all = ["Stock Reservation Entry"];
 		frm.set_query("to_sales_order", () => ({
 			filters: {
 				docstatus: 1,
@@ -16,7 +19,14 @@ frappe.ui.form.on("Party Transfer", {
 	refresh(frm) {
 		if (frm.doc.docstatus === 0 && frm.doc.to_sales_order) {
 			// Opened from a Sales Order: pick its line straight away if it has one.
-			party_transfer_load_lines(frm, !frm.doc.to_sales_order_item);
+			party_transfer_load_lines(frm, !frm.doc.to_sales_order_item).then(() => {
+				// An amended copy may point at reservations that no longer exist
+				// (a fully moved one is recreated under a new name on cancel).
+				if (frm.is_new() && frm.doc.amended_from && frm.doc.to_sales_order_item && !frm.__pt_reloaded) {
+					frm.__pt_reloaded = true;
+					party_transfer_load_reservations(frm);
+				}
+			});
 		}
 		frm.set_df_property("to_line", "read_only", frm.doc.docstatus !== 0);
 
@@ -33,6 +43,9 @@ frappe.ui.form.on("Party Transfer", {
 			frm.add_custom_button(__("Party Transfer Register"), () => {
 				frappe.set_route("query-report", "Party Transfer Register", {
 					party_transfer: frm.doc.name,
+					from_date: frm.doc.posting_date,
+					to_date: frm.doc.posting_date,
+					include_cancelled: frm.doc.docstatus === 2 ? 1 : 0,
 				});
 			});
 		}
@@ -70,12 +83,17 @@ frappe.ui.form.on("Party Transfer Item", {
 			frappe.model.set_value(cdt, cdn, "transfer_qty", row.available_qty);
 			return;
 		}
+		// Same rule as the server: proportional, at least one, and a part
+		// move leaves at least one piece behind.
 		let pieces = 0;
-		if (flt(row.available_qty) > 0 && flt(row.available_pieces) > 0) {
-			pieces =
-				qty + 0.0005 >= flt(row.available_qty)
-					? flt(row.available_pieces)
-					: Math.round((flt(row.available_pieces) * qty) / flt(row.available_qty));
+		const open = cint(row.available_pieces);
+		if (qty > 0 && flt(row.available_qty) > 0 && open > 0) {
+			if (qty + 0.0005 >= flt(row.available_qty)) {
+				pieces = open;
+			} else {
+				pieces = Math.round((open * qty) / flt(row.available_qty));
+				pieces = open > 1 ? Math.max(1, Math.min(pieces, open - 1)) : 1;
+			}
 		}
 		frappe.model.set_value(cdt, cdn, "transfer_pieces", pieces);
 		party_transfer_set_totals(frm);
@@ -100,7 +118,11 @@ function party_transfer_load_lines(frm, auto_pick) {
 	return frappe
 		.call({ method: `${PT_METHOD}.get_order_lines`, args: { sales_order: frm.doc.to_sales_order } })
 		.then((r) => {
-			const lines = r.message || [];
+			const res = r.message || {};
+			const lines = res.lines || [];
+			if (res.company && frm.doc.company !== res.company) {
+				frm.set_value("company", res.company);
+			}
 			const map = {};
 			const options = [""];
 			lines.forEach((l) => {
@@ -122,6 +144,10 @@ function party_transfer_load_lines(frm, auto_pick) {
 			frm.set_df_property("to_line", "options", choices);
 			// The Autocomplete control searches its own data list, not df.options.
 			frm.fields_dict.to_line.set_data(choices);
+			// Large orders: let the search reach every line, not just the first 99.
+			if (frm.fields_dict.to_line.awesomplete) {
+				frm.fields_dict.to_line.awesomplete.maxItems = Math.max(choices.length, 10);
+			}
 
 			// Keep the current pick, or pick the only line / the routed line.
 			const current = Object.keys(map).find((k) => map[k] === frm.doc.to_sales_order_item);

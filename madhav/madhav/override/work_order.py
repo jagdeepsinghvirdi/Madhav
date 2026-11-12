@@ -44,19 +44,55 @@ class WorkOrder(ERPNextWorkOrder):
 
     def on_close_or_cancel(self):
         super().on_close_or_cancel()
-        # Cancel already gives all the pieces back (revert_so_pieces_from_work_order).
-        # Close gives back only the pieces that were never made.
-        if self.status == "Closed" and self.sales_order_item and self.get("production_plan"):
-            unmade = max(0, flt(self.get("pieces")) - flt(self.get("completed_pcs")))
-            if unmade:
-                current = flt(frappe.db.get_value("Sales Order Item", self.sales_order_item, "work_order_pieces"))
-                frappe.db.set_value(
-                    "Sales Order Item",
-                    self.sales_order_item,
-                    "work_order_pieces",
-                    max(0, current - unmade),
-                    update_modified=False,
-                )
+        # Close gives back only the pieces never made; recount from the Work
+        # Orders so repeated closes or a later cancel can't drift.
+        if self.status == "Closed" and self.sales_order_item:
+            from madhav.doc_events.work_order import recompute_work_order_pieces
+
+            recompute_work_order_pieces(self.sales_order_item)
+
+    def validate_qty(self):
+        super().validate_qty()
+        self.validate_released_plan_qty()
+
+    def validate_released_plan_qty(self):
+        """A plan row that gave quantity back to its Sales Order (cancelled
+        Work Order) can't make a Work Order for that quantity again: it is
+        offered to a new Production Plan instead, and making it from the old
+        row too would plan it twice."""
+        if (
+            self.docstatus != 0
+            or not self.production_plan_item
+            or self.production_plan_sub_assembly_item
+            or self.flags.get("party_transfer_replacement")
+        ):
+            return
+        from madhav.madhav.utils.production_demand import get_plan_row_cancel_release
+
+        released = get_plan_row_cancel_release(self.production_plan_item, exclude_work_order=self.name)
+        if released.qty <= 0.0005:
+            return
+        planned = flt(frappe.db.get_value("Production Plan Item", self.production_plan_item, "planned_qty"))
+        ordered = flt(
+            frappe.db.sql(
+                """select ifnull(sum(qty), 0) from `tabWork Order`
+                where production_plan_item = %s and docstatus = 1 and name != %s""",
+                (self.production_plan_item, self.name or ""),
+            )[0][0]
+        )
+        allowance = flt(frappe.db.get_single_value("Manufacturing Settings", "overproduction_percentage_for_work_order"))
+        open_qty = max(0.0, planned - ordered - released.qty)
+        max_qty = flt(open_qty * (1 + allowance / 100), 3)
+        if flt(self.qty) > max_qty + 0.0005:
+            frappe.throw(
+                frappe._(
+                    "{0} of Production Plan {1} was given back to Sales Order {2} when its Work Order was "
+                    "cancelled. Plan it on a new Production Plan. This plan row can still make {3}."
+                ).format(
+                    flt(released.qty, 3), self.production_plan, self.sales_order, max_qty
+                ),
+                title=frappe._("Quantity already released"),
+            )
 
 @frappe.whitelist()
 def make_stock_entry(work_order_id, purpose, qty=None, target_warehouse=None):

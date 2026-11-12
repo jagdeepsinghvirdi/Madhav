@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+
 import frappe
 from frappe import _
 from erpnext.manufacturing.doctype.production_plan.production_plan import ProductionPlan as ERPNextProductionPlan
@@ -23,6 +25,21 @@ from madhav.madhav.utils.production_demand import (
 
 
 INCHES_PER_METER = 39.37
+
+
+@contextmanager
+def demand_cache():
+	"""Per-call cache for effective-planned figures (Get Items / Get Sales Orders).
+
+	Lines without a Work Order release or transfer skip the extra queries
+	(frappe.flags.pp_reduced_lines is set by the caller inside).
+	"""
+	frappe.flags.pp_demand_cache = {}
+	try:
+		yield
+	finally:
+		frappe.flags.pp_demand_cache = None
+		frappe.flags.pp_reduced_lines = None
 
 def meters_to_inches(value):
 	try:
@@ -296,6 +313,7 @@ def get_remaining_unreserved_stock_qty(sales_order_item):
 			"conversion_factor",
 			"delivered_qty",
 			"production_plan_qty",
+			"production_plan_pieces",
 		],
 		as_dict=True,
 	)
@@ -305,7 +323,7 @@ def get_remaining_unreserved_stock_qty(sales_order_item):
 	# Planned production that Work Orders released (closed / cancelled) or
 	# that a Party Transfer gave to another order no longer covers this line.
 	effective_planned = get_effective_planned(
-		sales_order_item, so_item.production_plan_qty
+		sales_order_item, so_item.production_plan_qty, so_item.production_plan_pieces
 	).qty
 	return pending_for_new_production_plan(
 		flt(so_item.stock_qty) or flt(so_item.qty) * conversion_factor,
@@ -319,7 +337,7 @@ def get_remaining_unreserved_stock_qty(sales_order_item):
 def get_remaining_pieces_for_new_production_plan(sales_order_item, so_pieces, production_plan_pieces):
 	"""Pieces still to plan, using the same rule as the qty."""
 	effective_planned_pieces = get_effective_planned(
-		sales_order_item, 0, production_plan_pieces
+		sales_order_item, None, production_plan_pieces
 	).pieces
 	return pending_for_new_production_plan(
 		so_pieces,
@@ -347,14 +365,16 @@ class CustomProductionPlan(ERPNextProductionPlan):
 	def get_items(self):
 		self.set("po_items", [])
 		if self.get_items_from == "Sales Order":
-			self.custom_get_so_items()
+			with demand_cache():
+				self.custom_get_so_items()
 		elif self.get_items_from == "Material Request":
 			self.get_mr_items()
 
 	@frappe.whitelist()
 	def get_open_sales_orders(self):
 		"""Pull sales orders which are pending to deliver based on criteria selected"""
-		open_so = custom_get_sales_orders(self)
+		with demand_cache():
+			open_so = custom_get_sales_orders(self)
 		if open_so:
 			self.add_so_in_table(open_so)
 		else:
@@ -410,6 +430,7 @@ class CustomProductionPlan(ERPNextProductionPlan):
 				pluck="name",
 			)
 		)
+		frappe.flags.pp_reduced_lines = reduced_lines
 		if reduced_lines:
 			open_to_plan = open_to_plan | so_item.name.isin(list(reduced_lines))
 
@@ -638,7 +659,8 @@ def custom_get_sales_orders(self):
 	# plan after a Work Order release or a Party Transfer; the remaining
 	# qty rule further down decides per line.
 	open_to_plan = so_item.qty > so_item.production_plan_qty
-	reduced_lines = lines_with_planned_reductions()
+	reduced_lines = lines_with_planned_reductions(open_orders_only=True)
+	frappe.flags.pp_reduced_lines = reduced_lines
 	if reduced_lines:
 		open_to_plan = open_to_plan | so_item.name.isin(list(reduced_lines))
 

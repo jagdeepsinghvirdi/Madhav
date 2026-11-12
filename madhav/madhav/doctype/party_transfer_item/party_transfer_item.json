@@ -8,7 +8,7 @@
  "module": "Madhav",
  "name": "Party Transfer Item",
  "owner": "Administrator",
- "modified": "2026-11-13 09:00:00.000000",
+ "modified": "2026-11-13 11:00:00.000000",
  "modified_by": "Administrator",
  "field_order": [
   "from_sales_order",
@@ -27,6 +27,7 @@
   "source_type",
   "source_cancelled",
   "new_stock_reservation_entry",
+  "from_planned_qty",
   "section_weight"
  ],
  "fields": [
@@ -59,7 +60,8 @@
    "fieldtype": "Data",
    "label": "From Sales Order Item",
    "read_only": 1,
-   "hidden": 1
+   "hidden": 1,
+   "search_index": 1
   },
   {
    "fieldname": "batch_no",
@@ -124,18 +126,18 @@
   },
   {
    "fieldname": "stock_reservation_entry",
-   "fieldtype": "Link",
+   "fieldtype": "Data",
    "label": "Source Reservation",
-   "options": "Stock Reservation Entry",
-   "read_only": 1
+   "read_only": 1,
+   "search_index": 1
   },
   {
    "fieldname": "source_type",
    "fieldtype": "Select",
    "label": "Source",
-   "options": "Production\nSpare",
+   "options": "Production\nSpare\nOther",
    "read_only": 1,
-   "description": "Production: made for the giving order, so that order gets it planned again. Spare: For Mill / extra stock."
+   "description": "Production: made for the giving order, so that order gets it planned again. Spare: For Mill / extra stock. Other: manual or other reservations."
   },
   {
    "fieldname": "source_cancelled",
@@ -146,11 +148,19 @@
   },
   {
    "fieldname": "new_stock_reservation_entry",
-   "fieldtype": "Link",
+   "fieldtype": "Data",
    "label": "New Reservation",
-   "options": "Stock Reservation Entry",
    "read_only": 1,
    "no_copy": 1
+  },
+  {
+   "fieldname": "from_planned_qty",
+   "fieldtype": "Float",
+   "label": "Giving Order Planned Qty at Transfer",
+   "read_only": 1,
+   "no_copy": 1,
+   "hidden": 1,
+   "precision": "3"
   },
   {
    "fieldname": "section_weight",

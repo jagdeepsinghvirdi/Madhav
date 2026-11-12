@@ -12,7 +12,7 @@
  "name": "Party Transfer",
  "naming_rule": "By \"Naming Series\" field",
  "owner": "Administrator",
- "modified": "2026-11-13 09:00:00.000000",
+ "modified": "2026-11-13 10:00:00.000000",
  "modified_by": "Administrator",
  "description": "Move reserved finished goods from one customer's order to another. The stock stays where it is; only the reservation moves. The giving order's quantity becomes available for a new Production Plan.",
  "field_order": [
@@ -76,7 +76,8 @@
    "label": "To Sales Order Item",
    "read_only": 1,
    "hidden": 1,
-   "reqd": 1
+   "reqd": 0,
+   "search_index": 1
   },
   {
    "fieldname": "column_break_to",
@@ -160,7 +161,7 @@
    "label": "Company",
    "options": "Company",
    "read_only": 1,
-   "reqd": 1
+   "reqd": 0
   },
   {
    "fieldname": "remarks",

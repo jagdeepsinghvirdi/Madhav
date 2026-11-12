@@ -25,10 +25,12 @@ from frappe import _
 from frappe.model.document import Document
 from frappe.utils import cint, flt
 
-from madhav.madhav.utils.production_demand import is_free_stock_source
+from madhav.madhav.utils.production_demand import is_free_stock_source, source_type_for
 
 QTY_EPSILON = 0.0005
 CLOSED_SO_STATUSES = ("Closed", "Completed", "On Hold", "Cancelled")
+# A fully delivered order (status To Bill) can't use reserved stock either.
+NO_RESERVATION_SO_STATUSES = CLOSED_SO_STATUSES + ("To Bill",)
 
 
 class PartyTransfer(Document):
@@ -46,7 +48,18 @@ class PartyTransfer(Document):
 		self.set_totals()
 
 	def on_submit(self):
+		# Lock the receiving line and every source reservation so two people
+		# moving the same stock at once can't both succeed; then re-check.
+		frappe.db.sql("select name from `tabSales Order Item` where name = %s for update", self.to_sales_order_item)
 		for row in self.items:
+			frappe.db.sql("select name from `tabStock Reservation Entry` where name = %s for update", row.stock_reservation_entry)
+		self.validate_rows()
+		self.validate_destination_allowance()
+		for row in self.items:
+			row.db_set(
+				"from_planned_qty",
+				flt(frappe.db.get_value("Sales Order Item", row.from_sales_order_item, "production_plan_qty")),
+			)
 			self.reduce_source_reservation(row)
 			self.create_destination_reservation(row)
 		self.report_destination_excess()
@@ -57,9 +70,58 @@ class PartyTransfer(Document):
 		self.ignore_linked_doctypes = ["Stock Reservation Entry"]
 
 	def on_cancel(self):
+		self.validate_not_replanned()
+		self.validate_not_moved_on()
 		for row in self.items:
 			self.cancel_destination_reservation(row)
 			self.restore_source_reservation(row)
+
+	def validate_not_moved_on(self):
+		"""The stock this transfer gave may since have been passed on to a
+		third order; cancelling would then hand A stock that C now holds."""
+		for row in self.items:
+			given = set(
+				frappe.get_all(
+					"Stock Reservation Entry",
+					filters={"from_voucher_type": "Party Transfer", "from_voucher_detail_no": row.name},
+					pluck="name",
+				)
+			)
+			if row.new_stock_reservation_entry:
+				given.add(row.new_stock_reservation_entry)
+			if not given:
+				continue
+			onward = frappe.db.sql(
+				"""
+				select distinct pt.name from `tabParty Transfer Item` pti
+				inner join `tabParty Transfer` pt on pt.name = pti.parent
+				where pt.docstatus = 1 and pt.name != %(me)s and pti.stock_reservation_entry in %(sres)s
+				""",
+				{"me": self.name, "sres": tuple(given)},
+			)
+			if onward:
+				frappe.throw(
+					_("Row #{0}: this stock was moved on again by Party Transfer {1}. Cancel that one first.").format(
+						row.idx, onward[0][0]
+					)
+				)
+
+	def validate_not_replanned(self):
+		"""Giving production stock back to an order that has since been planned
+		again would leave that quantity planned twice."""
+		for row in self.items:
+			if row.source_type != "Production":
+				continue
+			now = flt(frappe.db.get_value("Sales Order Item", row.from_sales_order_item, "production_plan_qty"))
+			if now > flt(row.from_planned_qty) + QTY_EPSILON:
+				frappe.throw(
+					_(
+						"Row #{0}: {1} has been put on a new Production Plan since this transfer "
+						"(planned {2} then, {3} now). Cancelling would plan the same quantity twice. "
+						"Make a new Party Transfer back from {4} instead."
+					).format(row.idx, row.from_sales_order, flt(row.from_planned_qty, 3), flt(now, 3), self.to_sales_order),
+					title=_("Order already re-planned"),
+				)
 
 	# ------------------------------------------------------------------
 	# Validation
@@ -74,7 +136,7 @@ class PartyTransfer(Document):
 		)
 		if not so or cint(so.docstatus) != 1:
 			frappe.throw(_("Sales Order {0} must be submitted.").format(frappe.bold(self.to_sales_order)))
-		if so.status in CLOSED_SO_STATUSES:
+		if so.status in NO_RESERVATION_SO_STATUSES:
 			frappe.throw(
 				_("Sales Order {0} is {1}; stock cannot be moved to it.").format(
 					frappe.bold(self.to_sales_order), so.status
@@ -83,11 +145,14 @@ class PartyTransfer(Document):
 		line = frappe.db.get_value(
 			"Sales Order Item",
 			self.to_sales_order_item,
-			["parent", "item_code", "item_name"],
+			["parent", "item_code", "item_name", "stock_qty", "qty", "delivered_qty", "conversion_factor"],
 			as_dict=True,
 		)
 		if not line or line.parent != self.to_sales_order:
 			frappe.throw(_("Pick the order line that needs the stock."))
+		cf = flt(line.conversion_factor) or 1
+		if (flt(line.stock_qty) or flt(line.qty) * cf) - flt(line.delivered_qty) * cf <= QTY_EPSILON:
+			frappe.throw(_("This line of {0} is fully delivered; it doesn't need stock.").format(self.to_sales_order))
 		self.to_customer = so.customer
 		self.to_customer_name = so.customer_name
 		self.company = so.company
@@ -104,6 +169,10 @@ class PartyTransfer(Document):
 				)
 			seen.add(key)
 
+			if not row.batch_no and frappe.db.get_value(
+				"Stock Reservation Entry", row.stock_reservation_entry, "reservation_based_on"
+			) == "Serial and Batch":
+				frappe.throw(_("Row #{0}: pick the batch to move.").format(row.idx))
 			source = get_open_reservation(row.stock_reservation_entry, row.batch_no)
 			if not source:
 				frappe.throw(
@@ -125,6 +194,11 @@ class PartyTransfer(Document):
 				)
 			if source.company != self.company:
 				frappe.throw(_("Row #{0}: the reservation belongs to another company.").format(row.idx))
+			if not frappe.has_permission("Sales Order", "read", source.sales_order):
+				frappe.throw(
+					_("Row #{0}: you do not have access to {1}.").format(row.idx, source.sales_order),
+					frappe.PermissionError,
+				)
 
 			# Refresh the read-only details from the live reservation.
 			row.from_sales_order = source.sales_order
@@ -136,7 +210,7 @@ class PartyTransfer(Document):
 			row.section_weight = source.section_weight
 			row.available_qty = source.open_qty
 			row.available_pieces = source.open_pieces
-			row.source_type = "Spare" if is_free_stock_source(source.from_voucher_type) else "Production"
+			row.source_type = source_type_for(source.from_voucher_type)
 
 			row.transfer_qty = flt(row.transfer_qty, 3)
 			if row.transfer_qty <= 0:
@@ -148,16 +222,9 @@ class PartyTransfer(Document):
 					)
 				)
 			if flt(row.transfer_pieces) <= 0 and flt(source.open_pieces) > 0:
-				row.transfer_pieces = proportional_pieces(
-					row.transfer_qty, source.open_qty, source.open_pieces
-				)
+				row.transfer_pieces = suggested_pieces(row.transfer_qty, source.open_qty, source.open_pieces)
 			row.transfer_pieces = cint(row.transfer_pieces)
-			if flt(source.open_pieces) > 0 and row.transfer_pieces > flt(source.open_pieces):
-				frappe.throw(
-					_("Row #{0}: only {1} pieces are reserved on {2} for batch {3}.").format(
-						row.idx, cint(source.open_pieces), row.from_sales_order, row.batch_no or "-"
-					)
-				)
+			self.validate_pieces(row, source)
 
 			from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
 				validate_length_for_so_reservation,
@@ -170,6 +237,41 @@ class PartyTransfer(Document):
 				item_code=self.item_code,
 				batch_no=row.batch_no,
 			)
+
+	def validate_pieces(self, row, source):
+		"""Pieces must follow the tonnes: all of them only with all the qty,
+		at least one with any qty, none when the reservation has none."""
+		open_pieces = cint(source.open_pieces)
+		if open_pieces <= 0:
+			row.transfer_pieces = 0
+			return
+		full = row.transfer_qty + QTY_EPSILON >= flt(source.open_qty)
+		if row.transfer_pieces > open_pieces:
+			frappe.throw(
+				_("Row #{0}: only {1} pieces are reserved on {2} for batch {3}.").format(
+					row.idx, open_pieces, row.from_sales_order, row.batch_no or "-"
+				)
+			)
+		if full and row.transfer_pieces != open_pieces:
+			frappe.throw(
+				_("Row #{0}: moving all {1} means moving all {2} pieces.").format(
+					row.idx, flt(source.open_qty, 3), open_pieces
+				)
+			)
+		if not full and open_pieces == 1:
+			frappe.throw(
+				_("Row #{0}: this reservation is a single piece ({1}); it can only be moved whole.").format(
+					row.idx, flt(source.open_qty, 3)
+				)
+			)
+		if not full and row.transfer_pieces >= open_pieces:
+			frappe.throw(
+				_("Row #{0}: moving part of the quantity must leave some pieces on {1}.").format(
+					row.idx, row.from_sales_order
+				)
+			)
+		if row.transfer_pieces < 1:
+			frappe.throw(_("Row #{0}: enter the pieces being moved.").format(row.idx))
 
 	def validate_destination_allowance(self):
 		from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
@@ -336,6 +438,15 @@ class PartyTransfer(Document):
 		)
 
 		source = frappe.get_doc("Stock Reservation Entry", row.stock_reservation_entry)
+		self.validate_giving_order_can_take_back(row, source)
+		if not row.batch_no:
+			free = flt(get_available_qty_to_reserve(self.item_code, row.warehouse))
+			if free < flt(row.transfer_qty) - QTY_EPSILON:
+				frappe.throw(
+					_("Row #{0}: {1} no longer has {2} free in {3}; this transfer cannot be cancelled.").format(
+						row.idx, self.item_code, flt(row.transfer_qty, 3), row.warehouse
+					)
+				)
 		if row.batch_no:
 			free = get_batch_available_qty(self.item_code, row.warehouse, row.batch_no)
 			if free < flt(row.transfer_qty) - QTY_EPSILON:
@@ -359,6 +470,40 @@ class PartyTransfer(Document):
 			),
 		)
 
+	def validate_giving_order_can_take_back(self, row, source):
+		"""Same rules as reserving for A in the first place."""
+		from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
+			get_auto_reserve_available_qty,
+			get_so_line_allowance,
+		)
+
+		status = frappe.db.get_value("Sales Order", row.from_sales_order, "status")
+		line = frappe.db.get_value(
+			"Sales Order Item", row.from_sales_order_item, ["stock_qty", "qty", "delivered_qty", "conversion_factor"], as_dict=True
+		)
+		pending = 0.0
+		if line:
+			cf = flt(line.conversion_factor) or 1
+			pending = (flt(line.stock_qty) or flt(line.qty) * cf) - flt(line.delivered_qty) * cf
+		if status in NO_RESERVATION_SO_STATUSES or pending <= QTY_EPSILON:
+			frappe.throw(
+				_(
+					"Row #{0}: {1} is {2} now, so it can't take the reservation back. "
+					"This transfer cannot be cancelled."
+				).format(row.idx, row.from_sales_order, status if pending > QTY_EPSILON else _("fully delivered"))
+			)
+		if row.source_type == "Production":
+			room = get_auto_reserve_available_qty(row.from_sales_order)
+		else:
+			room = get_so_line_allowance(row.from_sales_order, row.from_sales_order_item, is_tolerance=0)
+		if flt(room) < flt(row.transfer_qty) - QTY_EPSILON:
+			frappe.throw(
+				_(
+					"Row #{0}: {1} has since reserved other stock and can take back only {2}. "
+					"This transfer cannot be cancelled."
+				).format(row.idx, row.from_sales_order, flt(room, 3))
+			)
+
 	# ------------------------------------------------------------------
 	# Reduce B's Work Orders
 	# ------------------------------------------------------------------
@@ -366,11 +511,16 @@ class PartyTransfer(Document):
 	@frappe.whitelist()
 	def reduce_work_orders(self):
 		"""Cut Not Started Work Orders of the receiving line by its excess."""
-		if self.docstatus != 1:
+		# Work from the saved transfer, never from what the browser sent.
+		saved = frappe.get_doc(self.doctype, self.name)
+		saved.check_permission("submit")
+		if saved.docstatus != 1:
 			frappe.throw(_("Submit the transfer first."))
 		if not frappe.has_permission("Work Order", "cancel"):
 			frappe.throw(_("You need permission to cancel Work Orders."), frappe.PermissionError)
+		return saved._reduce_work_orders()
 
+	def _reduce_work_orders(self):
 		info = get_destination_excess(self.to_sales_order_item)
 		remaining = flt(info.excess, 3)
 		if remaining <= QTY_EPSILON:
@@ -400,6 +550,10 @@ class PartyTransfer(Document):
 				skipped.append(wo)
 				continue
 			if wo.blocked_reason:
+				skipped.append(wo)
+				continue
+			if not frappe.has_permission("Work Order", "cancel", doc=wo.name):
+				wo.blocked_reason = _("no permission to cancel it")
 				skipped.append(wo)
 				continue
 			cut = min(remaining, flt(wo.qty))
@@ -435,6 +589,18 @@ def proportional_pieces(qty, basis_qty, basis_pieces):
 	if flt(qty) + QTY_EPSILON >= flt(basis_qty):
 		return cint(basis_pieces)
 	return max(0, min(int(round(flt(basis_pieces) * flt(qty) / flt(basis_qty))), cint(basis_pieces)))
+
+
+def suggested_pieces(qty, open_qty, open_pieces):
+	"""Pieces to move with ``qty``: proportional, at least one, and leaving at
+	least one behind when only part of the quantity moves."""
+	open_pieces = cint(open_pieces)
+	if open_pieces <= 0:
+		return 0
+	if flt(qty) + QTY_EPSILON >= flt(open_qty):
+		return open_pieces
+	pieces = proportional_pieces(qty, open_qty, open_pieces)
+	return max(1, min(pieces, open_pieces - 1)) if open_pieces > 1 else 1
 
 
 def get_open_reservation(sre_name, batch_no=None):
@@ -528,6 +694,12 @@ def recreate_reservation(cancelled_sre, row):
 	"""Give a fully moved reservation back to the giving order on cancel."""
 	new = frappe.copy_doc(cancelled_sre)
 	new.amended_from = None
+	# A reservation can't link to a cancelled document (e.g. an earlier
+	# transfer or a cancelled Batch Wise Reservation Tool); drop the link then.
+	if new.from_voucher_type and new.from_voucher_no and cint(
+		frappe.db.get_value(new.from_voucher_type, new.from_voucher_no, "docstatus")
+	) == 2:
+		new.from_voucher_type = new.from_voucher_no = new.from_voucher_detail_no = None
 	new.status = "Draft"
 	new.delivered_qty = 0
 	new.reserved_qty = flt(row.transfer_qty, 3)
@@ -586,6 +758,7 @@ def get_destination_excess(sales_order_item):
 		where sales_order_item = %s and docstatus = 1
 			and status in ('Not Started', 'In Process')
 			and ifnull(production_plan, '') != ''
+			and ifnull(production_plan_sub_assembly_item, '') = ''
 		order by field(status, 'Not Started', 'In Process'), creation desc
 		""",
 		sales_order_item,
@@ -638,6 +811,9 @@ def replace_work_order(work_order, new_qty):
 	if new.meta.has_field("pending_pcs") and new.meta.has_field("pieces"):
 		new.pending_pcs = new.get("pieces") or 0
 	new.flags.ignore_permissions = True
+	# Replacing a cut Work Order on the same plan row is allowed even though
+	# the cut itself counts as released (see WorkOrder.validate_released_plan_qty).
+	new.flags.party_transfer_replacement = True
 	new.insert()
 	new.submit()
 	return new.name
@@ -654,19 +830,21 @@ def _comment(doctype, name, text):
 def get_order_lines(sales_order):
 	"""Lines of the receiving order, for the To Order Line picker."""
 	frappe.has_permission("Sales Order", "read", sales_order, throw=True)
-	return frappe.get_all(
+	lines = frappe.get_all(
 		"Sales Order Item",
 		filters={"parent": sales_order, "docstatus": 1},
 		fields=["name", "idx", "item_code", "item_name", "stock_qty", "delivered_qty",
 			"conversion_factor", "stock_reserved_qty", "length_size", "pieces"],
 		order_by="idx asc",
 	)
+	return {"company": frappe.db.get_value("Sales Order", sales_order, "company"), "lines": lines}
 
 
 @frappe.whitelist()
 def get_available_reservations(to_sales_order, to_sales_order_item):
 	"""Every open reservation of the same item on other orders, batch by batch."""
 	frappe.has_permission("Party Transfer", "create", throw=True)
+	frappe.has_permission("Sales Order", "read", to_sales_order, throw=True)
 	from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
 		get_so_length_window,
 	)
@@ -704,7 +882,13 @@ def get_available_reservations(to_sales_order, to_sales_order_item):
 		as_dict=True,
 	)
 	out = []
+	readable = {}
 	for r in rows:
+		# Only orders this user may see (User Permissions on Customer etc.).
+		if r.sales_order not in readable:
+			readable[r.sales_order] = frappe.has_permission("Sales Order", "read", r.sales_order)
+		if not readable[r.sales_order]:
+			continue
 		if r.batch_no:
 			open_qty = flt(flt(r.sb_qty) - flt(r.sb_delivered), 3)
 			open_pieces = proportional_pieces(open_qty, r.sb_qty, r.sb_pieces)
@@ -731,7 +915,7 @@ def get_available_reservations(to_sales_order, to_sales_order_item):
 				"section_weight": section_weight,
 				"available_qty": open_qty,
 				"available_pieces": open_pieces,
-				"source_type": "Spare" if is_free_stock_source(r.from_voucher_type) else "Production",
+				"source_type": source_type_for(r.from_voucher_type),
 				"length_ok": 1 if length_ok else 0,
 			}
 		)
