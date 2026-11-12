@@ -50,6 +50,7 @@ class PartyTransfer(Document):
 	def on_submit(self):
 		# Lock the receiving line and every source reservation so two people
 		# moving the same stock at once can't both succeed; then re-check.
+		self.lock_orders()
 		frappe.db.sql("select name from `tabSales Order Item` where name = %s for update", self.to_sales_order_item)
 		for row in self.items:
 			frappe.db.sql("select name from `tabStock Reservation Entry` where name = %s for update", row.stock_reservation_entry)
@@ -60,11 +61,48 @@ class PartyTransfer(Document):
 		for row in self.items:
 			row.db_set(
 				"from_planned_qty",
-				flt(frappe.db.get_value("Sales Order Item", row.from_sales_order_item, "production_plan_qty")),
+				flt(
+					frappe.db.sql(
+						"select production_plan_qty from `tabSales Order Item` where name = %s for update",
+						row.from_sales_order_item,
+					)[0][0]
+				),
 			)
 			self.reduce_source_reservation(row)
 			self.create_destination_reservation(row)
 		self.report_destination_excess()
+		self.refresh_totals_after_commit()
+
+	def lock_orders(self):
+		"""Lock every Sales Order involved, always in the same (sorted) order,
+		so two transfers between the same orders queue instead of deadlocking."""
+		orders = sorted({self.to_sales_order} | {row.from_sales_order for row in self.items if row.from_sales_order})
+		frappe.db.sql(
+			"select name from `tabSales Order` where name in %(orders)s order by name for update",
+			{"orders": tuple(orders)},
+		)
+
+	def refresh_totals_after_commit(self):
+		"""Reserved totals on the order lines and bins are sums over all
+		reservations. Inside this transaction they are worked out from its
+		snapshot, which can miss another transfer that committed meanwhile, so
+		they are recounted once more right after commit."""
+		sres = set()
+		for row in self.items:
+			sres.add(row.stock_reservation_entry)
+			sres.update(
+				frappe.get_all(
+					"Stock Reservation Entry",
+					filters={"from_voucher_type": "Party Transfer", "from_voucher_detail_no": row.name},
+					pluck="name",
+				)
+			)
+		frappe.enqueue(
+			"madhav.madhav.doctype.party_transfer.party_transfer.refresh_reservation_totals",
+			queue="short",
+			enqueue_after_commit=True,
+			sre_names=sorted(n for n in sres if n),
+		)
 
 	def before_cancel(self):
 		# The reservations this transfer made are cancelled in on_cancel;
@@ -72,11 +110,13 @@ class PartyTransfer(Document):
 		self.ignore_linked_doctypes = ["Stock Reservation Entry"]
 
 	def on_cancel(self):
+		self.lock_orders()
 		self.validate_not_replanned()
 		self.validate_not_moved_on()
 		for row in self.items:
 			self.cancel_destination_reservation(row)
 			self.restore_source_reservation(row)
+		self.refresh_totals_after_commit()
 
 	def validate_not_moved_on(self):
 		"""The stock this transfer gave may since have been passed on to a
@@ -967,3 +1007,23 @@ def get_available_reservations(to_sales_order, to_sales_order_item):
 	# Lengths that fit the receiving order first.
 	out.sort(key=lambda x: (0 if x["length_ok"] else 1))
 	return out
+
+
+def refresh_reservation_totals(sre_names):
+	"""Recount status, bin reserved stock and Sales Order reserved qty for
+	these reservations (and their items/lines) from committed data."""
+	seen_bins, seen_lines = set(), set()
+	for name in sre_names or []:
+		if not frappe.db.exists("Stock Reservation Entry", name):
+			continue
+		sre = frappe.get_doc("Stock Reservation Entry", name)
+		if sre.docstatus == 1:
+			sre.update_status()
+		key = (sre.item_code, sre.warehouse)
+		if key not in seen_bins:
+			sre.update_reserved_stock_in_bin()
+			seen_bins.add(key)
+		if sre.voucher_detail_no not in seen_lines:
+			sre.update_reserved_qty_in_voucher()
+			seen_lines.add(sre.voucher_detail_no)
+	frappe.db.commit()

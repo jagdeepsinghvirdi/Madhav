@@ -226,3 +226,26 @@ frappe.ui.form.on("Production Plan Sales Order", {
         );
     }
 });
+
+// The Sales Order picker on the plan also lists orders whose planned quantity
+// was given back (closed / cancelled Work Order, Party Transfer). Link-field
+// searches don't go through override_whitelisted_methods, so point the query
+// at Madhav's version directly (after ERPNext's own setup_queries).
+frappe.ui.form.on("Production Plan", {
+	onload(frm) {
+		madhav_set_sales_order_query(frm);
+	},
+	refresh(frm) {
+		madhav_set_sales_order_query(frm);
+	},
+});
+
+function madhav_set_sales_order_query(frm) {
+	frm.set_query("sales_order", "sales_orders", () => ({
+		query: "madhav.madhav.override.production_plan.sales_order_query",
+		filters: {
+			company: frm.doc.company,
+			item_code: frm.doc.item_code,
+		},
+	}));
+}

@@ -80,7 +80,7 @@ def get_data(filters):
 		r.idle_days = date_diff(today, since) if since else 0
 		if r.idle_days < idle_days:
 			continue
-		r.unproduced_qty = max(0.0, flt(r.qty) - flt(r.produced_qty))
+		r.unproduced_qty = flt(max(0.0, flt(r.qty) - flt(r.produced_qty)), 3)
 		r.unmade_pieces = max(0, cint(r.pieces) - cint(r.completed_pcs))
 		r.suggestion, r.suggestion_level = suggest(r)
 		out.append(r)

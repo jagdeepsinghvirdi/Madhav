@@ -1,4 +1,5 @@
 import frappe
+from frappe import _
 from frappe.utils import flt, cint
 from erpnext.manufacturing.doctype.work_order.work_order import WorkOrder as ERPNextWorkOrder
 
@@ -51,6 +52,17 @@ class WorkOrder(ERPNextWorkOrder):
 
             recompute_work_order_pieces(self.sales_order_item)
 
+    def on_cancel(self):
+        super().on_cancel()
+        # Remember how much of the order line was planned when this Work Order
+        # gave its quantity back (see validate_released_plan_qty).
+        if self.sales_order_item and self.meta.has_field("planned_qty_at_cancel"):
+            self.db_set(
+                "planned_qty_at_cancel",
+                flt(frappe.db.get_value("Sales Order Item", self.sales_order_item, "production_plan_qty")),
+                update_modified=False,
+            )
+
     def validate_qty(self):
         super().validate_qty()
         self.validate_released_plan_qty()
@@ -82,23 +94,43 @@ class WorkOrder(ERPNextWorkOrder):
         released = get_plan_row_cancel_release(self.production_plan_item, exclude_work_order=self.name)
         if released.qty <= 0.0005:
             return
-        last_cancel = frappe.db.sql(
-            """select max(modified) from `tabWork Order`
-            where production_plan_item = %s and docstatus = 2 and name != %s""",
-            (self.production_plan_item, self.name or ""),
-        )[0][0]
+        # Was the order line planned again since the cancel? Compare its planned
+        # qty now with what it was when the Work Order was cancelled (recorded on
+        # the cancelled Work Order); this also catches a draft plan that was
+        # created earlier and submitted after the cancel.
+        snapshot = None
+        if frappe.get_meta("Work Order").has_field("planned_qty_at_cancel"):
+            snapshot = frappe.db.sql(
+                """select max(ifnull(planned_qty_at_cancel, 0)) from `tabWork Order`
+                where production_plan_item = %s and docstatus = 2 and name != %s""",
+                (self.production_plan_item, self.name or ""),
+            )[0][0]
+        line_planned = flt(frappe.db.get_value("Sales Order Item", self.sales_order_item, "production_plan_qty"))
+        if flt(snapshot) > 0:
+            if line_planned <= flt(snapshot) + 0.0005:
+                return
+        else:
+            # Cancelled before the snapshot existed: fall back to plan creation time.
+            last_cancel = frappe.db.sql(
+                """select max(modified) from `tabWork Order`
+                where production_plan_item = %s and docstatus = 2 and name != %s""",
+                (self.production_plan_item, self.name or ""),
+            )[0][0]
+            if not frappe.db.sql(
+                """select pp.name from `tabProduction Plan Item` ppi
+                inner join `tabProduction Plan` pp on pp.name = ppi.parent
+                where ppi.sales_order_item = %s and pp.docstatus = 1 and pp.name != %s and pp.modified > %s
+                limit 1""",
+                (self.sales_order_item, self.production_plan, last_cancel),
+            ):
+                return
         replanned_by = frappe.db.sql(
-            """
-            select pp.name from `tabProduction Plan Item` ppi
+            """select pp.name from `tabProduction Plan Item` ppi
             inner join `tabProduction Plan` pp on pp.name = ppi.parent
-            where ppi.sales_order_item = %s and pp.docstatus = 1
-                and pp.name != %s and pp.creation > %s
-            limit 1
-            """,
-            (self.sales_order_item, self.production_plan, last_cancel),
-        )
-        if not replanned_by:
-            return
+            where ppi.sales_order_item = %s and pp.docstatus = 1 and pp.name != %s
+            order by pp.modified desc limit 1""",
+            (self.sales_order_item, self.production_plan),
+        ) or [[_("another Production Plan")]]
         planned = flt(frappe.db.get_value("Production Plan Item", self.production_plan_item, "planned_qty"))
         ordered = flt(
             frappe.db.sql(

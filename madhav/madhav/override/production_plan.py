@@ -379,10 +379,12 @@ class CustomProductionPlan(ERPNextProductionPlan):
 		if not sales_orders:
 			return
 		data = sales_order_query(filters={"company": self.company, "sales_orders": sales_orders})
-		if not data:
-			msg = _("No items are available in the sales order {0} for production").format(sales_orders[0])
-			if len(sales_orders) > 1:
-				msg = _("No items are available in sales orders {0} for production").format(", ".join(sales_orders))
+		available = {d[0] for d in data}
+		missing = [so for so in sales_orders if so not in available]
+		if missing:
+			msg = _("No items are available in the sales order {0} for production").format(missing[0])
+			if len(missing) > 1:
+				msg = _("No items are available in sales orders {0} for production").format(", ".join(missing))
 			frappe.throw(msg, title=_("Production Plan Already Submitted"))
 
 	@frappe.whitelist()
