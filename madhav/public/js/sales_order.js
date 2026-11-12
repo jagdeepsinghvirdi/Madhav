@@ -963,3 +963,20 @@ grid.wrapper.on("change", "input, select", function () {
 });
 
 }
+
+// Party Transfer: take reserved stock from another order for this one.
+frappe.ui.form.on("Sales Order", {
+	refresh(frm) {
+		if (frm.doc.docstatus !== 1 || ["Closed", "Completed", "On Hold"].includes(frm.doc.status)) {
+			return;
+		}
+		if (!frappe.model.can_create("Party Transfer")) {
+			return;
+		}
+		frm.add_custom_button(
+			__("Party Transfer (take stock from another order)"),
+			() => frappe.new_doc("Party Transfer", { to_sales_order: frm.doc.name }),
+			__("Create")
+		);
+	},
+});

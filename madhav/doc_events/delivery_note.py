@@ -3300,7 +3300,9 @@ def _sort_snapshots_for_restore(snapshots):
 	"""Restore non-tolerance SREs before Batch Wise Reservation Tool rows."""
 
 	def _key(snap):
-		is_bwrt = 1 if snap.get("from_voucher_type") == "Batch Wise Reservation Tool" else 0
+		from madhav.madhav.utils.production_demand import is_free_stock_source
+
+		is_bwrt = 1 if is_free_stock_source(snap.get("from_voucher_type")) else 0
 		return (is_bwrt, snap.get("name") or "")
 
 	return sorted(snapshots or [], key=_key)

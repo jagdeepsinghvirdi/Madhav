@@ -1,0 +1,165 @@
+{
+ "actions": [],
+ "creation": "2026-11-12 19:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "istable": 1,
+ "module": "Madhav",
+ "name": "Party Transfer Item",
+ "owner": "Administrator",
+ "modified": "2026-11-12 19:00:00.000000",
+ "modified_by": "Administrator",
+ "field_order": [
+  "from_sales_order",
+  "from_customer",
+  "from_customer_name",
+  "from_sales_order_item",
+  "batch_no",
+  "length",
+  "available_qty",
+  "available_pieces",
+  "transfer_qty",
+  "transfer_pieces",
+  "column_break_row",
+  "warehouse",
+  "stock_reservation_entry",
+  "source_type",
+  "source_cancelled",
+  "new_stock_reservation_entry",
+  "section_weight"
+ ],
+ "fields": [
+  {
+   "fieldname": "from_sales_order",
+   "fieldtype": "Link",
+   "label": "From Sales Order",
+   "options": "Sales Order",
+   "read_only": 1,
+   "in_list_view": 1,
+   "columns": 2
+  },
+  {
+   "fieldname": "from_customer",
+   "fieldtype": "Link",
+   "label": "From Customer",
+   "options": "Customer",
+   "read_only": 1
+  },
+  {
+   "fieldname": "from_customer_name",
+   "fieldtype": "Data",
+   "label": "From Customer",
+   "read_only": 1,
+   "in_list_view": 1,
+   "columns": 2
+  },
+  {
+   "fieldname": "from_sales_order_item",
+   "fieldtype": "Data",
+   "label": "From Sales Order Item",
+   "read_only": 1,
+   "hidden": 1
+  },
+  {
+   "fieldname": "batch_no",
+   "fieldtype": "Link",
+   "label": "Batch",
+   "options": "Batch",
+   "read_only": 1,
+   "in_list_view": 1,
+   "columns": 1
+  },
+  {
+   "fieldname": "length",
+   "fieldtype": "Float",
+   "label": "Length",
+   "read_only": 1,
+   "in_list_view": 1,
+   "columns": 1
+  },
+  {
+   "fieldname": "available_qty",
+   "fieldtype": "Float",
+   "label": "Reserved Qty",
+   "read_only": 1,
+   "in_list_view": 1,
+   "columns": 1,
+   "precision": "3"
+  },
+  {
+   "fieldname": "available_pieces",
+   "fieldtype": "Float",
+   "label": "Reserved Pcs",
+   "read_only": 1,
+   "in_list_view": 1,
+   "columns": 1
+  },
+  {
+   "fieldname": "transfer_qty",
+   "fieldtype": "Float",
+   "label": "Qty to Move",
+   "in_list_view": 1,
+   "columns": 1,
+   "precision": "3"
+  },
+  {
+   "fieldname": "transfer_pieces",
+   "fieldtype": "Float",
+   "label": "Pcs to Move",
+   "in_list_view": 1,
+   "columns": 1
+  },
+  {
+   "fieldname": "column_break_row",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "warehouse",
+   "fieldtype": "Link",
+   "label": "Warehouse",
+   "options": "Warehouse",
+   "read_only": 1
+  },
+  {
+   "fieldname": "stock_reservation_entry",
+   "fieldtype": "Link",
+   "label": "Source Reservation",
+   "options": "Stock Reservation Entry",
+   "read_only": 1
+  },
+  {
+   "fieldname": "source_type",
+   "fieldtype": "Select",
+   "label": "Source",
+   "options": "Production\nSpare",
+   "read_only": 1,
+   "description": "Production: made for the giving order, so that order gets it planned again. Spare: For Mill / extra stock."
+  },
+  {
+   "fieldname": "source_cancelled",
+   "fieldtype": "Check",
+   "label": "Source Reservation Cancelled",
+   "read_only": 1,
+   "no_copy": 1
+  },
+  {
+   "fieldname": "new_stock_reservation_entry",
+   "fieldtype": "Link",
+   "label": "New Reservation",
+   "options": "Stock Reservation Entry",
+   "read_only": 1,
+   "no_copy": 1
+  },
+  {
+   "fieldname": "section_weight",
+   "fieldtype": "Float",
+   "label": "Section Weight",
+   "read_only": 1
+  }
+ ],
+ "permissions": [],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

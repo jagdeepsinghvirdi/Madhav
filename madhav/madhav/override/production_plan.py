@@ -15,6 +15,13 @@ from frappe.utils import (
 )
 
 
+from madhav.madhav.utils.production_demand import (
+	free_stock_sources_sql,
+	get_effective_planned,
+	lines_with_planned_reductions,
+)
+
+
 INCHES_PER_METER = 39.37
 
 def meters_to_inches(value):
@@ -44,7 +51,7 @@ def get_already_reserved_qty(sales_order_item):
 			where voucher_type = 'Sales Order'
 				and voucher_detail_no = %s
 				and docstatus = 1
-				and from_voucher_type = 'Batch Wise Reservation Tool'
+				and from_voucher_type in {free_stock_sources_sql()}
 				{tolerance_filter}
 			""",
 			sales_order_item,
@@ -91,7 +98,44 @@ def get_already_reserved_pieces(sales_order_item):
 		if staged_qty <= 0 or open_qty <= 0:
 			continue
 		total_pieces += flt(r.staged_pieces) * min(1, open_qty / staged_qty)
-	return total_pieces
+	return total_pieces + get_party_transfer_received_pieces(sales_order_item).open
+
+
+def get_party_transfer_received_pieces(sales_order_item):
+	"""Pieces this line received from other parties through Party Transfer.
+
+	Split into still-reserved (open) and already delivered, scaled by the
+	received reservation's own delivered share - the same way BWRT pieces
+	are scaled above.
+	"""
+	out = frappe._dict(open=0.0, delivered=0.0)
+	if not sales_order_item or not frappe.db.table_exists("Party Transfer Item"):
+		return out
+	rows = frappe.db.sql(
+		"""
+		select pti.transfer_qty, pti.transfer_pieces,
+			sre.reserved_qty, sre.delivered_qty
+		from `tabParty Transfer Item` pti
+		inner join `tabParty Transfer` pt on pt.name = pti.parent
+		inner join `tabStock Reservation Entry` sre
+			on sre.from_voucher_type = 'Party Transfer'
+			and sre.from_voucher_detail_no = pti.name
+			and sre.docstatus = 1
+		where pt.to_sales_order_item = %s and pt.docstatus = 1
+		""",
+		sales_order_item,
+		as_dict=True,
+	)
+	for r in rows:
+		basis = flt(r.transfer_qty)
+		if basis <= 0 or flt(r.transfer_pieces) <= 0:
+			continue
+		# The received reservation can later shrink (passed on to a third
+		# party), so scale by its current reserved and delivered figures.
+		open_qty = max(0.0, flt(r.reserved_qty) - flt(r.delivered_qty))
+		out.delivered += flt(r.transfer_pieces) * min(1, flt(r.delivered_qty) / basis)
+		out.open += flt(r.transfer_pieces) * min(1, open_qty / basis)
+	return out
 
 
 def get_bwrt_delivered_qty(sales_order_item):
@@ -113,7 +157,7 @@ def get_bwrt_delivered_qty(sales_order_item):
 			where voucher_type = 'Sales Order'
 				and voucher_detail_no = %s
 				and docstatus = 1
-				and from_voucher_type = 'Batch Wise Reservation Tool'
+				and from_voucher_type in {free_stock_sources_sql()}
 				{tolerance_filter}
 			""",
 			sales_order_item,
@@ -157,7 +201,7 @@ def get_bwrt_delivered_pieces(sales_order_item):
 		if staged_qty <= 0 or flt(r.delivered_qty) <= 0:
 			continue
 		total += flt(r.staged_pieces) * min(1, flt(r.delivered_qty) / staged_qty)
-	return total
+	return total + get_party_transfer_received_pieces(sales_order_item).delivered
 
 
 def get_delivered_pieces(sales_order_item):
@@ -255,9 +299,14 @@ def get_remaining_unreserved_stock_qty(sales_order_item):
 	if not so_item:
 		return 0
 	conversion_factor = flt(so_item.conversion_factor) or 1
+	# Planned production that Work Orders released (closed / cancelled) or
+	# that a Party Transfer gave to another order no longer covers this line.
+	effective_planned = get_effective_planned(
+		sales_order_item, so_item.production_plan_qty
+	).qty
 	return pending_for_new_production_plan(
 		flt(so_item.stock_qty) or flt(so_item.qty) * conversion_factor,
-		so_item.production_plan_qty,
+		effective_planned,
 		flt(so_item.delivered_qty) * conversion_factor,
 		get_already_reserved_qty(sales_order_item),
 		get_bwrt_delivered_qty(sales_order_item),
@@ -266,9 +315,12 @@ def get_remaining_unreserved_stock_qty(sales_order_item):
 
 def get_remaining_pieces_for_new_production_plan(sales_order_item, so_pieces, production_plan_pieces):
 	"""Pieces still to plan, using the same rule as the qty."""
+	effective_planned_pieces = get_effective_planned(
+		sales_order_item, 0, production_plan_pieces
+	).pieces
 	return pending_for_new_production_plan(
 		so_pieces,
-		production_plan_pieces,
+		effective_planned_pieces,
 		get_delivered_pieces(sales_order_item),
 		get_already_reserved_pieces(sales_order_item),
 		get_bwrt_delivered_pieces(sales_order_item),
@@ -344,6 +396,20 @@ class CustomProductionPlan(ERPNextProductionPlan):
 
 		item = frappe.qb.DocType("Item")
 
+		# A line whose Work Orders cover its whole qty can still have
+		# something to plan when a Work Order was closed / cancelled or its
+		# stock was given to another party; the Python rule below decides.
+		open_to_plan = so_item.qty > so_item.work_order_qty
+		reduced_lines = lines_with_planned_reductions(
+			frappe.get_all(
+				"Sales Order Item",
+				filters={"parent": ["in", so_list], "docstatus": 1},
+				pluck="name",
+			)
+		)
+		if reduced_lines:
+			open_to_plan = open_to_plan | so_item.name.isin(list(reduced_lines))
+
 		items_query = (
 			frappe.qb.from_(so_item)
 			.select(
@@ -366,7 +432,7 @@ class CustomProductionPlan(ERPNextProductionPlan):
 				(so_item.parent.isin(so_list))
 				& (so_item.docstatus == 1)
 				& (so_item.is_manufacture == 1)
-				& (so_item.qty > so_item.work_order_qty)
+				& open_to_plan
 			)
 		)
 
@@ -559,6 +625,14 @@ def custom_get_sales_orders(self):
 
 	item = frappe.qb.DocType("Item")
 
+	# Lines fully covered by submitted plans can still have something to
+	# plan after a Work Order release or a Party Transfer; the remaining
+	# qty rule further down decides per line.
+	open_to_plan = so_item.qty > so_item.production_plan_qty
+	reduced_lines = lines_with_planned_reductions()
+	if reduced_lines:
+		open_to_plan = open_to_plan | so_item.name.isin(list(reduced_lines))
+
 	open_so_query = (
 		frappe.qb.from_(so)
 		.join(so_item).on(so_item.parent == so.name)
@@ -577,7 +651,7 @@ def custom_get_sales_orders(self):
 			(so.docstatus == 1)
 			& (so.status.notin(["Stopped", "Closed", "Completed"]))
 			& (so.company == self.company)
-			& (so_item.qty > so_item.production_plan_qty)
+			& open_to_plan
 			# Fully delivered lines have nothing left to produce.
 			& (so_item.qty > so_item.delivered_qty)
 		)
