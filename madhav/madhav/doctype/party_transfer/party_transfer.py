@@ -381,7 +381,25 @@ class PartyTransfer(Document):
 		for wo in info.work_orders:
 			if remaining <= QTY_EPSILON:
 				break
-			if wo.status != "Not Started" or wo.blocked_reason:
+			if wo.status == "In Process":
+				# Its quantity can't be changed once started. Leave a note on
+				# the Work Order saying when to close it instead.
+				cut = min(remaining, flt(wo.unproduced))
+				if cut > QTY_EPSILON:
+					stop_at = flt(flt(wo.qty) - cut, 3)
+					_comment(
+						"Work Order",
+						wo.name,
+						_(
+							"{0} now needs {1} less because Party Transfer {2} gave it stock. "
+							"Close this Work Order once it has produced {3}."
+						).format(self.to_sales_order, flt(cut, 3), self.name, stop_at),
+					)
+					wo.blocked_reason = _("In Process - note added: close it at {0} produced").format(stop_at)
+					remaining = flt(remaining - cut, 3)
+				skipped.append(wo)
+				continue
+			if wo.blocked_reason:
 				skipped.append(wo)
 				continue
 			cut = min(remaining, flt(wo.qty))
@@ -568,7 +586,7 @@ def get_destination_excess(sales_order_item):
 		where sales_order_item = %s and docstatus = 1
 			and status in ('Not Started', 'In Process')
 			and ifnull(production_plan, '') != ''
-		order by creation desc
+		order by field(status, 'Not Started', 'In Process'), creation desc
 		""",
 		sales_order_item,
 		as_dict=True,

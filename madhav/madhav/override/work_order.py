@@ -22,9 +22,13 @@ class WorkOrder(ERPNextWorkOrder):
 
         cond = "product_bundle_item = %s" if self.product_bundle_item else "production_item = %s"
 
+        # A closed Work Order still made what it produced, so that part keeps
+        # counting; only the unmade balance drops out. (Standard ERPNext drops
+        # the whole closed Work Order, which made the Sales Order look as if
+        # the produced stock had never been made.)
         qty = frappe.db.sql(
-            f""" select sum(qty) from
-            `tabWork Order` where sales_order = %s and sales_order_item = %s and docstatus = 1 and status <> 'Closed' and {cond}
+            f""" select sum(case when status = 'Closed' then least(produced_qty, qty) else qty end) from
+            `tabWork Order` where sales_order = %s and sales_order_item = %s and docstatus = 1 and {cond}
             """,
             (self.sales_order,self.sales_order_item, (self.product_bundle_item or self.production_item)),
             as_list=1,
@@ -37,6 +41,22 @@ class WorkOrder(ERPNextWorkOrder):
             "work_order_qty",
             flt(work_order_qty / total_bundle_qty, 3),
         )
+
+    def on_close_or_cancel(self):
+        super().on_close_or_cancel()
+        # Cancel already gives all the pieces back (revert_so_pieces_from_work_order).
+        # Close gives back only the pieces that were never made.
+        if self.status == "Closed" and self.sales_order_item and self.get("production_plan"):
+            unmade = max(0, flt(self.get("pieces")) - flt(self.get("completed_pcs")))
+            if unmade:
+                current = flt(frappe.db.get_value("Sales Order Item", self.sales_order_item, "work_order_pieces"))
+                frappe.db.set_value(
+                    "Sales Order Item",
+                    self.sales_order_item,
+                    "work_order_pieces",
+                    max(0, current - unmade),
+                    update_modified=False,
+                )
 
 @frappe.whitelist()
 def make_stock_entry(work_order_id, purpose, qty=None, target_warehouse=None):

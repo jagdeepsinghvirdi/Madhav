@@ -12,7 +12,7 @@
  "name": "Party Transfer",
  "naming_rule": "By \"Naming Series\" field",
  "owner": "Administrator",
- "modified": "2026-11-12 23:00:00.000000",
+ "modified": "2026-11-13 09:00:00.000000",
  "modified_by": "Administrator",
  "description": "Move reserved finished goods from one customer's order to another. The stock stays where it is; only the reservation moves. The giving order's quantity becomes available for a new Production Plan.",
  "field_order": [
@@ -134,11 +134,12 @@
    "fieldtype": "Float",
    "label": "Total Qty",
    "read_only": 1,
-   "in_list_view": 1
+   "in_list_view": 1,
+   "precision": "3"
   },
   {
    "fieldname": "total_pieces",
-   "fieldtype": "Float",
+   "fieldtype": "Int",
    "label": "Total Pieces",
    "read_only": 1
   },

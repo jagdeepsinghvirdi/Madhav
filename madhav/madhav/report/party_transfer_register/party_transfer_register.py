@@ -22,7 +22,7 @@ def get_columns():
 		# Data, not Float: a length must not be added up in the Total row.
 		{"label": _("Length"), "fieldname": "length", "fieldtype": "Data", "width": 70},
 		{"label": _("Qty"), "fieldname": "transfer_qty", "fieldtype": "Float", "precision": 3, "width": 85},
-		{"label": _("Pieces"), "fieldname": "transfer_pieces", "fieldtype": "Float", "precision": 0, "width": 70},
+		{"label": _("Pieces"), "fieldname": "transfer_pieces", "fieldtype": "Int", "width": 70},
 		{"label": _("From Order"), "fieldname": "from_sales_order", "fieldtype": "Link", "options": "Sales Order", "width": 125},
 		{"label": _("From Customer"), "fieldname": "from_customer_name", "fieldtype": "Data", "width": 170},
 		{"label": _("To Order"), "fieldname": "to_sales_order", "fieldtype": "Link", "options": "Sales Order", "width": 125},
@@ -61,7 +61,7 @@ def get_data(filters):
 		f"""
 		select pt.name as party_transfer, pt.posting_date,
 			if(pt.docstatus = 2, 'Cancelled', 'Submitted') as status,
-			pt.item_code, pt.item_name, pti.batch_no, cast(round(pti.length, 3) as char) as length,
+			pt.item_code, pt.item_name, pti.batch_no, cast(round(pti.length, 2) as char) as length,
 			pti.transfer_qty, pti.transfer_pieces,
 			pti.from_sales_order, pti.from_customer_name,
 			pt.to_sales_order, pt.to_customer_name,
