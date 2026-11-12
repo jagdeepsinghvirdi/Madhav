@@ -12,7 +12,7 @@
  "name": "Party Transfer",
  "naming_rule": "By \"Naming Series\" field",
  "owner": "Administrator",
- "modified": "2026-11-12 19:00:00.000000",
+ "modified": "2026-11-12 23:00:00.000000",
  "modified_by": "Administrator",
  "description": "Move reserved finished goods from one customer's order to another. The stock stays where it is; only the reservation moves. The giving order's quantity becomes available for a new Production Plan.",
  "field_order": [
@@ -66,9 +66,9 @@
   },
   {
    "fieldname": "to_line",
-   "fieldtype": "Select",
+   "fieldtype": "Autocomplete",
    "label": "To Order Line",
-   "description": "Pick the item line that needs the stock."
+   "description": "Type the item code or line number to find the line that needs the stock."
   },
   {
    "fieldname": "to_sales_order_item",

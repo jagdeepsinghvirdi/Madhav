@@ -37,6 +37,8 @@ class PartyTransfer(Document):
 		if self.docstatus == 0 or self.is_new():
 			# Every open reservation is listed; keep only the rows given a qty.
 			self.set("items", [row for row in self.items if flt(row.transfer_qty) > 0])
+			for idx, row in enumerate(self.items, start=1):
+				row.idx = idx
 		if not self.items:
 			frappe.throw(_("Enter the quantity to move on at least one reservation row."))
 		self.validate_rows()

@@ -117,7 +117,8 @@ function party_transfer_load_lines(frm, auto_pick) {
 				options.push(label);
 			});
 			frm.__pt_line_map = map;
-			frm.set_df_property("to_line", "options", options.join("\n"));
+			// Autocomplete: the user types the item code or "#line" to find it.
+			frm.set_df_property("to_line", "options", options.filter(Boolean));
 
 			// Keep the current pick, or pick the only line / the routed line.
 			const current = Object.keys(map).find((k) => map[k] === frm.doc.to_sales_order_item);
