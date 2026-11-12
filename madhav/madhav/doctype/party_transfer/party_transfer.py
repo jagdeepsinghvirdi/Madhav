@@ -53,8 +53,10 @@ class PartyTransfer(Document):
 		frappe.db.sql("select name from `tabSales Order Item` where name = %s for update", self.to_sales_order_item)
 		for row in self.items:
 			frappe.db.sql("select name from `tabStock Reservation Entry` where name = %s for update", row.stock_reservation_entry)
-		self.validate_rows()
-		self.validate_destination_allowance()
+		# Locking reads: a plain read inside this transaction would still see
+		# the snapshot taken before another user's transfer committed.
+		self.validate_rows(lock=True)
+		self.validate_destination_allowance(lock=True)
 		for row in self.items:
 			row.db_set(
 				"from_planned_qty",
@@ -128,6 +130,7 @@ class PartyTransfer(Document):
 	# ------------------------------------------------------------------
 
 	def set_destination_details(self):
+		frappe.has_permission("Sales Order", "read", self.to_sales_order, throw=True)
 		so = frappe.db.get_value(
 			"Sales Order",
 			self.to_sales_order,
@@ -159,7 +162,7 @@ class PartyTransfer(Document):
 		self.item_code = line.item_code
 		self.item_name = line.item_name
 
-	def validate_rows(self):
+	def validate_rows(self, lock=False):
 		seen = set()
 		for row in self.items:
 			key = (row.stock_reservation_entry, row.batch_no or "")
@@ -173,7 +176,7 @@ class PartyTransfer(Document):
 				"Stock Reservation Entry", row.stock_reservation_entry, "reservation_based_on"
 			) == "Serial and Batch":
 				frappe.throw(_("Row #{0}: pick the batch to move.").format(row.idx))
-			source = get_open_reservation(row.stock_reservation_entry, row.batch_no)
+			source = get_open_reservation(row.stock_reservation_entry, row.batch_no, for_update=lock)
 			if not source:
 				frappe.throw(
 					_("Row #{0}: reservation {1} is no longer open.").format(
@@ -273,13 +276,23 @@ class PartyTransfer(Document):
 		if row.transfer_pieces < 1:
 			frappe.throw(_("Row #{0}: enter the pieces being moved.").format(row.idx))
 
-	def validate_destination_allowance(self):
+	def validate_destination_allowance(self, lock=False):
 		from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
 			get_so_line_allowance,
 		)
 
+		frappe.has_permission("Sales Order", "read", self.to_sales_order, throw=True)
 		total = sum(flt(row.transfer_qty) for row in self.items)
 		allowance = get_so_line_allowance(self.to_sales_order, self.to_sales_order_item, is_tolerance=0)
+		if lock:
+			# The allowance above was worked out from this transaction's
+			# snapshot. Anything reserved for the order since (another
+			# transfer committing meanwhile) comes off it.
+			query = """select ifnull(sum(reserved_qty - delivered_qty), 0) from `tabStock Reservation Entry`
+				where voucher_type = 'Sales Order' and voucher_no = %s and docstatus = 1"""
+			snapshot = flt(frappe.db.sql(query, self.to_sales_order)[0][0])
+			current = flt(frappe.db.sql(query + " for update", self.to_sales_order)[0][0])
+			allowance = flt(allowance) - max(0.0, current - snapshot)
 		if total > flt(allowance) + QTY_EPSILON:
 			frappe.throw(
 				_(
@@ -298,6 +311,12 @@ class PartyTransfer(Document):
 
 	def reduce_source_reservation(self, row):
 		sre = frappe.get_doc("Stock Reservation Entry", row.stock_reservation_entry)
+		current = frappe.db.get_value(
+			"Stock Reservation Entry", sre.name, ["reserved_qty", "delivered_qty", "docstatus"], as_dict=True, for_update=True
+		)
+		if cint(current.docstatus) != 1:
+			frappe.throw(_("Row #{0}: reservation {1} was cancelled meanwhile; reload and try again.").format(row.idx, sre.name))
+		sre.reserved_qty, sre.delivered_qty = flt(current.reserved_qty), flt(current.delivered_qty)
 		open_total = flt(sre.reserved_qty) - flt(sre.delivered_qty)
 		if open_total < flt(row.transfer_qty) - QTY_EPSILON:
 			frappe.throw(
@@ -603,8 +622,11 @@ def suggested_pieces(qty, open_qty, open_pieces):
 	return max(1, min(pieces, open_pieces - 1)) if open_pieces > 1 else 1
 
 
-def get_open_reservation(sre_name, batch_no=None):
-	"""Open (undelivered) part of one reservation, for one batch if given."""
+def get_open_reservation(sre_name, batch_no=None, for_update=False):
+	"""Open (undelivered) part of one reservation, for one batch if given.
+
+	``for_update`` locks the rows and reads their latest committed values.
+	"""
 	if not sre_name:
 		return None
 	sre = frappe.db.get_value(
@@ -616,6 +638,7 @@ def get_open_reservation(sre_name, batch_no=None):
 			"reservation_based_on", "from_voucher_type",
 		],
 		as_dict=True,
+		for_update=for_update,
 	)
 	if not sre or cint(sre.docstatus) != 1 or sre.voucher_type != "Sales Order":
 		return None
@@ -639,6 +662,7 @@ def get_open_reservation(sre_name, batch_no=None):
 			{"parent": sre.name, "parenttype": "Stock Reservation Entry", "batch_no": batch_no},
 			["qty", "delivered_qty", "pieces", "length", "section_weight"],
 			as_dict=True,
+			for_update=for_update,
 		)
 		if not entry:
 			return None
@@ -663,26 +687,47 @@ def trim_reservation(sre, batch_no, qty, pieces=0):
 	ERPNext does not allow editing a partly delivered reservation through
 	the form, so the batch row and header are updated directly and the
 	Sales Order, bin and status totals refreshed - the same way the
-	Delivery Note code releases undelivered reservation.
+	Delivery Note code releases undelivered reservation. Values are read
+	with locking reads so a concurrent change is never overwritten.
 	"""
 	qty = flt(qty, 3)
+	header = frappe.db.sql(
+		"select reserved_qty, delivered_qty from `tabStock Reservation Entry` where name = %s for update",
+		sre.name,
+		as_dict=True,
+	)[0]
 	if sre.reservation_based_on == "Serial and Batch" and batch_no:
-		entry = next((e for e in sre.get("sb_entries") or [] if e.batch_no == batch_no), None)
+		entry = frappe.db.sql(
+			"""select name, qty, ifnull(delivered_qty, 0) as delivered_qty, ifnull(pieces, 0) as pieces
+			from `tabSerial and Batch Entry`
+			where parent = %s and parenttype = 'Stock Reservation Entry' and batch_no = %s
+			for update""",
+			(sre.name, batch_no),
+			as_dict=True,
+		)
 		if not entry:
 			frappe.throw(_("Batch {0} is not on reservation {1}.").format(batch_no, sre.name))
+		entry = entry[0]
 		new_qty = flt(flt(entry.qty) - qty, 3)
-		if new_qty < flt(entry.get("delivered_qty")) - QTY_EPSILON:
+		if new_qty < flt(entry.delivered_qty) - QTY_EPSILON:
 			frappe.throw(_("Reservation {0} cannot go below what it has delivered.").format(sre.name))
-		entry.db_set("qty", new_qty, update_modified=False)
+		values = {"qty": new_qty}
 		if frappe.db.has_column("Serial and Batch Entry", "pieces"):
-			entry.db_set("pieces", max(0, cint(entry.get("pieces")) - cint(pieces)), update_modified=False)
-		entry.qty = new_qty
-		new_reserved = flt(sum(flt(e.qty) for e in sre.sb_entries), 3)
+			values["pieces"] = max(0, cint(entry.pieces) - cint(pieces))
+		frappe.db.set_value("Serial and Batch Entry", entry.name, values, update_modified=False)
+		new_reserved = flt(
+			frappe.db.sql(
+				"""select ifnull(sum(qty), 0) from `tabSerial and Batch Entry`
+				where parent = %s and parenttype = 'Stock Reservation Entry' for update""",
+				sre.name,
+			)[0][0],
+			3,
+		)
 	else:
-		new_reserved = flt(flt(sre.reserved_qty) - qty, 3)
-	if new_reserved < flt(sre.delivered_qty) - QTY_EPSILON:
+		new_reserved = flt(flt(header.reserved_qty) - qty, 3)
+	if new_reserved < flt(header.delivered_qty) - QTY_EPSILON:
 		frappe.throw(_("Reservation {0} cannot go below what it has delivered.").format(sre.name))
-	sre.db_set("reserved_qty", new_reserved)
+	frappe.db.set_value("Stock Reservation Entry", sre.name, "reserved_qty", new_reserved)
 
 	sre = frappe.get_doc("Stock Reservation Entry", sre.name)
 	sre.update_status()

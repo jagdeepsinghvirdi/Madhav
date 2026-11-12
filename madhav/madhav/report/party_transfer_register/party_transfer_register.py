@@ -57,7 +57,7 @@ def get_data(filters):
 		conditions.append("pt.name = %(party_transfer)s")
 		values["party_transfer"] = filters.party_transfer
 
-	return frappe.db.sql(
+	rows = frappe.db.sql(
 		f"""
 		select pt.name as party_transfer, pt.posting_date,
 			if(pt.docstatus = 2, 'Cancelled', 'Submitted') as status,
@@ -75,3 +75,12 @@ def get_data(filters):
 		values,
 		as_dict=True,
 	)
+	# Respect User Permissions: show a transfer only if both orders are visible.
+	can_read = {}
+
+	def readable(so):
+		if so not in can_read:
+			can_read[so] = frappe.has_permission("Sales Order", "read", so)
+		return can_read[so]
+
+	return [r for r in rows if readable(r.from_sales_order) and readable(r.to_sales_order)]

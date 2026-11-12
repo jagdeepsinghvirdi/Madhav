@@ -22,6 +22,7 @@ def execute():
 		select distinct sales_order, sales_order_item, production_item, product_bundle_item
 		from `tabWork Order`
 		where docstatus = 1 and status = 'Closed' and ifnull(sales_order_item, '') != ''
+			and ifnull(production_plan_sub_assembly_item, '') = ''
 		""",
 		as_dict=True,
 	)
@@ -31,6 +32,7 @@ def execute():
 			select ifnull(sum(case when status = 'Closed' then least(produced_qty, qty) else qty end), 0)
 			from `tabWork Order`
 			where sales_order = %s and sales_order_item = %s and docstatus = 1 and production_item = %s
+				and ifnull(production_plan_sub_assembly_item, '') = ''
 			""",
 			(r.sales_order, r.sales_order_item, r.production_item),
 		)[0][0]

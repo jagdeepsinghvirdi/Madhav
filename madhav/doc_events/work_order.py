@@ -21,6 +21,7 @@ def recompute_work_order_pieces(sales_order_item):
             else ifnull(pieces, 0) end), 0)
         from `tabWork Order`
         where sales_order_item = %s and docstatus = 1
+            and ifnull(production_plan_sub_assembly_item, '') = ''
         """,
         sales_order_item,
     )[0][0]

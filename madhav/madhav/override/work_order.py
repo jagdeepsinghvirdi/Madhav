@@ -56,14 +56,24 @@ class WorkOrder(ERPNextWorkOrder):
         self.validate_released_plan_qty()
 
     def validate_released_plan_qty(self):
-        """A plan row that gave quantity back to its Sales Order (cancelled
-        Work Order) can't make a Work Order for that quantity again: it is
-        offered to a new Production Plan instead, and making it from the old
-        row too would plan it twice."""
+        """Don't plan the same quantity twice.
+
+        A cancelled Work Order gives its quantity back to the Sales Order line,
+        and a new Production Plan can pick it up. Once a newer Production Plan
+        has planned that line, the old plan row must not make a Work Order for
+        the released quantity as well. Until then, re-making it from the old
+        row (Cancel & Amend, splitting a Work Order) is fine: the release then
+        simply shrinks again.
+
+        Runs on save and on submit (Production Plan "Make Work Order" inserts
+        drafts without validation, so submit is where it is caught).
+        """
         if (
-            self.docstatus != 0
+            self.docstatus == 2
+            or self.get("_action") == "update_after_submit"
             or not self.production_plan_item
             or self.production_plan_sub_assembly_item
+            or not self.sales_order_item
             or self.flags.get("party_transfer_replacement")
         ):
             return
@@ -71,6 +81,23 @@ class WorkOrder(ERPNextWorkOrder):
 
         released = get_plan_row_cancel_release(self.production_plan_item, exclude_work_order=self.name)
         if released.qty <= 0.0005:
+            return
+        last_cancel = frappe.db.sql(
+            """select max(modified) from `tabWork Order`
+            where production_plan_item = %s and docstatus = 2 and name != %s""",
+            (self.production_plan_item, self.name or ""),
+        )[0][0]
+        replanned_by = frappe.db.sql(
+            """
+            select pp.name from `tabProduction Plan Item` ppi
+            inner join `tabProduction Plan` pp on pp.name = ppi.parent
+            where ppi.sales_order_item = %s and pp.docstatus = 1
+                and pp.name != %s and pp.creation > %s
+            limit 1
+            """,
+            (self.sales_order_item, self.production_plan, last_cancel),
+        )
+        if not replanned_by:
             return
         planned = flt(frappe.db.get_value("Production Plan Item", self.production_plan_item, "planned_qty"))
         ordered = flt(
@@ -87,11 +114,12 @@ class WorkOrder(ERPNextWorkOrder):
             frappe.throw(
                 frappe._(
                     "{0} of Production Plan {1} was given back to Sales Order {2} when its Work Order was "
-                    "cancelled. Plan it on a new Production Plan. This plan row can still make {3}."
+                    "cancelled, and Production Plan {3} has planned that order line since. "
+                    "Making it here as well would plan it twice. This plan row can still make {4}."
                 ).format(
-                    flt(released.qty, 3), self.production_plan, self.sales_order, max_qty
+                    flt(released.qty, 3), self.production_plan, self.sales_order, replanned_by[0][0], max_qty
                 ),
-                title=frappe._("Quantity already released"),
+                title=frappe._("Quantity already planned again"),
             )
 
 @frappe.whitelist()
