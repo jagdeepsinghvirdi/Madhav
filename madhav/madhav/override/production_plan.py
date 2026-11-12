@@ -371,6 +371,21 @@ class CustomProductionPlan(ERPNextProductionPlan):
 			self.get_mr_items()
 
 	@frappe.whitelist()
+	def validate_sales_orders(self, sales_order=None):
+		"""ERPNext only accepts orders with a line whose qty is above its
+		planned qty. An order whose planned quantity was released by a Work
+		Order or given away by a Party Transfer can be planned again too."""
+		sales_orders = [sales_order] if sales_order else [r.sales_order for r in self.sales_orders if r.sales_order]
+		if not sales_orders:
+			return
+		data = sales_order_query(filters={"company": self.company, "sales_orders": sales_orders})
+		if not data:
+			msg = _("No items are available in the sales order {0} for production").format(sales_orders[0])
+			if len(sales_orders) > 1:
+				msg = _("No items are available in sales orders {0} for production").format(", ".join(sales_orders))
+			frappe.throw(msg, title=_("Production Plan Already Submitted"))
+
+	@frappe.whitelist()
 	def get_open_sales_orders(self):
 		"""Pull sales orders which are pending to deliver based on criteria selected"""
 		with demand_cache():
@@ -749,3 +764,40 @@ def custom_get_sales_orders(self):
 		)
 
 	return result
+
+
+@frappe.whitelist()
+def sales_order_query(doctype=None, txt=None, searchfield=None, start=None, page_len=None, filters=None):
+	"""ERPNext's sales_order_query, also listing orders whose planned quantity
+	was released (closed / cancelled Work Order) or given to another order."""
+	frappe.has_permission("Production Plan", throw=True)
+	filters = frappe.parse_json(filters) if isinstance(filters, str) else (filters or {})
+
+	so_table = frappe.qb.DocType("Sales Order")
+	table = frappe.qb.DocType("Sales Order Item")
+	open_to_plan = table.qty > table.production_plan_qty
+	reduced = lines_with_planned_reductions(open_orders_only=True)
+	if reduced:
+		open_to_plan = open_to_plan | table.name.isin(list(reduced))
+
+	query = (
+		frappe.qb.from_(so_table)
+		.join(table)
+		.on(table.parent == so_table.name)
+		.select(table.parent)
+		.distinct()
+		.where(open_to_plan & (table.docstatus == 1))
+	)
+	if filters.get("company"):
+		query = query.where(so_table.company == filters.get("company"))
+	if filters.get("sales_orders"):
+		query = query.where(so_table.name.isin(filters.get("sales_orders")))
+	if filters.get("item_code"):
+		query = query.where(table.item_code == filters.get("item_code"))
+	if txt:
+		query = query.where(table.parent.like(f"%{txt}%"))
+	if page_len:
+		query = query.limit(page_len)
+	if start:
+		query = query.offset(start)
+	return query.run()
