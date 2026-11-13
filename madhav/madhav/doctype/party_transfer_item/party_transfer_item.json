@@ -8,7 +8,7 @@
  "module": "Madhav",
  "name": "Party Transfer Item",
  "owner": "Administrator",
- "modified": "2026-11-13 11:00:00.000000",
+ "modified": "2026-11-14 10:00:00.000000",
  "modified_by": "Administrator",
  "field_order": [
   "from_sales_order",
@@ -17,6 +17,7 @@
   "from_sales_order_item",
   "batch_no",
   "length",
+  "other_length",
   "available_qty",
   "available_pieces",
   "transfer_qty",
@@ -80,6 +81,14 @@
    "in_list_view": 1,
    "columns": 1,
    "precision": "2"
+  },
+  {
+   "fieldname": "other_length",
+   "fieldtype": "Check",
+   "label": "Other Length",
+   "read_only": 1,
+   "default": "0",
+   "description": "Length is outside the receiving order line's length ± 2 (allowed for the same item)."
   },
   {
    "fieldname": "available_qty",

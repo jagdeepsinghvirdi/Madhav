@@ -173,7 +173,9 @@ class TestEffectiveRemaining(unittest.TestCase):
 			frappe, "flags", frappe._dict(pp_reduced_lines={"SOI-1"})
 		):
 			effective = pd.get_effective_planned("SOI-1", planned, 0).qty
-		return pending_for_new_production_plan(so_qty, effective, delivered, free_open, free_delivered)
+		return pending_for_new_production_plan(
+			so_qty, effective, delivered, free_open, free_delivered, production_open=prod_open
+		)
 
 	def test_worked_example_from_madhav(self):
 		# MU-SO26-00448 / FG003791: 194.046 ordered and planned, 196.749 produced,
@@ -205,3 +207,30 @@ class TestEffectiveRemaining(unittest.TestCase):
 
 	def test_delivered_beyond_effective_plan(self):
 		self.assertEqual(self.remaining(100, 100, given=20, delivered=80, prod_open=0), 20)
+
+	def test_production_beyond_plan(self):
+		# Plan 5.98, 6.435 made in two lengths and reserved, 0.42 spare stock.
+		self.assertAlmostEqual(self.remaining(10, 5.98, free_open=0.42, prod_open=6.435), 3.145, places=6)
+
+
+class TestProductionOpenPieces(unittest.TestCase):
+	"""Production still reserved, converted to the order line's pieces by weight."""
+
+	def pieces(self, so_qty, so_pieces, prod_open):
+		from madhav.madhav.override import production_plan as pp
+
+		with patch.object(pp, "get_production_coverage", return_value=(prod_open, 0)), patch.object(
+			pp.frappe.db, "get_value", return_value=so_qty
+		):
+			return pp.production_open_pieces("SOI-1", so_pieces)
+
+	def test_other_length_counts_by_weight(self):
+		# 10 t / 84 pcs at 9 m; 10 t made (part at 11 m) -> all 84 pieces covered.
+		self.assertAlmostEqual(self.pieces(10, 84, 10), 84)
+
+	def test_part_made(self):
+		self.assertAlmostEqual(self.pieces(10, 17, 6.435), 17 * 0.6435)
+
+	def test_nothing_open_or_no_pieces(self):
+		self.assertEqual(self.pieces(10, 17, 0), 0)
+		self.assertEqual(self.pieces(10, 0, 5), 0)

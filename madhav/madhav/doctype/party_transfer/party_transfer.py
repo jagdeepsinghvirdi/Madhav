@@ -269,17 +269,9 @@ class PartyTransfer(Document):
 			row.transfer_pieces = cint(row.transfer_pieces)
 			self.validate_pieces(row, source)
 
-			from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
-				validate_length_for_so_reservation,
-			)
-
-			validate_length_for_so_reservation(
-				self.to_sales_order_item,
-				row.length,
-				sales_order=self.to_sales_order,
-				item_code=self.item_code,
-				batch_no=row.batch_no,
-			)
+			# Same item, any length: the team moves stock of another length
+			# too. Rows outside the receiving line's length ± 2 are marked.
+			row.other_length = 0 if length_fits(self.to_sales_order_item, row.length, row.batch_no) else 1
 
 	def validate_pieces(self, row, source):
 		"""Pieces must follow the tonnes: all of them only with all the qty,
@@ -925,9 +917,27 @@ def get_order_lines(sales_order):
 	return {"company": frappe.db.get_value("Sales Order", sales_order, "company"), "lines": lines}
 
 
+def length_fits(sales_order_item, length, batch_no=None):
+	"""True when the length is within the order line's length ± 2 (or the line has no length)."""
+	from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
+		get_so_length_window,
+		resolve_reservation_length,
+	)
+
+	min_len, max_len, _so_len = get_so_length_window(sales_order_item)
+	if min_len is None:
+		return True
+	length = resolve_reservation_length(length=length, batch_no=batch_no)
+	return bool(length) and min_len <= length <= max_len
+
+
 @frappe.whitelist()
 def get_available_reservations(to_sales_order, to_sales_order_item):
-	"""Every open reservation of the same item on other orders, batch by batch."""
+	"""Every open reservation of the same item on other orders, batch by batch.
+
+	All lengths are listed; lengths that fit the receiving line come first and
+	the others are marked ``other_length``.
+	"""
 	frappe.has_permission("Party Transfer", "create", throw=True)
 	frappe.has_permission("Sales Order", "read", to_sales_order, throw=True)
 	from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
@@ -1001,11 +1011,11 @@ def get_available_reservations(to_sales_order, to_sales_order_item):
 				"available_qty": open_qty,
 				"available_pieces": open_pieces,
 				"source_type": source_type_for(r.from_voucher_type),
-				"length_ok": 1 if length_ok else 0,
+				"other_length": 0 if length_ok else 1,
 			}
 		)
 	# Lengths that fit the receiving order first.
-	out.sort(key=lambda x: (0 if x["length_ok"] else 1))
+	out.sort(key=lambda x: x["other_length"])
 	return out
 
 

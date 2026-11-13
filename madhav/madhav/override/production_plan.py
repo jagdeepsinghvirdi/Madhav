@@ -20,6 +20,7 @@ from frappe.utils import (
 from madhav.madhav.utils.production_demand import (
 	free_stock_sources_sql,
 	get_effective_planned,
+	get_production_coverage,
 	lines_with_planned_reductions,
 )
 
@@ -251,25 +252,30 @@ def get_delivered_pieces(sales_order_item):
 
 
 def pending_for_new_production_plan(
-	so_qty, production_plan_qty, delivered, bwrt_open=0, bwrt_delivered=0
+	so_qty, production_plan_qty, delivered, bwrt_open=0, bwrt_delivered=0, production_open=0
 ):
 	"""Qty (or pieces) of an SO line still to put on a new Production Plan.
 
 	Delivery is counted once: what left through a planned Work Order is
 	already inside ``production_plan_qty``, so only the larger of the two
-	is subtracted. Batch Wise Reservation Tool stock (open or delivered)
-	came from free stock and is subtracted on top.
+	is subtracted. Production still reserved for the line
+	(``production_open``, Finish Work Order / Stock Transfer reservations)
+	counts with the delivery: when the line's own production went beyond its
+	plan (e.g. extra pieces in another length), the extra is covered too.
+	Batch Wise Reservation Tool stock (open or delivered) came from free
+	stock and is subtracted on top.
 
 	SO 100, PP 60, 60 delivered from production -> 40 (not 0).
 	SO 100, BWRT 30 delivered, PP 70            -> 0.
 	SO 100, no PP, 20 delivered from stock      -> 80.
+	SO 10, PP 5.98, 6.435 produced and reserved   -> 3.565.
 	"""
 	delivered_outside_bwrt = max(0, flt(delivered) - flt(bwrt_delivered))
 	return max(
 		0,
 		flt(
 			flt(so_qty)
-			- max(flt(production_plan_qty), delivered_outside_bwrt)
+			- max(flt(production_plan_qty), delivered_outside_bwrt + flt(production_open))
 			- flt(bwrt_open)
 			- flt(bwrt_delivered),
 			6,
@@ -300,9 +306,11 @@ def remaining_qty_for_new_production_plan(
 def get_remaining_unreserved_stock_qty(sales_order_item):
 	"""SO stock still available to plan on a new Production Plan.
 
-	Uses submitted ``production_plan_qty``, not live reservations. Reservations
-	fill an already-planned bucket and are offered again on BWRT for that
-	leftover; they must not inflate the next plan's Get Items qty.
+	Uses submitted ``production_plan_qty``. Reservations fill an
+	already-planned bucket and are offered again on BWRT for that leftover;
+	they must not inflate the next plan's Get Items qty. Production that went
+	beyond the plan (e.g. extra pieces made in another length on the Finish
+	Work Order) does cover the line, so it is not planned again.
 	"""
 	so_item = frappe.db.get_value(
 		"Sales Order Item",
@@ -331,6 +339,7 @@ def get_remaining_unreserved_stock_qty(sales_order_item):
 		flt(so_item.delivered_qty) * conversion_factor,
 		get_already_reserved_qty(sales_order_item),
 		get_bwrt_delivered_qty(sales_order_item),
+		production_open=get_production_coverage(sales_order_item)[0],
 	)
 
 
@@ -345,7 +354,24 @@ def get_remaining_pieces_for_new_production_plan(sales_order_item, so_pieces, pr
 		get_delivered_pieces(sales_order_item),
 		get_already_reserved_pieces(sales_order_item),
 		get_bwrt_delivered_pieces(sales_order_item),
+		production_open=production_open_pieces(sales_order_item, so_pieces),
 	)
+
+
+def production_open_pieces(sales_order_item, so_pieces):
+	"""Production still reserved for the line, in the order's own pieces.
+
+	Extra production can be in another length (more or fewer pieces per
+	tonne), so the reserved tonnes are converted at the order line's pieces
+	per tonne. That keeps pieces left in step with tonnes left.
+	"""
+	open_qty = get_production_coverage(sales_order_item)[0]
+	if open_qty <= 0 or flt(so_pieces) <= 0:
+		return 0.0
+	so_qty = flt(frappe.db.get_value("Sales Order Item", sales_order_item, "stock_qty"))
+	if so_qty <= 0:
+		return 0.0
+	return flt(so_pieces) * open_qty / so_qty
 
 
 class CustomProductionPlan(ERPNextProductionPlan):

@@ -3,8 +3,25 @@
 
 const PT_METHOD = "madhav.madhav.doctype.party_transfer.party_transfer";
 
+// Length cell shows other lengths (outside the order's length ± 2) in red with " *".
+function party_transfer_length_formatter(value, df, options, doc) {
+	const txt = frappe.form.formatters.Float(value, df, options, doc);
+	return doc && doc.other_length
+		? `<span class="text-danger" title="${__("Other length")}">${txt} *</span>`
+		: txt;
+}
+
+function party_transfer_mark_other_lengths(frm) {
+	const grid = frm.fields_dict.items && frm.fields_dict.items.grid;
+	if (grid && grid.update_docfield_property) {
+		grid.update_docfield_property("length", "formatter", party_transfer_length_formatter);
+	}
+}
+
 frappe.ui.form.on("Party Transfer", {
 	setup(frm) {
+		const length_df = frappe.meta.docfield_map?.["Party Transfer Item"]?.length;
+		if (length_df) length_df.formatter = party_transfer_length_formatter;
 		// Cancelling the transfer cancels its reservations and gives A's back
 		// in one step; the form must not cancel the reservations on their own.
 		frm.ignore_doctypes_on_cancel_all = ["Stock Reservation Entry"];
@@ -17,6 +34,7 @@ frappe.ui.form.on("Party Transfer", {
 	},
 
 	refresh(frm) {
+		party_transfer_mark_other_lengths(frm);
 		if (frm.doc.docstatus === 0 && frm.doc.to_sales_order) {
 			// Opened from a Sales Order: pick its line straight away if it has one.
 			party_transfer_load_lines(frm, !frm.doc.to_sales_order_item).then(() => {
@@ -178,28 +196,21 @@ function party_transfer_load_reservations(frm) {
 		})
 		.then((r) => {
 			const rows = r.message || [];
-			let skipped = 0;
+			let other = 0;
 			rows.forEach((d) => {
-				if (!d.length_ok) {
-					skipped += 1;
-					return;
-				}
+				// Same item, any length; other lengths come last and are marked.
+				if (d.other_length) other += 1;
 				const row = frm.add_child("items");
 				Object.assign(row, d, { transfer_qty: 0, transfer_pieces: 0 });
-				delete row.length_ok;
 			});
 			frm.refresh_field("items");
 			party_transfer_set_totals(frm);
 			if (!frm.doc.items.length) {
-				frappe.msgprint(
-					skipped
-						? __("No reserved stock of this item fits the order's length. {0} reservation(s) were left out because their length is outside the allowed range.", [skipped])
-						: __("No other order has this item reserved.")
-				);
-			} else if (skipped) {
+				frappe.msgprint(__("No other order has this item reserved."));
+			} else if (other) {
 				frappe.show_alert({
-					message: __("{0} reservation(s) left out: length outside this order's range.", [skipped]),
-					indicator: "orange",
+					message: __("{0} reservation(s) are another length (Length in red with *, listed last).", [other]),
+					indicator: "blue",
 				});
 			}
 		});

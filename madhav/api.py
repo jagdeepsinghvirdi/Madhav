@@ -1008,7 +1008,10 @@ def populate_pending_work_orders(filters=None):
     values = {}
 
     # Base Conditions
-    conditions.append("wo.status NOT IN ('Draft', 'Completed', 'Cancelled')")
+    # Closed / Stopped Work Orders are left out too: closing gives the
+    # unmade quantity back to planning, so it is made on a new plan's Work
+    # Order and must not be fetched twice.
+    conditions.append("wo.status NOT IN ('Draft', 'Completed', 'Cancelled', 'Closed', 'Stopped')")
 
     # Company Filter
     if filters.get("company"):

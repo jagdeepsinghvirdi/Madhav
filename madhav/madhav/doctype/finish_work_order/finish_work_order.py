@@ -1199,6 +1199,25 @@ class FinishWorkOrder(Document):
                 )
                 continue
 
+            wo_status = frappe.db.get_value("Work Order", pwo.work_order, "status")
+            if wo_status == "Closed":
+                # Closing gave the unmade quantity back to planning; it is made
+                # on a new Production Plan's Work Order instead.
+                self._collect_save_error(
+                    frappe._(
+                        "Row {0}: Work Order {1} is Closed. Remove this row; its remaining "
+                        "quantity is made on a new Production Plan's Work Order."
+                    ).format(pwo.idx, frappe.bold(pwo.work_order))
+                )
+                continue
+            if wo_status == "Stopped":
+                self._collect_save_error(
+                    frappe._(
+                        "Row {0}: Work Order {1} is Stopped. Re-open it, or remove this row."
+                    ).format(pwo.idx, frappe.bold(pwo.work_order))
+                )
+                continue
+
             so_item = frappe.db.get_value(
                 "Work Order", pwo.work_order, "sales_order_item"
             )
