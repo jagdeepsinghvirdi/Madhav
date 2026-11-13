@@ -229,7 +229,10 @@ class TestProductionOpenPieces(unittest.TestCase):
 		self.assertAlmostEqual(self.pieces(10, 84, 10), 84)
 
 	def test_part_made(self):
-		self.assertAlmostEqual(self.pieces(10, 17, 6.435), 17 * 0.6435)
+		# Demo MU-SO26-00596 / FG001394: 6.435 of 10 t at 17 pcs -> 11 whole pieces (9 + 2 made).
+		self.assertEqual(self.pieces(10, 17, 6.435), 11)
+		# MU-SO26-00596 / FG001320: 2.85 of 5 t at 14 pcs -> 8 (5 + 3 made).
+		self.assertEqual(self.pieces(5, 14, 2.85), 8)
 
 	def test_nothing_open_or_no_pieces(self):
 		self.assertEqual(self.pieces(10, 17, 0), 0)

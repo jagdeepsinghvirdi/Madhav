@@ -363,7 +363,7 @@ def production_open_pieces(sales_order_item, so_pieces):
 
 	Extra production can be in another length (more or fewer pieces per
 	tonne), so the reserved tonnes are converted at the order line's pieces
-	per tonne. That keeps pieces left in step with tonnes left.
+	per tonne, to whole pieces. That keeps pieces left in step with tonnes left.
 	"""
 	open_qty = get_production_coverage(sales_order_item)[0]
 	if open_qty <= 0 or flt(so_pieces) <= 0:
@@ -371,7 +371,7 @@ def production_open_pieces(sales_order_item, so_pieces):
 	so_qty = flt(frappe.db.get_value("Sales Order Item", sales_order_item, "stock_qty"))
 	if so_qty <= 0:
 		return 0.0
-	return flt(so_pieces) * open_qty / so_qty
+	return float(round(flt(so_pieces) * open_qty / so_qty))
 
 
 class CustomProductionPlan(ERPNextProductionPlan):
