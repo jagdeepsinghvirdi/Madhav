@@ -1163,6 +1163,29 @@ class FinishWorkOrder(Document):
             fg_qty = flt(pwo.consumption or 0, precision)
             scrap_required = flt(pwo.scrap_qty or 0, precision)
 
+            # A row being finished must not point at a Closed / Stopped Work
+            # Order. Closing gave the unmade quantity back to planning; it is
+            # made on a new Production Plan's Work Order instead.
+            if pwo.work_order and (fg_qty > 0 or flt(pwo.ready_qty) > 0):
+                wo_status = frappe.db.get_value("Work Order", pwo.work_order, "status")
+                if wo_status == "Closed":
+                    self._collect_save_error(
+                        frappe._(
+                            "Row {0}: Work Order {1} is Closed. Remove this row; its remaining "
+                            "quantity is made on a new Production Plan's Work Order."
+                        ).format(pwo.idx, frappe.bold(pwo.work_order)),
+                        title=frappe._("Closed Work Order"),
+                    )
+                    continue
+                if wo_status == "Stopped":
+                    self._collect_save_error(
+                        frappe._(
+                            "Row {0}: Work Order {1} is Stopped. Re-open it, or remove this row."
+                        ).format(pwo.idx, frappe.bold(pwo.work_order)),
+                        title=frappe._("Stopped Work Order"),
+                    )
+                    continue
+
             if (
                 pwo.sales_order
                 and not cint(pwo.make_it_unplanned)
@@ -1196,25 +1219,6 @@ class FinishWorkOrder(Document):
                     continue
                 self._collect_save_error(
                     f"Row {pwo.idx}: Work Order is not set for item <b>{pwo.item}</b>."
-                )
-                continue
-
-            wo_status = frappe.db.get_value("Work Order", pwo.work_order, "status")
-            if wo_status == "Closed":
-                # Closing gave the unmade quantity back to planning; it is made
-                # on a new Production Plan's Work Order instead.
-                self._collect_save_error(
-                    frappe._(
-                        "Row {0}: Work Order {1} is Closed. Remove this row; its remaining "
-                        "quantity is made on a new Production Plan's Work Order."
-                    ).format(pwo.idx, frappe.bold(pwo.work_order))
-                )
-                continue
-            if wo_status == "Stopped":
-                self._collect_save_error(
-                    frappe._(
-                        "Row {0}: Work Order {1} is Stopped. Re-open it, or remove this row."
-                    ).format(pwo.idx, frappe.bold(pwo.work_order))
                 )
                 continue
 
