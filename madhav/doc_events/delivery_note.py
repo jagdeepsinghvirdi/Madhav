@@ -187,15 +187,35 @@ def return_row_pieces(original_pieces, original_qty, return_qty):
 
 
 def scale_return_row_pieces(doc):
-    """A return row copies the original row's Pieces; scale it to the qty
-    returned, unless the user typed a different count."""
+    """Prepare return rows against the original Delivery Note.
+
+    - The original row delivered through a Serial and Batch Bundle but also
+      carries use_serial_batch_fields = 1, which the return copies. ERPNext
+      only builds a return's (Inward) bundle from the original for rows with
+      that flag off, so with it on the return got a brand-new batch and
+      failed ("Batch ... is not present in the original Delivery Note").
+      Clear it on rows that point at a bundled original row.
+    - The row copies the original Pieces; scale it to the qty returned,
+      unless the user typed a different count.
+    """
     if not cint(getattr(doc, "is_return", 0)):
         return
     for row in doc.get("items") or []:
         if not getattr(row, "dn_detail", None):
             continue
-        original = frappe.db.get_value("Delivery Note Item", row.dn_detail, ["pieces", "qty"], as_dict=True)
-        if not original or cint(original.pieces) <= 0:
+        original = frappe.db.get_value(
+            "Delivery Note Item", row.dn_detail, ["pieces", "qty", "serial_and_batch_bundle"], as_dict=True
+        )
+        if not original:
+            continue
+        if (
+            original.serial_and_batch_bundle
+            and not getattr(row, "serial_and_batch_bundle", None)
+            and not getattr(row, "batch_no", None)
+            and cint(getattr(row, "use_serial_batch_fields", 0))
+        ):
+            row.use_serial_batch_fields = 0
+        if cint(original.pieces) <= 0:
             continue
         current = cint(flt(getattr(row, "pieces", 0)))
         if current and current != cint(original.pieces):

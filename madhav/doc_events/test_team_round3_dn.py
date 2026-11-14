@@ -270,3 +270,19 @@ class TestReturnPieceLedgerSign(FrappeTestCase):
 
 	def test_normal_delivery_still_takes_pieces_out(self):
 		self.assertEqual(self._sign(-2.0, 0), -14)
+
+
+class TestReturnUsesOriginalBundle(FrappeTestCase):
+	def test_flag_cleared_so_erpnext_builds_inward_bundle_from_original(self):
+		doc = _Doc(name="RET-1", is_return=1, items=[frappe._dict(name="r1", dn_detail="orig", qty=-2.0, pieces=41,
+			serial_and_batch_bundle=None, batch_no=None, use_serial_batch_fields=1)])
+		with patch.object(dn.frappe.db, "get_value", return_value=frappe._dict(pieces=41, qty=6.0, serial_and_batch_bundle="SABB-ORIG")):
+			dn.scale_return_row_pieces(doc)
+		self.assertEqual(doc.items[0].use_serial_batch_fields, 0)
+
+	def test_row_with_typed_batch_keeps_old_fields(self):
+		doc = _Doc(name="RET-1", is_return=1, items=[frappe._dict(name="r1", dn_detail="orig", qty=-2.0, pieces=41,
+			serial_and_batch_bundle=None, batch_no="MUBT-1", use_serial_batch_fields=1)])
+		with patch.object(dn.frappe.db, "get_value", return_value=frappe._dict(pieces=41, qty=6.0, serial_and_batch_bundle="SABB-ORIG")):
+			dn.scale_return_row_pieces(doc)
+		self.assertEqual(doc.items[0].use_serial_batch_fields, 1)
