@@ -169,6 +169,8 @@ def before_validate(self, method):
     # Pcs × Length × SW, and change_qty_serial_and_batch runs on insert only
     # (reserved weight). The formula value is shown in SW Qty instead.
     _sync_dn_item_warehouse_to_reservation(self)
+    # Saved draft: a changed row Qty resizes its draft bundle (team, 14 Nov 2026).
+    sync_draft_bundles_to_row_qty(self)
     set_dn_sw_qty(self)
     # Display only: reserved batch's Assorted Length on blank rows.
     _fill_dn_assorted_length_from_reservations(self)
@@ -1204,6 +1206,41 @@ def validate(self, method):
             ):
                 args["validate_qty"] = False
 
+    set_invoice_qty_totals(self)
+
+
+def invoice_basis_qty(row):
+    """Qty this row will be billed at: Invoice Qty on Deliver-as-Qty rows, else Qty.
+
+    Mirrors before_submit, which replaces Qty with Invoice Qty only on
+    Deliver-as-Qty rows.
+    """
+    if cint(getattr(row, "custom_deliver_as_qty", 0)) and flt(getattr(row, "invoice_qty", 0)) > 0:
+        return flt(row.invoice_qty)
+    return flt(getattr(row, "qty", 0))
+
+
+def set_invoice_qty_totals(doc):
+    """Total Invoice Qty and Total (INR) as per Invoice Qty (team, 14 Nov 2026).
+
+    Display only: Total Qty, Total and the taxes are not touched.
+    """
+    meta = frappe.get_meta("Delivery Note")
+    has_qty = meta.has_field("total_invoice_qty")
+    has_amount = meta.has_field("total_as_per_invoice_qty")
+    if not has_qty and not has_amount:
+        return
+    total_qty = 0.0
+    total_amount = 0.0
+    for row in doc.get("items") or []:
+        qty = invoice_basis_qty(row)
+        total_qty += qty
+        total_amount += qty * flt(getattr(row, "base_rate", 0))
+    if has_qty:
+        doc.total_invoice_qty = flt(total_qty, 3)
+    if has_amount:
+        doc.total_as_per_invoice_qty = flt(total_amount, 2)
+
 
 def _has_deliver_as_qty_over_delivery(doc):
     for row in doc.items:
@@ -1549,12 +1586,6 @@ def change_qty_serial_and_batch(self):
         if not item.against_sales_order:
             continue
 
-        deliver_as_qty = frappe.db.get_value(
-            "Sales Order",
-            item.against_sales_order,
-            "deliver_as_qty",
-        )
-
         if not item.serial_and_batch_bundle:
             continue
 
@@ -1563,68 +1594,230 @@ def change_qty_serial_and_batch(self):
             item.serial_and_batch_bundle,
         )
         bundle.reload()
+        _resize_bundle_to_row_qty(self, item, bundle)
 
-        # IMPORTANT: Use item.qty here, NOT invoice_qty.
-        target_qty = flt(item.qty)
 
-        batch_entries = [e for e in bundle.entries if e.batch_no]
-        if not batch_entries:
+BUNDLE_QTY_TOLERANCE = 0.0005
+
+
+def bundle_needs_resize(bundle_total_qty, row_qty, conversion_factor=1):
+    """True when a draft bundle's total no longer matches the row's stock qty."""
+    target = flt(row_qty) * flt(conversion_factor or 1)
+    return abs(abs(flt(bundle_total_qty)) - target) > BUNDLE_QTY_TOLERANCE
+
+
+def scaled_entry_qtys(entry_qtys, target_qty):
+    """Entry qtys scaled to ``target_qty`` in proportion (as the resize does)."""
+    total = sum(abs(flt(q)) for q in entry_qtys)
+    if not total:
+        return [0.0 for _q in entry_qtys]
+    return [flt(target_qty) * abs(flt(q)) / total for q in entry_qtys]
+
+
+def _line_reserved_batch_qty(so_detail, warehouse, batch_no):
+    """Undelivered qty of ``batch_no`` reserved for this Sales Order line here."""
+    if not so_detail or not batch_no:
+        return 0
+    return flt(
+        frappe.db.sql(
+            """
+            SELECT SUM(sbe.qty - IFNULL(sbe.delivered_qty, 0))
+            FROM `tabStock Reservation Entry` sre
+            INNER JOIN `tabSerial and Batch Entry` sbe
+                ON sbe.parent = sre.name AND sbe.parenttype = 'Stock Reservation Entry'
+            WHERE sre.docstatus = 1
+              AND sre.voucher_type = 'Sales Order'
+              AND sre.voucher_detail_no = %(so_detail)s
+              AND sre.warehouse = %(warehouse)s
+              AND sre.status IN ('Reserved', 'Partially Reserved', 'Partially Delivered')
+              AND sbe.batch_no = %(batch_no)s
+            """,
+            {"so_detail": so_detail, "warehouse": warehouse, "batch_no": batch_no},
+        )[0][0]
+        or 0
+    )
+
+
+def _row_batch_cap(item, warehouse, batch_no):
+    """Most of a batch this row may take: its own reservation plus free stock."""
+    from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
+        get_batch_available_qty,
+    )
+
+    return flt(
+        _line_reserved_batch_qty(item.so_detail, warehouse, batch_no)
+        + flt(get_batch_available_qty(item.item_code, warehouse, batch_no)),
+        3,
+    )
+
+
+def _validate_bundle_increase(item, bundle, target_qty):
+    """A larger Qty must still fit each batch already on the bundle."""
+    entries = [e for e in bundle.entries if e.batch_no]
+    current = sum(abs(flt(e.qty)) for e in entries)
+    if flt(target_qty) <= current + BUNDLE_QTY_TOLERANCE:
+        return
+    desired = scaled_entry_qtys([e.qty for e in entries], target_qty)
+    for entry, want in zip(entries, desired):
+        warehouse = entry.warehouse or item.warehouse
+        cap = _row_batch_cap(item, warehouse, entry.batch_no)
+        if flt(want, 3) > cap + BUNDLE_QTY_TOLERANCE:
+            frappe.throw(
+                _(
+                    "Row #{0}: Qty {1} needs {2} of batch {3}, but only {4} is available to this row "
+                    "(its Sales Order reservation plus free stock in {5}). Lower the Qty, or open the "
+                    "Serial and Batch Bundle and add another batch."
+                ).format(
+                    item.idx,
+                    flt(target_qty, 3),
+                    flt(want, 3),
+                    frappe.bold(entry.batch_no),
+                    cap,
+                    warehouse,
+                ),
+                title=_("Not enough batch stock"),
+            )
+
+
+def sync_draft_bundles_to_row_qty(doc):
+    """Saved draft Delivery Note: changing a row's Qty resizes its draft bundle.
+
+    ERPNext otherwise refuses the save ("Total quantity ... in the Serial and
+    Batch Bundle does not match") until the bundle is edited by hand. Only
+    rows whose Qty no longer matches their own draft bundle are touched, so
+    unchanged rows keep their bundle exactly as it is. Pieces follow the new
+    weight from length × section weight unless the user also typed a new
+    piece count on this save; Length is refreshed from the entries.
+    """
+    if doc.is_new() or cint(doc.docstatus) != 0 or cint(getattr(doc, "is_return", 0)):
+        return
+    for item in doc.get("items") or []:
+        if not item.against_sales_order or not item.serial_and_batch_bundle:
             continue
-
-        total_original_qty = sum(abs(flt(e.qty)) for e in batch_entries)
-        if not total_original_qty:
-            continue
-
-        # Plain batch items (no length/section_weight) must not go through the
-        # steel piece conversion — that path forces qty to 0 when dims are missing.
-        # Also do NOT cap by Batch.batch_qty: that field is not available stock and
-        # incorrectly shrinks deliver-as-qty / SR-adjusted bundles on cancel/submit.
-        has_piece_dims = any(
-            flt(e.length) and flt(e.section_weight) for e in batch_entries
+        info = frappe.db.get_value(
+            "Serial and Batch Bundle",
+            item.serial_and_batch_bundle,
+            ["docstatus", "total_qty", "voucher_no", "voucher_detail_no"],
+            as_dict=True,
         )
-        if not has_piece_dims:
-            desired_qty = []
-            for entry in batch_entries:
-                original = abs(flt(entry.qty))
-                ratio = (original / total_original_qty) if total_original_qty else 0
-                desired_qty.append(target_qty * ratio)
-            allocated_total_qty = sum(desired_qty)
-            for i, entry in enumerate(batch_entries):
-                entry.qty = -desired_qty[i]
-                if hasattr(entry, "pieces"):
-                    entry.pieces = 0
-            item.qty = allocated_total_qty
-            item.stock_qty = allocated_total_qty
-            item.amount = flt(item.rate) * allocated_total_qty
-            item.base_amount = item.amount * flt(self.conversion_rate or 1)
-            if hasattr(item, "pieces"):
-                item.pieces = 0
-            bundle.total_qty = -allocated_total_qty
-            bundle.flags.ignore_validate = True
-            bundle.flags.ignore_links = True
-            bundle.save(ignore_permissions=True)
-            bundle.reload()
+        if not info or cint(info.docstatus) != 0:
+            continue
+        # Never resize a bundle that belongs to another document or row.
+        if info.voucher_no and info.voucher_no != doc.name:
+            continue
+        if info.voucher_detail_no and item.name and info.voucher_detail_no != item.name:
+            continue
+        if flt(item.qty) <= 0:
+            continue
+        if not bundle_needs_resize(info.total_qty, item.qty, item.conversion_factor):
             continue
 
-        # ── Step 1 (steel): Proportional QTY from reserved/fetched weight ──
-        # Do NOT cap by Batch.batch_qty — that field is receipt size, not
-        # available stock, and was shrinking reserved qty on DN save
-        # (e.g. 0.445 → 0.443).
+        bundle = frappe.get_doc("Serial and Batch Bundle", item.serial_and_batch_bundle)
+        _validate_bundle_increase(item, bundle, flt(item.qty))
+        bundle_pieces = sum(cint(flt(e.pieces)) for e in bundle.entries if e.batch_no)
+        # Pieces untouched since the bundle was made follow the new weight;
+        # a count the user typed on this save wins (capped to stock).
+        entered = 0 if cint(flt(item.pieces)) == bundle_pieces else None
+        _resize_bundle_to_row_qty(doc, item, bundle, entered_pieces=entered)
+
+
+def _resize_bundle_to_row_qty(self, item, bundle, entered_pieces=None):
+    """Resize one row's Serial and Batch Bundle to the row Qty.
+
+    ``entered_pieces`` None uses the row's Pieces as the entered count
+    (insert behaviour); 0 derives pieces from each entry's dimensions.
+    """
+    # IMPORTANT: Use item.qty here, NOT invoice_qty.
+    target_qty = flt(item.qty)
+
+    batch_entries = [e for e in bundle.entries if e.batch_no]
+    if not batch_entries:
+        return
+
+    total_original_qty = sum(abs(flt(e.qty)) for e in batch_entries)
+    if not total_original_qty:
+        return
+
+    # Plain batch items (no length/section_weight) must not go through the
+    # steel piece conversion — that path forces qty to 0 when dims are missing.
+    # Also do NOT cap by Batch.batch_qty: that field is not available stock and
+    # incorrectly shrinks deliver-as-qty / SR-adjusted bundles on cancel/submit.
+    has_piece_dims = any(
+        flt(e.length) and flt(e.section_weight) for e in batch_entries
+    )
+    if not has_piece_dims:
         desired_qty = []
         for entry in batch_entries:
             original = abs(flt(entry.qty))
-            ratio = original / total_original_qty
+            ratio = (original / total_original_qty) if total_original_qty else 0
             desired_qty.append(target_qty * ratio)
+        allocated_total_qty = sum(desired_qty)
+        for i, entry in enumerate(batch_entries):
+            entry.qty = -desired_qty[i]
+            if hasattr(entry, "pieces"):
+                entry.pieces = 0
+        item.qty = allocated_total_qty
+        item.stock_qty = allocated_total_qty
+        item.amount = flt(item.rate) * allocated_total_qty
+        item.base_amount = item.amount * flt(self.conversion_rate or 1)
+        if hasattr(item, "pieces"):
+            item.pieces = 0
+        bundle.total_qty = -allocated_total_qty
+        bundle.flags.ignore_validate = True
+        bundle.flags.ignore_links = True
+        bundle.save(ignore_permissions=True)
+        bundle.reload()
+        return
 
-        # Absorb floating remainder on the first entry
-        leftover_qty = target_qty - sum(desired_qty)
-        if abs(leftover_qty) > 0.0000001 and desired_qty:
-            desired_qty[0] += leftover_qty
+    # ── Step 1 (steel): Proportional QTY from reserved/fetched weight ──
+    # Do NOT cap by Batch.batch_qty — that field is receipt size, not
+    # available stock, and was shrinking reserved qty on DN save
+    # (e.g. 0.445 → 0.443).
+    desired_qty = []
+    for entry in batch_entries:
+        original = abs(flt(entry.qty))
+        ratio = original / total_original_qty
+        desired_qty.append(target_qty * ratio)
 
-        # ── Step 2: Integer pieces for display / piece ledger (do NOT rewrite weight) ──
-        entered_total = cint(flt(getattr(item, "pieces", 0)))
-        bundle_pieces = sum(cint(flt(entry.pieces)) for entry in batch_entries)
-        piece_weight = (total_original_qty / bundle_pieces) if bundle_pieces else 0
+    # Absorb floating remainder on the first entry
+    leftover_qty = target_qty - sum(desired_qty)
+    if abs(leftover_qty) > 0.0000001 and desired_qty:
+        desired_qty[0] += leftover_qty
+
+    # ── Step 2: Integer pieces for display / piece ledger (do NOT rewrite weight) ──
+    entered_total = (
+        cint(flt(getattr(item, "pieces", 0)))
+        if entered_pieces is None
+        else cint(entered_pieces)
+    )
+    bundle_pieces = sum(cint(flt(entry.pieces)) for entry in batch_entries)
+    piece_weight = (total_original_qty / bundle_pieces) if bundle_pieces else 0
+    for i, entry in enumerate(batch_entries):
+        entry_length = resolve_entry_length(
+            entry, entry.batch_no, item.so_detail
+        )
+        entry_section_weight = resolve_entry_section_weight(
+            entry, item.item_code, entry_length, entry.batch_no
+        )
+        if entry_length and not flt(entry.length):
+            entry.length = entry_length
+        if entry_section_weight and not flt(entry.section_weight):
+            entry.section_weight = entry_section_weight
+
+    if entered_total > 0:
+        # The count on the Delivery Note row wins. It is never increased,
+        # and a partial the user already typed is not scaled again.
+        kept = dn_pieces_for_invoice_change(
+            entered_total,
+            bundle_pieces,
+            total_original_qty,
+            target_qty,
+            piece_weight=piece_weight,
+            tolerance_percent=_delivery_tolerance_percent(),
+        )
+        desired_pieces = distribute_integer_pieces(kept, desired_qty)
+    else:
+        desired_pieces = []
         for i, entry in enumerate(batch_entries):
             entry_length = resolve_entry_length(
                 entry, entry.batch_no, item.so_detail
@@ -1632,112 +1825,86 @@ def change_qty_serial_and_batch(self):
             entry_section_weight = resolve_entry_section_weight(
                 entry, item.item_code, entry_length, entry.batch_no
             )
-            if entry_length and not flt(entry.length):
-                entry.length = entry_length
-            if entry_section_weight and not flt(entry.section_weight):
-                entry.section_weight = entry_section_weight
-
-        if entered_total > 0:
-            # The count on the Delivery Note row wins. It is never increased,
-            # and a partial the user already typed is not scaled again.
-            kept = dn_pieces_for_invoice_change(
-                entered_total,
-                bundle_pieces,
-                total_original_qty,
-                target_qty,
-                piece_weight=piece_weight,
-                tolerance_percent=_delivery_tolerance_percent(),
-            )
-            desired_pieces = distribute_integer_pieces(kept, desired_qty)
-        else:
-            desired_pieces = []
-            for i, entry in enumerate(batch_entries):
-                entry_length = resolve_entry_length(
-                    entry, entry.batch_no, item.so_detail
-                )
-                entry_section_weight = resolve_entry_section_weight(
-                    entry, item.item_code, entry_length, entry.batch_no
-                )
-                # Missing dimensions must not turn a blank count into a
-                # ceiling of 0 that later looks like a real piece change.
-                if not entry_length or not entry_section_weight:
-                    desired_pieces.append(0)
-                    continue
-                desired_pieces.append(
-                    int_pieces_from_qty(
-                        desired_qty[i], entry_length, entry_section_weight
-                    )
-                )
-
-        target_total_pieces = sum(desired_pieces)
-
-        # ── Step 3: Cap integer pieces against batch availability, spill leftover ──
-        available_pieces_cache = {
-            entry.batch_no: int(round(get_batch_available_pieces(
-                item.item_code, entry.warehouse or item.warehouse, entry.batch_no
-            )))
-            for entry in batch_entries
-        }
-
-        for i, entry in enumerate(batch_entries):
-            available = available_pieces_cache.get(entry.batch_no, 0)
-            if available and desired_pieces[i] > available:
-                desired_pieces[i] = available
-
-        actual_total_pieces = sum(desired_pieces)
-        leftover_pieces = target_total_pieces - actual_total_pieces
-
-        for i, entry in enumerate(batch_entries):
-            if leftover_pieces <= 0:
-                break
-            available = available_pieces_cache.get(entry.batch_no, 0)
-            if not available:
+            # Missing dimensions must not turn a blank count into a
+            # ceiling of 0 that later looks like a real piece change.
+            if not entry_length or not entry_section_weight:
+                desired_pieces.append(0)
                 continue
-            room = available - desired_pieces[i]
-            if room > 0:
-                take = min(room, leftover_pieces)
-                desired_pieces[i] += int(take)
-                leftover_pieces -= int(take)
-
-        if leftover_pieces > 0:
-            frappe.msgprint(
-                f"Not enough available pieces for {item.item_code} in "
-                f"{item.warehouse}: short by {leftover_pieces} pieces.",
-                indicator="orange",
-                alert=True,
+            desired_pieces.append(
+                int_pieces_from_qty(
+                    desired_qty[i], entry_length, entry_section_weight
+                )
             )
 
-        # ── Step 4: Keep reserved weight; only stamp integer pieces ──
-        total_allocated_pieces = 0
-        last_section_weight = 0
-        for i, entry in enumerate(batch_entries):
-            pieces = int(desired_pieces[i])
-            entry.qty = -desired_qty[i]
-            entry.pieces = pieces
-            total_allocated_pieces += pieces
-            last_section_weight = flt(entry.section_weight)
+    target_total_pieces = sum(desired_pieces)
 
-        allocated_total_qty = sum(desired_qty)
+    # ── Step 3: Cap integer pieces against batch availability, spill leftover ──
+    available_pieces_cache = {
+        entry.batch_no: int(round(get_batch_available_pieces(
+            item.item_code, entry.warehouse or item.warehouse, entry.batch_no
+        )))
+        for entry in batch_entries
+    }
 
-        item.qty = allocated_total_qty
-        item.stock_qty = allocated_total_qty * flt(item.conversion_factor or 1)
-        item.amount = flt(item.rate) * allocated_total_qty
-        item.base_amount = item.amount * flt(self.conversion_rate or 1)
-        item.pieces = int(total_allocated_pieces)
-        if last_section_weight:
-            item.section_weight = last_section_weight
-        sync_dn_item_length_from_entries(item, batch_entries, item.so_detail)
-        bundle.total_qty = -allocated_total_qty
-        bundle.flags.ignore_validate = True
-        bundle.flags.ignore_links = True
-        bundle.save(ignore_permissions=True)
-        bundle.reload()
+    for i, entry in enumerate(batch_entries):
+        available = available_pieces_cache.get(entry.batch_no, 0)
+        if available and desired_pieces[i] > available:
+            desired_pieces[i] = available
 
-        frappe.logger().info(
-            f"Updated Bundle {bundle.name}: Total Qty={bundle.total_qty}, "
-            f"Total Pieces={total_allocated_pieces}, "
-            f"Entries={[{'batch': d.batch_no, 'qty': d.qty, 'pieces': d.pieces} for d in bundle.entries]}"
+    actual_total_pieces = sum(desired_pieces)
+    leftover_pieces = target_total_pieces - actual_total_pieces
+
+    for i, entry in enumerate(batch_entries):
+        if leftover_pieces <= 0:
+            break
+        available = available_pieces_cache.get(entry.batch_no, 0)
+        if not available:
+            continue
+        room = available - desired_pieces[i]
+        if room > 0:
+            take = min(room, leftover_pieces)
+            desired_pieces[i] += int(take)
+            leftover_pieces -= int(take)
+
+    if leftover_pieces > 0:
+        frappe.msgprint(
+            f"Not enough available pieces for {item.item_code} in "
+            f"{item.warehouse}: short by {leftover_pieces} pieces.",
+            indicator="orange",
+            alert=True,
         )
+
+    # ── Step 4: Keep reserved weight; only stamp integer pieces ──
+    total_allocated_pieces = 0
+    last_section_weight = 0
+    for i, entry in enumerate(batch_entries):
+        pieces = int(desired_pieces[i])
+        entry.qty = -desired_qty[i]
+        entry.pieces = pieces
+        total_allocated_pieces += pieces
+        last_section_weight = flt(entry.section_weight)
+
+    allocated_total_qty = sum(desired_qty)
+
+    item.qty = allocated_total_qty
+    item.stock_qty = allocated_total_qty * flt(item.conversion_factor or 1)
+    item.amount = flt(item.rate) * allocated_total_qty
+    item.base_amount = item.amount * flt(self.conversion_rate or 1)
+    item.pieces = int(total_allocated_pieces)
+    if last_section_weight:
+        item.section_weight = last_section_weight
+    sync_dn_item_length_from_entries(item, batch_entries, item.so_detail)
+    bundle.total_qty = -allocated_total_qty
+    bundle.flags.ignore_validate = True
+    bundle.flags.ignore_links = True
+    bundle.save(ignore_permissions=True)
+    bundle.reload()
+
+    frappe.logger().info(
+        f"Updated Bundle {bundle.name}: Total Qty={bundle.total_qty}, "
+        f"Total Pieces={total_allocated_pieces}, "
+        f"Entries={[{'batch': d.batch_no, 'qty': d.qty, 'pieces': d.pieces} for d in bundle.entries]}"
+    )
 
 def get_batch_qty_from_sle(item_code, warehouse, batch_no):
     """Real physical stock for a batch, from Stock Ledger Entry via the
@@ -4284,6 +4451,12 @@ def make_delivery_note_custom(source_name, target_doc=None, kwargs=None):
                     "rate": "rate",
                 },
                 "postprocess": update_item,
+            },
+            # Same as ERPNext's Create → Delivery Note: bring the Sales
+            # Order's taxes and charges (freight, loading, GST) along.
+            "Sales Taxes and Charges": {
+                "doctype": "Sales Taxes and Charges",
+                "reset_value": True,
             },
         },
         target_doc,

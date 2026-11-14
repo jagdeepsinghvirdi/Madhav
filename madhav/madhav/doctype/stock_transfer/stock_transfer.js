@@ -253,7 +253,7 @@ async function validate_batch_limit(cdt, cdn, fieldname) {
 
             frappe.msgprint({
                 title: "Batch Limit Reached",
-                message: `Pieces cannot exceed available warehouse pieces. Value reset to <b>${limit}</b>`,
+                message: `Pieces cannot exceed the free (not reserved) warehouse pieces. Value reset to <b>${limit}</b>`,
                 indicator: "orange"
             });
 
@@ -283,7 +283,7 @@ async function validate_batch_limit(cdt, cdn, fieldname) {
 
             frappe.msgprint({
                 title: "Batch Limit Reached",
-                message: `Qty cannot exceed available warehouse qty. Value reset to <b>${limit}</b>`,
+                message: `Qty cannot exceed the free (not reserved) warehouse qty. Value reset to <b>${limit}</b>`,
                 indicator: "orange"
             });
 

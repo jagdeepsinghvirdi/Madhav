@@ -151,9 +151,17 @@ frappe.ui.form.on('Delivery Note Item', {
 	// from that weight when Length/Pieces is already filled (issue 2(i)).
 	qty(frm, cdt, cdn) {
 		preserve_entered_dn_pieces_on_qty_change(frm, cdt, cdn);
+		update_invoice_qty_totals(frm);
 	},
 	invoice_qty(frm, cdt, cdn) {
 		preserve_entered_dn_pieces_on_qty_change(frm, cdt, cdn);
+		update_invoice_qty_totals(frm);
+	},
+	rate(frm) {
+		update_invoice_qty_totals(frm);
+	},
+	items_remove(frm) {
+		update_invoice_qty_totals(frm);
 	},
 	warehouse(frm, cdt, cdn) {
 		enforce_delivery_note_piece_limits(frm, false, cdt, cdn);
@@ -185,6 +193,75 @@ frappe.ui.form.on('Delivery Note Item', {
 		set_sw_qty(cdt, cdn);
 	}
 });
+
+// Get Items From → Sales Order: bring the Sales Order's taxes and charges
+// (freight, loading, GST), as Create → Delivery Note does (team, 14 Nov 2026).
+// `mapped` is the Delivery Note built server side from one Sales Order.
+// The Delivery Note's taxes are replaced by the Sales Order's only when every
+// tax row already on the Delivery Note is also on the Sales Order (blank, or
+// the default GST rows), so nothing typed by hand is lost and row order
+// ("On Previous Row Total") stays as on the Sales Order. Otherwise the
+// missing charges are listed for the user.
+function apply_sales_order_taxes(frm, mapped) {
+	const so_taxes = (mapped.taxes || []).filter((t) => t.account_head);
+	if (!so_taxes.length) return { changed: false, skipped: [] };
+	const key = (t) => `${t.charge_type}|${t.account_head}`;
+	const so_keys = new Set(so_taxes.map(key));
+	const existing = (frm.doc.taxes || []).filter((t) => t.account_head);
+	const dn_keys = new Set(existing.map(key));
+
+	if (!existing.every((t) => so_keys.has(key(t)))) {
+		return {
+			changed: false,
+			skipped: so_taxes.filter((t) => !dn_keys.has(key(t))).map((t) => t.description || t.account_head),
+		};
+	}
+	if (existing.length === so_taxes.length && so_taxes.every((t) => dn_keys.has(key(t)))) {
+		return { changed: false, skipped: [] };
+	}
+
+	const skip = new Set(["name", "idx", "parent", "parenttype", "parentfield", "doctype", "docstatus", "owner", "creation", "modified", "modified_by", "__islocal", "__unsaved"]);
+	frm.clear_table("taxes");
+	so_taxes.forEach((t) => {
+		const row = frm.add_child("taxes");
+		Object.keys(t).forEach((k) => {
+			if (skip.has(k) || t[k] === undefined || t[k] === null) return;
+			row[k] = t[k];
+		});
+	});
+	// Assign directly: set_value would make ERPNext reload the template rows.
+	["taxes_and_charges", "tax_category"].forEach((f) => {
+		if (mapped[f] && frappe.meta.has_field("Delivery Note", f)) frm.doc[f] = mapped[f];
+	});
+	frm.refresh_field("taxes");
+	frm.refresh_field("taxes_and_charges");
+	return { changed: true, skipped: [] };
+}
+
+// Total Invoice Qty / Total (INR) as per Invoice Qty: display only, mirrors
+// set_invoice_qty_totals() in doc_events/delivery_note.py (the saved value
+// comes from the server). Invoice Qty on Deliver-as-Qty rows, else Qty.
+function update_invoice_qty_totals(frm) {
+	if (!frappe.meta.has_field("Delivery Note", "total_invoice_qty")) return;
+	// Let ERPNext recalculate base_rate first.
+	setTimeout(() => {
+		let total_qty = 0;
+		let total_amount = 0;
+		(frm.doc.items || []).forEach((row) => {
+			let qty =
+				cint(row.custom_deliver_as_qty) && flt(row.invoice_qty) > 0
+					? flt(row.invoice_qty)
+					: flt(row.qty);
+			let base_rate = flt(row.base_rate) || flt(row.rate) * flt(frm.doc.conversion_rate || 1);
+			total_qty += qty;
+			total_amount += qty * base_rate;
+		});
+		frm.doc.total_invoice_qty = flt(total_qty, 3);
+		frm.doc.total_as_per_invoice_qty = flt(total_amount, 2);
+		frm.refresh_field("total_invoice_qty");
+		frm.refresh_field("total_as_per_invoice_qty");
+	}, 300);
+}
 
 // SW Qty = Pcs × row Length Size × Section Weight / 1000. Display only -
 // mirrors set_dn_sw_qty() in doc_events/delivery_note.py; Qty is untouched.
@@ -535,6 +612,15 @@ function open_sales_order_items_selector_for_delivery_note(frm) {
 			});
 
 			Promise.all(calls.map(c => c.then ? c : Promise.resolve(c))).then(results => {
+				let taxes_changed = false;
+				const skipped_charges = [];
+				results.forEach(r => {
+					if (r && r.message) {
+						const res = apply_sales_order_taxes(frm, r.message);
+						taxes_changed = taxes_changed || res.changed;
+						skipped_charges.push(...res.skipped);
+					}
+				});
 				results.forEach(r => {
 					if (r && r.message && r.message.items) {
 						r.message.items.forEach(item => {
@@ -556,7 +642,20 @@ function open_sales_order_items_selector_for_delivery_note(frm) {
 				(frm.doc.items || []).forEach((row) => {
 					set_sw_qty(row.doctype, row.name);
 				});
+				if (taxes_changed && frm.cscript && frm.cscript.calculate_taxes_and_totals) {
+					frm.cscript.calculate_taxes_and_totals();
+				}
+				if (skipped_charges.length) {
+					frappe.msgprint({
+						title: __("Sales Order charges not added"),
+						indicator: "orange",
+						message: __(
+							"This Delivery Note already has its own taxes, so these Sales Order charges were not added. Add them by hand if needed:"
+						) + "<br><ul><li>" + [...new Set(skipped_charges)].join("</li><li>") + "</li></ul>",
+					});
+				}
 				frm.refresh();
+				update_invoice_qty_totals(frm);
 			});
 		},
 	});

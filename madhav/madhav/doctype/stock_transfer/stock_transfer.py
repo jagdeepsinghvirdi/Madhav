@@ -87,6 +87,63 @@ def get_live_batch_pieces(item_code, warehouse, batch_no):
 	return flt(rows[0][1]) if rows and rows[0][0] else None
 
 
+def get_reserved_batch_map(warehouse, batch_nos):
+	"""Open Sales Order reservations per batch in one warehouse.
+
+	Returns ``{batch_no: {"qty": undelivered reserved qty, "pieces": open pieces}}``
+	from submitted, not-yet-delivered Stock Reservation Entries. Every
+	reservation counts, whichever Sales Order it is for: a Material Transfer
+	moves the stock out of the reservation's warehouse, which would leave the
+	reservation pointing at stock that is no longer there. Unreserve first.
+	"""
+	batch_nos = [b for b in (batch_nos or []) if b]
+	if not warehouse or not batch_nos:
+		return {}
+	rows = frappe.db.sql(
+		"""
+		SELECT sbe.batch_no,
+			sbe.qty, IFNULL(sbe.delivered_qty, 0) AS delivered_qty,
+			IFNULL(sbe.pieces, 0) AS pieces
+		FROM `tabStock Reservation Entry` sre
+		INNER JOIN `tabSerial and Batch Entry` sbe
+			ON sbe.parent = sre.name AND sbe.parenttype = 'Stock Reservation Entry'
+		WHERE sre.docstatus = 1
+		  AND sre.status IN ('Reserved', 'Partially Reserved', 'Partially Delivered')
+		  AND sre.warehouse = %(warehouse)s
+		  AND sbe.batch_no IN %(batch_nos)s
+		""",
+		{"warehouse": warehouse, "batch_nos": tuple(batch_nos)},
+		as_dict=True,
+	)
+	return summarize_reserved_batches(rows)
+
+
+def summarize_reserved_batches(rows):
+	"""Sum open reserved qty / pieces per batch (pieces pro-rata to undelivered qty)."""
+	out = {}
+	for r in rows or []:
+		qty = flt(r.get("qty"))
+		open_qty = max(qty - flt(r.get("delivered_qty")), 0)
+		if open_qty <= 0:
+			continue
+		pieces = flt(r.get("pieces"))
+		open_pieces = pieces * open_qty / qty if qty > 0 else 0
+		cur = out.setdefault(r.get("batch_no"), {"qty": 0.0, "pieces": 0.0})
+		cur["qty"] += open_qty
+		cur["pieces"] += open_pieces
+	return out
+
+
+def free_batch_limits(live_qty, live_pieces, reserved):
+	"""Qty / pieces of a batch that a Stock Transfer may move (live minus reserved)."""
+	reserved = reserved or {}
+	free_qty = max(flt(flt(live_qty) - flt(reserved.get("qty")), 3), 0)
+	free_pieces = None
+	if live_pieces is not None:
+		free_pieces = max(flt(live_pieces) - round(flt(reserved.get("pieces"))), 0)
+	return free_qty, free_pieces
+
+
 class StockTransfer(Document):
 
     def before_cancel(self):
@@ -513,19 +570,28 @@ class StockTransfer(Document):
                 continue
 
             warehouse = item.source_warehouse or self.source_warehouse
-            batch_qty = get_live_batch_qty(item.item_code, warehouse, item.batch)
-            batch_pieces = get_live_batch_pieces(item.item_code, warehouse, item.batch)
+            live_qty = get_live_batch_qty(item.item_code, warehouse, item.batch)
+            live_pieces = get_live_batch_pieces(item.item_code, warehouse, item.batch)
+            reserved = get_reserved_batch_map(warehouse, [item.batch]).get(item.batch) or {}
+            batch_qty, batch_pieces = free_batch_limits(live_qty, live_pieces, reserved)
             item_pieces = flt(item.pieces)
             item_qty = flt(item.qty)
+            reserved_note = ""
+            if flt(reserved.get("qty")) > 0:
+                reserved_note = _(
+                    " {0} of it is reserved against a Sales Order; unreserve it first to move it."
+                ).format(flt(reserved.get("qty"), 3))
 
             if batch_pieces is not None and item_pieces > batch_pieces:
                 frappe.throw(
-                    f"Row #{item.idx}: Pieces {item_pieces} cannot exceed Batch Pieces {batch_pieces} for Batch {item.batch}."
+                    f"Row #{item.idx}: Pieces {item_pieces} cannot exceed available Batch Pieces "
+                    f"{batch_pieces} for Batch {item.batch}.{reserved_note}"
                 )
 
-            if item_qty > batch_qty:
+            if flt(item_qty, 3) > batch_qty:
                 frappe.throw(
-                    f"Row #{item.idx}: Qty {item_qty} cannot exceed Batch Qty {batch_qty} for Batch {item.batch}."
+                    f"Row #{item.idx}: Qty {item_qty} cannot exceed available Batch Qty "
+                    f"{batch_qty} for Batch {item.batch}.{reserved_note}"
                 )
 
     def create_stock_entry(self):
@@ -905,8 +971,28 @@ def get_batch_stock(
 		params,
 		as_dict=1,
 	)
+	data = _exclude_reserved_stock(data, source_warehouse)
 	_fill_missing_batch_dimensions(data)
 	return data
+
+
+def _exclude_reserved_stock(rows, warehouse):
+	"""Show only stock not reserved against a Sales Order (team, 14 Nov 2026)."""
+	reserved_map = get_reserved_batch_map(warehouse, [r.get("batch_no") for r in rows or []])
+	out = []
+	for row in rows or []:
+		reserved = reserved_map.get(row.get("batch_no"))
+		if reserved:
+			live_pieces = flt(row.get("pieces")) if flt(row.get("pieces")) > 0 else None
+			free_qty, free_pieces = free_batch_limits(row.get("qty"), live_pieces, reserved)
+			if free_qty <= 0.0001:
+				continue
+			row["reserved_qty"] = flt(reserved.get("qty"), 3)
+			row["qty"] = free_qty
+			if free_pieces is not None:
+				row["pieces"] = free_pieces
+		out.append(row)
+	return out
 
 
 @frappe.whitelist()
@@ -916,10 +1002,13 @@ def get_transfer_batch_limits(item_code, warehouse, batch_no):
 	Batch.batch_qty / Batch.pieces are receipt-size totals and stay wrong
 	after a partial Material Transfer — do not use them as transfer caps.
 	"""
-	return {
-		"qty": get_live_batch_qty(item_code, warehouse, batch_no),
-		"pieces": get_live_batch_pieces(item_code, warehouse, batch_no),
-	}
+	reserved = get_reserved_batch_map(warehouse, [batch_no]).get(batch_no) or {}
+	qty, pieces = free_batch_limits(
+		get_live_batch_qty(item_code, warehouse, batch_no),
+		get_live_batch_pieces(item_code, warehouse, batch_no),
+		reserved,
+	)
+	return {"qty": qty, "pieces": pieces, "reserved_qty": flt(reserved.get("qty"), 3)}
 
 
 def _fill_missing_batch_dimensions(rows):

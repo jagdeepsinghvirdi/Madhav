@@ -78,6 +78,49 @@ def ensure_work_order_covers_fg(work_order, fg_qty, precision=3):
 		)
 
 
+def work_order_pending_qty(wo_qty, produced_qty, precision=3):
+	"""Work Order Pending Qty = Qty - Produced Qty, never below zero.
+
+	Earlier code wrote ``qty - this row's ready qty``, so a Work Order
+	finished across two rows (or two Finish Work Orders) only subtracted
+	the last row: 6.5 qty, 4.445 made showed 6.095 pending instead of 2.055.
+	"""
+	return max(_round_qty(flt(wo_qty) - flt(produced_qty), precision), 0)
+
+
+def so_length_error_for_row(row_idx, item_code, sales_order, length, window):
+	"""Message when an FWO row's length is outside the Sales Order line ±2.
+
+	``window`` is ``(min_length, max_length, so_length)`` from
+	``get_so_length_window``. Returns None when the line has no length
+	(no check) or the row length is inside the window.
+	"""
+	min_length, max_length, so_length = window
+	if min_length is None:
+		return None
+	length = flt(length)
+	if length <= 0:
+		return frappe._(
+			"Row {0}: Length is missing for item {1}. Sales Order {2} line length is {3} "
+			"(allowed {4} to {5})."
+		).format(row_idx, frappe.bold(item_code), frappe.bold(sales_order), so_length, min_length, max_length)
+	if length < min_length or length > max_length:
+		return frappe._(
+			"Row {0}: Length {1} for item {2} is outside the allowed range {3} to {4} "
+			"(Sales Order {5} line length {6} ± {7})."
+		).format(
+			row_idx,
+			frappe.bold(length),
+			frappe.bold(item_code),
+			min_length,
+			max_length,
+			frappe.bold(sales_order),
+			so_length,
+			flt(max_length) - flt(so_length),
+		)
+	return None
+
+
 def _round_qty(value, precision=3):
 	"""Round a qty without depending on frappe.flt precision init."""
 	prec = max(0, int(precision or 0))
@@ -172,7 +215,9 @@ class FinishWorkOrder(Document):
 
         completed_pcs = max(flt(wo.completed_pcs or 0) - finished_pcs, 0)
         total_pcs = flt(wo.pieces or 0)
-        pending_qty = min(flt(wo.pending_qty or 0) + finished_qty, flt(wo.qty or 0))
+        # Stock Entry was cancelled just before this, so produced_qty is
+        # already back to its true value.
+        pending_qty = work_order_pending_qty(restored_qty, getattr(wo, "produced_qty", 0))
 
         wo.db_set("completed_pcs", completed_pcs)
         wo.db_set("pending_pcs", max(total_pcs - completed_pcs, 0))
@@ -1096,6 +1141,20 @@ class FinishWorkOrder(Document):
             title=frappe._("Insufficient Raw Material"),
         )
 
+    def _validate_row_length_against_so(self, pwo, so_item):
+        from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
+            get_so_length_window,
+        )
+
+        message = so_length_error_for_row(
+            pwo.idx, pwo.item, pwo.sales_order, pwo.length_size,
+            get_so_length_window(so_item),
+        )
+        if message:
+            self._collect_save_error(
+                message, title=frappe._("Length outside Sales Order range")
+            )
+
     def validate_stock_readiness(self):
         """Stock-readiness checks for Save and Submit.
 
@@ -1225,33 +1284,13 @@ class FinishWorkOrder(Document):
             so_item = frappe.db.get_value(
                 "Work Order", pwo.work_order, "sales_order_item"
             )
-            if pwo.sales_order and so_item and not cint(pwo.quality_required):
-                so_wh = frappe.db.get_value("Sales Order Item", so_item, "warehouse")
-                if so_wh and pwo.target_warehouse == so_wh:
-                    from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
-                        validate_length_for_so_reservation,
-                    )
-
-                    if self.flags.get("fwo_collect_errors"):
-                        try:
-                            validate_length_for_so_reservation(
-                                so_item,
-                                pwo.length_size,
-                                sales_order=pwo.sales_order,
-                                item_code=pwo.item,
-                            )
-                        except frappe.ValidationError as exc:
-                            self._collect_save_error(
-                                str(exc).strip()
-                                or frappe._("Row {0}: length is outside the Sales Order window.").format(pwo.idx)
-                            )
-                    else:
-                        validate_length_for_so_reservation(
-                            so_item,
-                            pwo.length_size,
-                            sales_order=pwo.sales_order,
-                            item_code=pwo.item,
-                        )
+            # Every row tied to a Sales Order line must be inside the line's
+            # length ± 2, whether it goes to Quality Inspection or straight to
+            # the Sales Order warehouse (team, 14 Nov 2026). Previously only
+            # rows that reserved on submit were checked, so QI rows let 6 m
+            # through on a 12 m line.
+            if pwo.sales_order and so_item:
+                self._validate_row_length_against_so(pwo, so_item)
 
             if skip_consume:
                 fg_final_qty = flt(_pwo_basis_qty(pwo), 3)
@@ -1726,8 +1765,9 @@ class FinishWorkOrder(Document):
             pcs = flt(pwo.ready_pieces or 0)
             doc.db_set("completed_pcs", completed + pcs)
             doc.db_set("pending_pcs", total - (completed + pcs))
-            ready_qty  = fg_final_qty
-            doc.db_set("pending_qty", flt(doc.qty or 0) -  flt(ready_qty or 0))
+            # The Manufacture Stock Entry is submitted above, so produced_qty
+            # already includes this row (and earlier rows for the same WO).
+            doc.db_set("pending_qty", work_order_pending_qty(doc.qty, doc.produced_qty))
         # ==============================
         # EXCESS RM
         # ==============================
