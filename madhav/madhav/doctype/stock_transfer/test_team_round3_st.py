@@ -213,3 +213,44 @@ class TestReleaseAndRestore(FrappeTestCase):
 		self.assertEqual(errors, [])
 		trim.assert_called_once_with(docs["SRE-1"], "B1", -0.4, -4)
 		self.assertEqual(recreate.call_args[0][1].transfer_qty, 1.0)
+
+
+class FakeNewSRE(SimpleNamespace):
+	def set(self, f, v):
+		setattr(self, f, list(v))
+
+	def append(self, f, v):
+		getattr(self, f).append(v)
+
+	def insert(self):
+		self.inserted = True
+
+	def submit(self):
+		self.submitted = True
+
+
+class TestReservationMovesToTarget(FrappeTestCase):
+	def _run(self, reserved_rows):
+		doc = StockTransfer.__new__(StockTransfer)
+		doc.doctype, doc.name, doc.target_warehouse = "Stock Transfer", "STE-TEST", "For Mill (EXTRA) - MUPL"
+		doc.transfer_item = [SimpleNamespace(name="row1", target_warehouse=None)]
+		doc._fg_reservation_data = [{"from_voucher_detail_no": r} for r in reserved_rows]
+		doc._released_reservations = [{"sre": "SRE-1", "row": "row1", "batch_no": "B1", "qty": 1.308, "pieces": 12, "length": 6.575, "section_weight": 16.58}]
+		new = FakeNewSRE(item_code="FG000569", reservation_based_on="Serial and Batch", sb_entries=[], flags=frappe._dict())
+		with patch.object(st_module.frappe, "get_doc", return_value=SimpleNamespace(name="SRE-1")), \
+			patch.object(st_module.frappe, "copy_doc", return_value=new), \
+			patch(f"{MOD}.get_available_qty_to_reserve", return_value=5):
+			doc.carry_released_reservations()
+		return new
+
+	def test_reserved_again_in_target_for_same_line(self):
+		new = self._run([])
+		self.assertTrue(getattr(new, "submitted", False))
+		self.assertEqual(new.warehouse, "For Mill (EXTRA) - MUPL")
+		self.assertEqual((new.from_voucher_type, new.from_voucher_no), ("Stock Transfer", "STE-TEST"))
+		self.assertEqual(new.sb_entries[0]["qty"], 1.308)
+		self.assertEqual(new.sb_entries[0]["warehouse"], "For Mill (EXTRA) - MUPL")
+
+	def test_not_twice_when_sales_order_warehouse_rule_reserved_it(self):
+		new = self._run(["row1"])
+		self.assertFalse(getattr(new, "submitted", False))

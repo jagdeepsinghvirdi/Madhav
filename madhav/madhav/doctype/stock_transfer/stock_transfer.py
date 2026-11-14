@@ -602,6 +602,7 @@ class StockTransfer(Document):
                 })
                 remaining = flt(remaining - take, 3)
 
+        self._released_reservations = released
         if released:
             frappe.get_doc({
                 "doctype": "Comment", "comment_type": "Info",
@@ -609,7 +610,7 @@ class StockTransfer(Document):
                 "content": RELEASED_SRE_PREFIX + json.dumps(released),
             }).insert(ignore_permissions=True)
             frappe.msgprint(
-                _("Reservation for the same Sales Order line moved with the stock: {0}").format(
+                _("Reservation of the batch's own Sales Order line moves with the stock: {0}").format(
                     ", ".join(f"{r['qty']} of {r['batch_no']} ({r['sre']})" for r in released)
                 ),
                 indicator="blue",
@@ -722,6 +723,44 @@ class StockTransfer(Document):
                 length=data.get("length"),
                 section_weight=data.get("section_weight"),
             )
+
+        self.carry_released_reservations()
+
+    def carry_released_reservations(self):
+        """Re-reserve, in the target warehouse, own-line stock released on submit
+        when the usual Sales Order warehouse rule did not reserve that row
+        (e.g. Finished Goods → For Mill). The reservation moves with the stock
+        and stays with its own order line; it is linked to this transfer, so
+        cancelling the transfer cancels it and gives the source back.
+        """
+        reserved_rows = {d["from_voucher_detail_no"] for d in getattr(self, "_fg_reservation_data", [])}
+        rows = {r.name: r for r in self.transfer_item or []}
+        for rec in getattr(self, "_released_reservations", []) or []:
+            row = rows.get(rec["row"])
+            if not row or row.name in reserved_rows:
+                continue
+            source = frappe.get_doc("Stock Reservation Entry", rec["sre"])
+            target = row.target_warehouse or self.target_warehouse
+            new = frappe.copy_doc(source)
+            new.amended_from = None
+            new.warehouse = target
+            new.from_voucher_type, new.from_voucher_no, new.from_voucher_detail_no = self.doctype, self.name, row.name
+            new.status = "Draft"
+            new.delivered_qty = 0
+            new.reserved_qty = flt(rec["qty"], 3)
+            new.available_qty_to_reserve = flt(rec["qty"], 3)
+            new.available_qty = flt(get_available_qty_to_reserve(new.item_code, target), 3)
+            if new.reservation_based_on == "Serial and Batch":
+                new.set("sb_entries", [])
+                new.append("sb_entries", {
+                    "batch_no": rec["batch_no"], "qty": flt(rec["qty"], 3), "warehouse": target,
+                    "pieces": cint(rec["pieces"]), "length": flt(rec["length"]),
+                    "section_weight": flt(rec["section_weight"]),
+                })
+                new.auto_reserve_serial_and_batch = lambda *args, **kwargs: None
+            new.flags.ignore_permissions = True
+            new.insert()
+            new.submit()
 
     def validate_transfer_item_limits(self):
         for item in self.transfer_item:
