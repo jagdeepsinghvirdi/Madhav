@@ -1,13 +1,18 @@
 # Copyright (c) 2026, Finbyz pvt. ltd. and contributors
 # For license information, please see license.txt
 
+import json
+
 import frappe
 from frappe import _
-from frappe.utils import flt
+from frappe.utils import cint, flt
 from frappe.model.document import Document
 from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
 	get_available_qty_to_reserve,
 )
+
+
+RELEASED_SRE_PREFIX = "MADHAV_ST_RELEASED_SRE::"
 
 
 def resolve_sre_sb_dimensions(qty=0, pieces=None, length=None, section_weight=None, batch_vals=None):
@@ -87,21 +92,25 @@ def get_live_batch_pieces(item_code, warehouse, batch_no):
 	return flt(rows[0][1]) if rows and rows[0][0] else None
 
 
-def get_reserved_batch_map(warehouse, batch_nos):
+def get_reserved_batch_map(warehouse, batch_nos, own_lines=None):
 	"""Open Sales Order reservations per batch in one warehouse.
 
 	Returns ``{batch_no: {"qty": undelivered reserved qty, "pieces": open pieces}}``
-	from submitted, not-yet-delivered Stock Reservation Entries. Every
-	reservation counts, whichever Sales Order it is for: a Material Transfer
-	moves the stock out of the reservation's warehouse, which would leave the
-	reservation pointing at stock that is no longer there. Unreserve first.
+	from submitted, not-yet-delivered Stock Reservation Entries.
+
+	``own_lines`` is ``{batch_no: Sales Order Item}``: the order line the
+	batch was made / bought for. A reservation for that same line does not
+	count (Harsh, 14 Nov 2026: stock reserved for the same Sales Order line
+	stays available for that order; the transfer moves the reservation with
+	the stock). Reservations for any other line do count: moving that stock
+	would leave another order's reservation pointing at stock that is gone.
 	"""
 	batch_nos = [b for b in (batch_nos or []) if b]
 	if not warehouse or not batch_nos:
 		return {}
 	rows = frappe.db.sql(
 		"""
-		SELECT sbe.batch_no,
+		SELECT sbe.batch_no, sre.voucher_detail_no,
 			sbe.qty, IFNULL(sbe.delivered_qty, 0) AS delivered_qty,
 			IFNULL(sbe.pieces, 0) AS pieces
 		FROM `tabStock Reservation Entry` sre
@@ -115,7 +124,35 @@ def get_reserved_batch_map(warehouse, batch_nos):
 		{"warehouse": warehouse, "batch_nos": tuple(batch_nos)},
 		as_dict=True,
 	)
+	own_lines = own_lines or {}
+	rows = [
+		r for r in rows
+		if not (own_lines.get(r.get("batch_no")) and r.get("voucher_detail_no") == own_lines.get(r.get("batch_no")))
+	]
 	return summarize_reserved_batches(rows)
+
+
+def source_sales_order_line(source_doctype, source_name, item_code=None, batch_no=None):
+	"""Sales Order Item a transferred batch belongs to, from its source document.
+
+	Stock Entry (Manufacture) → its Work Order's line; Purchase Receipt → the
+	receipt row's line. None when the batch is not tied to an order line.
+	"""
+	if not source_doctype or not source_name:
+		return None
+	if source_doctype == "Stock Entry":
+		work_order = frappe.db.get_value("Stock Entry", source_name, "work_order")
+		return frappe.db.get_value("Work Order", work_order, "sales_order_item") if work_order else None
+	if source_doctype == "Purchase Receipt":
+		filters = {"parent": source_name}
+		if item_code:
+			filters["item_code"] = item_code
+		if batch_no:
+			line = frappe.db.get_value("Purchase Receipt Item", dict(filters, batch_no=batch_no), "sales_order_item")
+			if line:
+				return line
+		return frappe.db.get_value("Purchase Receipt Item", filters, "sales_order_item")
+	return None
 
 
 def summarize_reserved_batches(rows):
@@ -223,6 +260,11 @@ class StockTransfer(Document):
             # Submitted transfers always create an SE — missing link means
             # stock would stay in the target warehouse if we continue.
             errors.append("linked Stock Entry not found (cannot rollback warehouse qty)")
+
+        # Stock is back in the source warehouse: give back any reservation
+        # of the batch's own order line that the transfer moved.
+        if not errors:
+            errors.extend(self.restore_released_reservations())
 
         if errors:
             frappe.throw(
@@ -492,7 +534,124 @@ class StockTransfer(Document):
                 indicator="orange",
             )
 
+        self.release_own_line_reservations()
         self.create_stock_entry()
+
+    def release_own_line_reservations(self):
+        """Take the transferred qty off reservations for the batch's own line.
+
+        That stock stays available to its own order (Harsh, 14 Nov 2026), but
+        a reservation is tied to its warehouse, so it is released here before
+        the Material Transfer and, when the target is the Sales Order
+        warehouse, reserved again there by on_submit. What was released is
+        recorded so cancelling the transfer gives it back.
+        """
+        from madhav.madhav.doctype.party_transfer.party_transfer import (
+            proportional_pieces,
+            trim_reservation,
+        )
+
+        released = []
+        for row in self.transfer_item or []:
+            if not row.batch:
+                continue
+            warehouse = row.source_warehouse or self.source_warehouse
+            line = source_sales_order_line(
+                row.source_document_type, row.source_document_name, row.item_code, row.batch
+            )
+            if not line:
+                continue
+            remaining = flt(row.qty, 3)
+            entries = frappe.db.sql(
+                """
+                SELECT sre.name, sbe.qty, IFNULL(sbe.delivered_qty, 0) AS delivered_qty,
+                    IFNULL(sbe.pieces, 0) AS pieces, sbe.length, sbe.section_weight
+                FROM `tabStock Reservation Entry` sre
+                INNER JOIN `tabSerial and Batch Entry` sbe
+                    ON sbe.parent = sre.name AND sbe.parenttype = 'Stock Reservation Entry'
+                WHERE sre.docstatus = 1 AND sre.voucher_detail_no = %s AND sre.warehouse = %s
+                  AND sre.status IN ('Reserved', 'Partially Reserved', 'Partially Delivered')
+                  AND sbe.batch_no = %s
+                ORDER BY sre.creation
+                FOR UPDATE
+                """,
+                (line, warehouse, row.batch),
+                as_dict=True,
+            )
+            for e in entries:
+                if remaining <= 0.0005:
+                    break
+                open_qty = flt(flt(e.qty) - flt(e.delivered_qty), 3)
+                take = flt(min(open_qty, remaining), 3)
+                if take <= 0:
+                    continue
+                pieces = proportional_pieces(take, open_qty, flt(e.pieces) * open_qty / flt(e.qty) if flt(e.qty) else 0)
+                sre = frappe.get_doc("Stock Reservation Entry", e.name)
+                header_open = flt(sre.reserved_qty) - flt(sre.delivered_qty)
+                cancelled = flt(sre.delivered_qty) <= 0.0005 and abs(header_open - take) <= 0.0005
+                if cancelled:
+                    sre.flags.ignore_permissions = True
+                    sre.flags.ignore_links = True
+                    sre.cancel()
+                else:
+                    trim_reservation(sre, row.batch, take, pieces)
+                released.append({
+                    "sre": e.name, "batch_no": row.batch, "qty": take, "pieces": pieces,
+                    "warehouse": warehouse, "length": flt(e.length), "section_weight": flt(e.section_weight),
+                    "cancelled": int(cancelled), "row": row.name,
+                })
+                remaining = flt(remaining - take, 3)
+
+        if released:
+            frappe.get_doc({
+                "doctype": "Comment", "comment_type": "Info",
+                "reference_doctype": self.doctype, "reference_name": self.name,
+                "content": RELEASED_SRE_PREFIX + json.dumps(released),
+            }).insert(ignore_permissions=True)
+            frappe.msgprint(
+                _("Reservation for the same Sales Order line moved with the stock: {0}").format(
+                    ", ".join(f"{r['qty']} of {r['batch_no']} ({r['sre']})" for r in released)
+                ),
+                indicator="blue",
+                alert=True,
+            )
+        return released
+
+    def restore_released_reservations(self):
+        """On cancel: give back what release_own_line_reservations took."""
+        from madhav.madhav.doctype.party_transfer.party_transfer import (
+            recreate_reservation,
+            trim_reservation,
+        )
+
+        content = frappe.db.get_value(
+            "Comment",
+            {
+                "reference_doctype": self.doctype, "reference_name": self.name,
+                "content": ["like", RELEASED_SRE_PREFIX + "%"],
+            },
+            "content",
+        )
+        if not content:
+            return []
+        errors = []
+        for r in json.loads(content[len(RELEASED_SRE_PREFIX):]):
+            try:
+                source = frappe.get_doc("Stock Reservation Entry", r["sre"])
+                if source.docstatus == 1:
+                    trim_reservation(source, r["batch_no"], -flt(r["qty"]), -cint(r["pieces"]))
+                else:
+                    recreate_reservation(source, frappe._dict(
+                        transfer_qty=r["qty"], batch_no=r["batch_no"], warehouse=r["warehouse"],
+                        transfer_pieces=r["pieces"], length=r["length"], section_weight=r["section_weight"],
+                    ))
+            except Exception:
+                frappe.log_error(
+                    title="Stock Transfer Cancel - restore reservation",
+                    message=f"{self.name} / {r.get('sre')}\n{frappe.get_traceback()}",
+                )
+                errors.append(f"reservation {r.get('sre')}")
+        return errors
 
     def _validate_payload_length_for_reservation(self, payload):
         """Fail early when length is outside SO ±2 (before Stock Entry submit)."""
@@ -572,14 +731,19 @@ class StockTransfer(Document):
             warehouse = item.source_warehouse or self.source_warehouse
             live_qty = get_live_batch_qty(item.item_code, warehouse, item.batch)
             live_pieces = get_live_batch_pieces(item.item_code, warehouse, item.batch)
-            reserved = get_reserved_batch_map(warehouse, [item.batch]).get(item.batch) or {}
+            own_line = source_sales_order_line(
+                item.source_document_type, item.source_document_name, item.item_code, item.batch
+            )
+            reserved = get_reserved_batch_map(
+                warehouse, [item.batch], {item.batch: own_line} if own_line else None
+            ).get(item.batch) or {}
             batch_qty, batch_pieces = free_batch_limits(live_qty, live_pieces, reserved)
             item_pieces = flt(item.pieces)
             item_qty = flt(item.qty)
             reserved_note = ""
             if flt(reserved.get("qty")) > 0:
                 reserved_note = _(
-                    " {0} of it is reserved against a Sales Order; unreserve it first to move it."
+                    " {0} of it is reserved against another Sales Order line; unreserve it first to move it."
                 ).format(flt(reserved.get("qty"), 3))
 
             if batch_pieces is not None and item_pieces > batch_pieces:
@@ -977,8 +1141,18 @@ def get_batch_stock(
 
 
 def _exclude_reserved_stock(rows, warehouse):
-	"""Show only stock not reserved against a Sales Order (team, 14 Nov 2026)."""
-	reserved_map = get_reserved_batch_map(warehouse, [r.get("batch_no") for r in rows or []])
+	"""Leave out stock reserved for another Sales Order line (Harsh, 14 Nov 2026).
+
+	Stock reserved for the batch's own order line stays listed.
+	"""
+	own_lines = {}
+	for r in rows or []:
+		line = source_sales_order_line(
+			r.get("reference_doctype"), r.get("reference_name"), r.get("item_code"), r.get("batch_no")
+		)
+		if line:
+			own_lines[r.get("batch_no")] = line
+	reserved_map = get_reserved_batch_map(warehouse, [r.get("batch_no") for r in rows or []], own_lines)
 	out = []
 	for row in rows or []:
 		reserved = reserved_map.get(row.get("batch_no"))
@@ -996,13 +1170,18 @@ def _exclude_reserved_stock(rows, warehouse):
 
 
 @frappe.whitelist()
-def get_transfer_batch_limits(item_code, warehouse, batch_no):
+def get_transfer_batch_limits(item_code, warehouse, batch_no, source_document_type=None, source_document_name=None):
 	"""Live qty/pieces in warehouse for Stock Transfer row validation.
 
 	Batch.batch_qty / Batch.pieces are receipt-size totals and stay wrong
 	after a partial Material Transfer — do not use them as transfer caps.
+	Stock reserved for another order line is not free; stock reserved for
+	the batch's own line (from its source document) is.
 	"""
-	reserved = get_reserved_batch_map(warehouse, [batch_no]).get(batch_no) or {}
+	own_line = source_sales_order_line(source_document_type, source_document_name, item_code, batch_no)
+	reserved = get_reserved_batch_map(
+		warehouse, [batch_no], {batch_no: own_line} if own_line else None
+	).get(batch_no) or {}
 	qty, pieces = free_batch_limits(
 		get_live_batch_qty(item_code, warehouse, batch_no),
 		get_live_batch_pieces(item_code, warehouse, batch_no),

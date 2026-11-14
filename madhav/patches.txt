@@ -16,3 +16,5 @@ madhav.patches.v1_0.ensure_dn_item_sw_qty
 madhav.patches.v1_0.party_transfer_work_order_recount
 madhav.patches.v1_0.party_transfer_reports_no_total
 madhav.patches.v1_0.recount_sales_order_work_order_qty
+madhav.patches.v1_0.work_order_pending_qty_recount
+madhav.patches.v1_0.delivery_note_invoice_qty_totals
