@@ -615,7 +615,8 @@ function open_sales_order_items_selector_for_delivery_note(frm) {
 				let taxes_changed = false;
 				const skipped_charges = [];
 				results.forEach(r => {
-					if (r && r.message) {
+					// Only an order that actually brought rows brings its charges.
+					if (r && r.message && (r.message.items || []).length) {
 						const res = apply_sales_order_taxes(frm, r.message);
 						taxes_changed = taxes_changed || res.changed;
 						skipped_charges.push(...res.skipped);
