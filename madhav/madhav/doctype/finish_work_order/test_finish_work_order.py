@@ -275,3 +275,24 @@ class TestFwoEntryValues(unittest.TestCase):
 	def test_submit_throws_first_entry_error(self):
 		with self.assertRaises(frappe.ValidationError):
 			self._errors([self._row(ready_pieces=-1), self._row(idx=2, ready_pieces=0)], action="submit")
+
+
+class TestFetchPendingWorkOrders(unittest.TestCase):
+	"""Fetch Pending Work Orders leaves Closed / Stopped Work Orders out.
+
+	Closing gives the unmade quantity back to planning; the new plan's Work
+	Order makes it, so fetching the closed one too doubled the quantity
+	(demo: MFG-WO-2026-04888 closed and MFG-WO-2026-04889 both fetched).
+	"""
+
+	def test_closed_and_stopped_excluded(self):
+		from unittest.mock import patch
+
+		from madhav import api
+
+		with patch.object(api.frappe.db, "sql", return_value=[]) as sql:
+			api.populate_pending_work_orders({"company": "C"})
+		query = sql.call_args[0][0]
+		self.assertIn("'Closed'", query)
+		self.assertIn("'Stopped'", query)
+		self.assertIn("wo.status NOT IN", query)

@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+
 import frappe
 from frappe import _
 from erpnext.manufacturing.doctype.production_plan.production_plan import ProductionPlan as ERPNextProductionPlan
@@ -15,7 +17,30 @@ from frappe.utils import (
 )
 
 
+from madhav.madhav.utils.production_demand import (
+	free_stock_sources_sql,
+	get_effective_planned,
+	get_production_coverage,
+	lines_with_planned_reductions,
+)
+
+
 INCHES_PER_METER = 39.37
+
+
+@contextmanager
+def demand_cache():
+	"""Per-call cache for effective-planned figures (Get Items / Get Sales Orders).
+
+	Lines without a Work Order release or transfer skip the extra queries
+	(frappe.flags.pp_reduced_lines is set by the caller inside).
+	"""
+	frappe.flags.pp_demand_cache = {}
+	try:
+		yield
+	finally:
+		frappe.flags.pp_demand_cache = None
+		frappe.flags.pp_reduced_lines = None
 
 def meters_to_inches(value):
 	try:
@@ -44,7 +69,7 @@ def get_already_reserved_qty(sales_order_item):
 			where voucher_type = 'Sales Order'
 				and voucher_detail_no = %s
 				and docstatus = 1
-				and from_voucher_type = 'Batch Wise Reservation Tool'
+				and from_voucher_type in {free_stock_sources_sql()}
 				{tolerance_filter}
 			""",
 			sales_order_item,
@@ -91,7 +116,44 @@ def get_already_reserved_pieces(sales_order_item):
 		if staged_qty <= 0 or open_qty <= 0:
 			continue
 		total_pieces += flt(r.staged_pieces) * min(1, open_qty / staged_qty)
-	return total_pieces
+	return total_pieces + get_party_transfer_received_pieces(sales_order_item).open
+
+
+def get_party_transfer_received_pieces(sales_order_item):
+	"""Pieces this line received from other parties through Party Transfer.
+
+	Split into still-reserved (open) and already delivered, scaled by the
+	received reservation's own delivered share - the same way BWRT pieces
+	are scaled above.
+	"""
+	out = frappe._dict(open=0.0, delivered=0.0)
+	if not sales_order_item or not frappe.db.table_exists("Party Transfer Item"):
+		return out
+	rows = frappe.db.sql(
+		"""
+		select pti.transfer_qty, pti.transfer_pieces,
+			sre.reserved_qty, sre.delivered_qty
+		from `tabParty Transfer Item` pti
+		inner join `tabParty Transfer` pt on pt.name = pti.parent
+		inner join `tabStock Reservation Entry` sre
+			on sre.from_voucher_type = 'Party Transfer'
+			and sre.from_voucher_detail_no = pti.name
+			and sre.docstatus = 1
+		where pt.to_sales_order_item = %s and pt.docstatus = 1
+		""",
+		sales_order_item,
+		as_dict=True,
+	)
+	for r in rows:
+		basis = flt(r.transfer_qty)
+		if basis <= 0 or flt(r.transfer_pieces) <= 0:
+			continue
+		# The received reservation can later shrink (passed on to a third
+		# party), so scale by its current reserved and delivered figures.
+		open_qty = max(0.0, flt(r.reserved_qty) - flt(r.delivered_qty))
+		out.delivered += flt(r.transfer_pieces) * min(1, flt(r.delivered_qty) / basis)
+		out.open += flt(r.transfer_pieces) * min(1, open_qty / basis)
+	return out
 
 
 def get_bwrt_delivered_qty(sales_order_item):
@@ -113,7 +175,7 @@ def get_bwrt_delivered_qty(sales_order_item):
 			where voucher_type = 'Sales Order'
 				and voucher_detail_no = %s
 				and docstatus = 1
-				and from_voucher_type = 'Batch Wise Reservation Tool'
+				and from_voucher_type in {free_stock_sources_sql()}
 				{tolerance_filter}
 			""",
 			sales_order_item,
@@ -157,7 +219,7 @@ def get_bwrt_delivered_pieces(sales_order_item):
 		if staged_qty <= 0 or flt(r.delivered_qty) <= 0:
 			continue
 		total += flt(r.staged_pieces) * min(1, flt(r.delivered_qty) / staged_qty)
-	return total
+	return total + get_party_transfer_received_pieces(sales_order_item).delivered
 
 
 def get_delivered_pieces(sales_order_item):
@@ -190,26 +252,34 @@ def get_delivered_pieces(sales_order_item):
 
 
 def pending_for_new_production_plan(
-	so_qty, production_plan_qty, delivered, bwrt_open=0, bwrt_delivered=0
+	so_qty, production_plan_qty, delivered, bwrt_open=0, bwrt_delivered=0, production_open=0
 ):
 	"""Qty (or pieces) of an SO line still to put on a new Production Plan.
 
 	Delivery is counted once: what left through a planned Work Order is
 	already inside ``production_plan_qty``, so only the larger of the two
-	is subtracted. Batch Wise Reservation Tool stock (open or delivered)
-	came from free stock and is subtracted on top.
+	is subtracted. Production still reserved for the line
+	(``production_open``, Finish Work Order / Stock Transfer reservations)
+	counts with the delivery: when the line's own production went beyond its
+	plan (e.g. extra pieces in another length), the extra is covered too.
+	Batch Wise Reservation Tool stock (open or delivered) came from free
+	stock and is subtracted on top.
 
 	SO 100, PP 60, 60 delivered from production -> 40 (not 0).
 	SO 100, BWRT 30 delivered, PP 70            -> 0.
 	SO 100, no PP, 20 delivered from stock      -> 80.
+	SO 10, PP 5.98, 6.435 produced and reserved   -> 3.565.
 	"""
 	delivered_outside_bwrt = max(0, flt(delivered) - flt(bwrt_delivered))
 	return max(
 		0,
-		flt(so_qty)
-		- max(flt(production_plan_qty), delivered_outside_bwrt)
-		- flt(bwrt_open)
-		- flt(bwrt_delivered),
+		flt(
+			flt(so_qty)
+			- max(flt(production_plan_qty), delivered_outside_bwrt + flt(production_open))
+			- flt(bwrt_open)
+			- flt(bwrt_delivered),
+			6,
+		),
 	)
 
 
@@ -236,9 +306,11 @@ def remaining_qty_for_new_production_plan(
 def get_remaining_unreserved_stock_qty(sales_order_item):
 	"""SO stock still available to plan on a new Production Plan.
 
-	Uses submitted ``production_plan_qty``, not live reservations. Reservations
-	fill an already-planned bucket and are offered again on BWRT for that
-	leftover; they must not inflate the next plan's Get Items qty.
+	Uses submitted ``production_plan_qty``. Reservations fill an
+	already-planned bucket and are offered again on BWRT for that leftover;
+	they must not inflate the next plan's Get Items qty. Production that went
+	beyond the plan (e.g. extra pieces made in another length on the Finish
+	Work Order) does cover the line, so it is not planned again.
 	"""
 	so_item = frappe.db.get_value(
 		"Sales Order Item",
@@ -249,30 +321,57 @@ def get_remaining_unreserved_stock_qty(sales_order_item):
 			"conversion_factor",
 			"delivered_qty",
 			"production_plan_qty",
+			"production_plan_pieces",
 		],
 		as_dict=True,
 	)
 	if not so_item:
 		return 0
 	conversion_factor = flt(so_item.conversion_factor) or 1
+	# Planned production that Work Orders released (closed / cancelled) or
+	# that a Party Transfer gave to another order no longer covers this line.
+	effective_planned = get_effective_planned(
+		sales_order_item, so_item.production_plan_qty, so_item.production_plan_pieces
+	).qty
 	return pending_for_new_production_plan(
 		flt(so_item.stock_qty) or flt(so_item.qty) * conversion_factor,
-		so_item.production_plan_qty,
+		effective_planned,
 		flt(so_item.delivered_qty) * conversion_factor,
 		get_already_reserved_qty(sales_order_item),
 		get_bwrt_delivered_qty(sales_order_item),
+		production_open=get_production_coverage(sales_order_item)[0],
 	)
 
 
 def get_remaining_pieces_for_new_production_plan(sales_order_item, so_pieces, production_plan_pieces):
 	"""Pieces still to plan, using the same rule as the qty."""
+	effective_planned_pieces = get_effective_planned(
+		sales_order_item, None, production_plan_pieces
+	).pieces
 	return pending_for_new_production_plan(
 		so_pieces,
-		production_plan_pieces,
+		effective_planned_pieces,
 		get_delivered_pieces(sales_order_item),
 		get_already_reserved_pieces(sales_order_item),
 		get_bwrt_delivered_pieces(sales_order_item),
+		production_open=production_open_pieces(sales_order_item, so_pieces),
 	)
+
+
+def production_open_pieces(sales_order_item, so_pieces):
+	"""Production still reserved for the line, in the order's own pieces.
+
+	Extra production can be in another length (more or fewer pieces per
+	tonne), so the reserved tonnes are converted at the order line's pieces
+	per tonne, to whole pieces. That keeps pieces left in step with tonnes left.
+	"""
+	open_qty = get_production_coverage(sales_order_item)[0]
+	if open_qty <= 0 or flt(so_pieces) <= 0:
+		return 0.0
+	so_qty = flt(frappe.db.get_value("Sales Order Item", sales_order_item, "stock_qty"))
+	if so_qty <= 0:
+		return 0.0
+	return float(round(flt(so_pieces) * open_qty / so_qty))
 
 
 class CustomProductionPlan(ERPNextProductionPlan):
@@ -292,14 +391,33 @@ class CustomProductionPlan(ERPNextProductionPlan):
 	def get_items(self):
 		self.set("po_items", [])
 		if self.get_items_from == "Sales Order":
-			self.custom_get_so_items()
+			with demand_cache():
+				self.custom_get_so_items()
 		elif self.get_items_from == "Material Request":
 			self.get_mr_items()
 
 	@frappe.whitelist()
+	def validate_sales_orders(self, sales_order=None):
+		"""ERPNext only accepts orders with a line whose qty is above its
+		planned qty. An order whose planned quantity was released by a Work
+		Order or given away by a Party Transfer can be planned again too."""
+		sales_orders = [sales_order] if sales_order else [r.sales_order for r in self.sales_orders if r.sales_order]
+		if not sales_orders:
+			return
+		data = sales_order_query(filters={"company": self.company, "sales_orders": sales_orders})
+		available = {d[0] for d in data}
+		missing = [so for so in sales_orders if so not in available]
+		if missing:
+			msg = _("No items are available in the sales order {0} for production").format(missing[0])
+			if len(missing) > 1:
+				msg = _("No items are available in sales orders {0} for production").format(", ".join(missing))
+			frappe.throw(msg, title=_("Production Plan Already Submitted"))
+
+	@frappe.whitelist()
 	def get_open_sales_orders(self):
 		"""Pull sales orders which are pending to deliver based on criteria selected"""
-		open_so = custom_get_sales_orders(self)
+		with demand_cache():
+			open_so = custom_get_sales_orders(self)
 		if open_so:
 			self.add_so_in_table(open_so)
 		else:
@@ -344,6 +462,21 @@ class CustomProductionPlan(ERPNextProductionPlan):
 
 		item = frappe.qb.DocType("Item")
 
+		# A line whose Work Orders cover its whole qty can still have
+		# something to plan when a Work Order was closed / cancelled or its
+		# stock was given to another party; the Python rule below decides.
+		open_to_plan = so_item.qty > so_item.work_order_qty
+		reduced_lines = lines_with_planned_reductions(
+			frappe.get_all(
+				"Sales Order Item",
+				filters={"parent": ["in", so_list], "docstatus": 1},
+				pluck="name",
+			)
+		)
+		frappe.flags.pp_reduced_lines = reduced_lines
+		if reduced_lines:
+			open_to_plan = open_to_plan | so_item.name.isin(list(reduced_lines))
+
 		items_query = (
 			frappe.qb.from_(so_item)
 			.select(
@@ -366,7 +499,7 @@ class CustomProductionPlan(ERPNextProductionPlan):
 				(so_item.parent.isin(so_list))
 				& (so_item.docstatus == 1)
 				& (so_item.is_manufacture == 1)
-				& (so_item.qty > so_item.work_order_qty)
+				& open_to_plan
 			)
 		)
 
@@ -395,6 +528,12 @@ class CustomProductionPlan(ERPNextProductionPlan):
 				flt(item.qty)
 				- max(item.work_order_qty, item.delivered_qty, 0)
 			) * item.conversion_factor
+			# ERPNext's add_items() skips rows with no pending qty. A line
+			# whose Work Orders cover its whole qty can still need planning
+			# after a Work Order release or a Party Transfer, so give it the
+			# remaining qty now (the loop below sets the final figure).
+			if item.name in reduced_lines:
+				item.pending_qty = get_remaining_unreserved_stock_qty(item.name)
 
 		pi = frappe.qb.DocType("Packed Item")
 
@@ -559,6 +698,15 @@ def custom_get_sales_orders(self):
 
 	item = frappe.qb.DocType("Item")
 
+	# Lines fully covered by submitted plans can still have something to
+	# plan after a Work Order release or a Party Transfer; the remaining
+	# qty rule further down decides per line.
+	open_to_plan = so_item.qty > so_item.production_plan_qty
+	reduced_lines = lines_with_planned_reductions(open_orders_only=True)
+	frappe.flags.pp_reduced_lines = reduced_lines
+	if reduced_lines:
+		open_to_plan = open_to_plan | so_item.name.isin(list(reduced_lines))
+
 	open_so_query = (
 		frappe.qb.from_(so)
 		.join(so_item).on(so_item.parent == so.name)
@@ -577,7 +725,7 @@ def custom_get_sales_orders(self):
 			(so.docstatus == 1)
 			& (so.status.notin(["Stopped", "Closed", "Completed"]))
 			& (so.company == self.company)
-			& (so_item.qty > so_item.production_plan_qty)
+			& open_to_plan
 			# Fully delivered lines have nothing left to produce.
 			& (so_item.qty > so_item.delivered_qty)
 		)
@@ -644,3 +792,40 @@ def custom_get_sales_orders(self):
 		)
 
 	return result
+
+
+@frappe.whitelist()
+def sales_order_query(doctype=None, txt=None, searchfield=None, start=None, page_len=None, filters=None):
+	"""ERPNext's sales_order_query, also listing orders whose planned quantity
+	was released (closed / cancelled Work Order) or given to another order."""
+	frappe.has_permission("Production Plan", throw=True)
+	filters = frappe.parse_json(filters) if isinstance(filters, str) else (filters or {})
+
+	so_table = frappe.qb.DocType("Sales Order")
+	table = frappe.qb.DocType("Sales Order Item")
+	open_to_plan = table.qty > table.production_plan_qty
+	reduced = lines_with_planned_reductions(open_orders_only=True)
+	if reduced:
+		open_to_plan = open_to_plan | table.name.isin(list(reduced))
+
+	query = (
+		frappe.qb.from_(so_table)
+		.join(table)
+		.on(table.parent == so_table.name)
+		.select(table.parent)
+		.distinct()
+		.where(open_to_plan & (table.docstatus == 1))
+	)
+	if filters.get("company"):
+		query = query.where(so_table.company == filters.get("company"))
+	if filters.get("sales_orders"):
+		query = query.where(so_table.name.isin(filters.get("sales_orders")))
+	if filters.get("item_code"):
+		query = query.where(table.item_code == filters.get("item_code"))
+	if txt:
+		query = query.where(table.parent.like(f"%{txt}%"))
+	if page_len:
+		query = query.limit(page_len)
+	if start:
+		query = query.offset(start)
+	return query.run()

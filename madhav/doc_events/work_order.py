@@ -6,71 +6,33 @@ def validate(self,method):
     self.db_set("pending_pcs",flt(self.pieces) - flt(self.completed_pcs))
     self.db_set("pending_qty",flt(self.qty) - flt(self.produced_qty))
 
-def update_so_pieces_from_work_order(doc, method=None):
+def recompute_work_order_pieces(sales_order_item):
+    """Sales Order Item.work_order_pieces = pieces of its submitted Work
+    Orders, counting a Closed one only for the pieces it actually made.
 
-    if not doc.sales_order_item:
+    Recounting (instead of adding on submit and subtracting on cancel) keeps
+    the figure right after closes, repeated closes and cancels of closed
+    Work Orders."""
+    if not sales_order_item:
         return
-
-    # Existing SO values
-    so_item = frappe.db.get_value(
-        "Sales Order Item",
-        doc.sales_order_item,
-        ["pieces", "work_order_pieces"],
-        as_dict=True
-    )
-
-    current_so_pieces = so_item.pieces or 0
-    existing_wo_pieces = so_item.work_order_pieces or 0
-
-    # Current WO pieces (parent field in Work Order)
-    current_wo_pieces = doc.pieces or 0
-
-    # Remaining SO pieces
-    new_so_pieces = current_so_pieces - current_wo_pieces
-
-    # Total WO pieces
-    new_wo_total = existing_wo_pieces + current_wo_pieces
-
+    total = frappe.db.sql(
+        """
+        select ifnull(sum(case when status = 'Closed' then least(ifnull(completed_pcs, 0), ifnull(pieces, 0))
+            else ifnull(pieces, 0) end), 0)
+        from `tabWork Order`
+        where sales_order_item = %s and docstatus = 1
+            and ifnull(production_plan_sub_assembly_item, '') = ''
+        """,
+        sales_order_item,
+    )[0][0]
     frappe.db.set_value(
-        "Sales Order Item",
-        doc.sales_order_item,
-        {
-           
-            "work_order_pieces": new_wo_total
-        },
-        update_modified=False
+        "Sales Order Item", sales_order_item, "work_order_pieces", max(0, flt(total)), update_modified=False
     )
-    
+
+
+def update_so_pieces_from_work_order(doc, method=None):
+    recompute_work_order_pieces(doc.sales_order_item)
+
 
 def revert_so_pieces_from_work_order(doc, method=None):
-
-    # Only WO from PP
-    if not doc.production_plan:
-        return
-
-    if not doc.sales_order_item:
-        return
-
-    so_item = frappe.db.get_value(
-        "Sales Order Item",
-        doc.sales_order_item,
-        ["pieces", "work_order_pieces"],
-        as_dict=True
-    )
-
-    current_so_pieces = so_item.pieces or 0
-    existing_wo_pieces = so_item.work_order_pieces or 0
-
-    cancelled_wo_pieces = doc.pieces or 0
-
-    restored_so_pieces = current_so_pieces + cancelled_wo_pieces
-    new_wo_total = existing_wo_pieces - cancelled_wo_pieces
-
-    frappe.db.set_value(
-        "Sales Order Item",
-        doc.sales_order_item,
-        {
-            "work_order_pieces": new_wo_total
-        },
-        update_modified=False
-    )
+    recompute_work_order_pieces(doc.sales_order_item)

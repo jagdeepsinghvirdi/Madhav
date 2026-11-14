@@ -116,3 +116,20 @@ class TestPendingForNewProductionPlan(FrappeTestCase):
 
 	def test_over_delivery_floors_at_zero(self):
 		self.assertEqual(self._pending(100, 0, 103), 0)
+
+	def test_production_beyond_plan_is_covered(self):
+		# MU-SO26-00596 / FG001394 on demo: SO 10, planned 5.98, Finish Work
+		# Order made 5.315 at length 9 plus 1.12 at length 8.5 (6.435 reserved),
+		# 0.42 spare stock reserved. Only 3.145 is left, not 3.6.
+		self.assertAlmostEqual(self._pending(10, 5.98, 0, bwrt_open=0.42, production_open=6.435), 3.145, places=6)
+
+	def test_production_below_plan_keeps_plan(self):
+		self.assertEqual(self._pending(100, 60, 0, production_open=30), 40)
+
+	def test_production_delivered_and_held_counted_once(self):
+		# 6.435 made: 2 delivered, 4.435 still reserved.
+		self.assertAlmostEqual(self._pending(10, 5.98, 2, production_open=4.435), 3.565, places=6)
+
+	def test_unplanned_production_is_covered(self):
+		# Made without a Production Plan (Finish Work Order "Make it Unplanned").
+		self.assertEqual(self._pending(10, 0, 0, production_open=4), 6)

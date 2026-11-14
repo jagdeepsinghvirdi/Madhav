@@ -1,4 +1,5 @@
 import frappe
+from frappe import _
 from frappe.utils import flt, cint
 from erpnext.manufacturing.doctype.work_order.work_order import WorkOrder as ERPNextWorkOrder
 
@@ -22,9 +23,13 @@ class WorkOrder(ERPNextWorkOrder):
 
         cond = "product_bundle_item = %s" if self.product_bundle_item else "production_item = %s"
 
+        # A closed Work Order still made what it produced, so that part keeps
+        # counting; only the unmade balance drops out. (Standard ERPNext drops
+        # the whole closed Work Order, which made the Sales Order look as if
+        # the produced stock had never been made.)
         qty = frappe.db.sql(
-            f""" select sum(qty) from
-            `tabWork Order` where sales_order = %s and sales_order_item = %s and docstatus = 1 and status <> 'Closed' and {cond}
+            f""" select sum(case when status = 'Closed' then least(produced_qty, qty) else qty end) from
+            `tabWork Order` where sales_order = %s and sales_order_item = %s and docstatus = 1 and {cond}
             """,
             (self.sales_order,self.sales_order_item, (self.product_bundle_item or self.production_item)),
             as_list=1,
@@ -37,6 +42,117 @@ class WorkOrder(ERPNextWorkOrder):
             "work_order_qty",
             flt(work_order_qty / total_bundle_qty, 3),
         )
+
+    def on_close_or_cancel(self):
+        super().on_close_or_cancel()
+        # Close gives back only the pieces never made; recount from the Work
+        # Orders so repeated closes or a later cancel can't drift.
+        if self.status == "Closed" and self.sales_order_item:
+            from madhav.doc_events.work_order import recompute_work_order_pieces
+
+            recompute_work_order_pieces(self.sales_order_item)
+
+    def on_cancel(self):
+        super().on_cancel()
+        # Remember how much of the order line was planned when this Work Order
+        # gave its quantity back (see validate_released_plan_qty).
+        if self.sales_order_item and self.meta.has_field("planned_qty_at_cancel"):
+            self.db_set(
+                "planned_qty_at_cancel",
+                flt(frappe.db.get_value("Sales Order Item", self.sales_order_item, "production_plan_qty")),
+                update_modified=False,
+            )
+
+    def validate_qty(self):
+        super().validate_qty()
+        self.validate_released_plan_qty()
+
+    def validate_released_plan_qty(self):
+        """Don't plan the same quantity twice.
+
+        A cancelled Work Order gives its quantity back to the Sales Order line,
+        and a new Production Plan can pick it up. Once a newer Production Plan
+        has planned that line, the old plan row must not make a Work Order for
+        the released quantity as well. Until then, re-making it from the old
+        row (Cancel & Amend, splitting a Work Order) is fine: the release then
+        simply shrinks again.
+
+        Runs on save and on submit (Production Plan "Make Work Order" inserts
+        drafts without validation, so submit is where it is caught).
+        """
+        if (
+            self.docstatus == 2
+            or self.get("_action") == "update_after_submit"
+            or not self.production_plan_item
+            or self.production_plan_sub_assembly_item
+            or not self.sales_order_item
+            or self.flags.get("party_transfer_replacement")
+        ):
+            return
+        from madhav.madhav.utils.production_demand import get_plan_row_cancel_release
+
+        released = get_plan_row_cancel_release(self.production_plan_item, exclude_work_order=self.name)
+        if released.qty <= 0.0005:
+            return
+        # Was the order line planned again since the cancel? Compare its planned
+        # qty now with what it was when the Work Order was cancelled (recorded on
+        # the cancelled Work Order); this also catches a draft plan that was
+        # created earlier and submitted after the cancel.
+        snapshot = None
+        if frappe.get_meta("Work Order").has_field("planned_qty_at_cancel"):
+            snapshot = frappe.db.sql(
+                """select max(ifnull(planned_qty_at_cancel, 0)) from `tabWork Order`
+                where production_plan_item = %s and docstatus = 2 and name != %s""",
+                (self.production_plan_item, self.name or ""),
+            )[0][0]
+        line_planned = flt(frappe.db.get_value("Sales Order Item", self.sales_order_item, "production_plan_qty"))
+        if flt(snapshot) > 0:
+            if line_planned <= flt(snapshot) + 0.0005:
+                return
+        else:
+            # Cancelled before the snapshot existed: fall back to plan creation time.
+            last_cancel = frappe.db.sql(
+                """select max(modified) from `tabWork Order`
+                where production_plan_item = %s and docstatus = 2 and name != %s""",
+                (self.production_plan_item, self.name or ""),
+            )[0][0]
+            if not frappe.db.sql(
+                """select pp.name from `tabProduction Plan Item` ppi
+                inner join `tabProduction Plan` pp on pp.name = ppi.parent
+                where ppi.sales_order_item = %s and pp.docstatus = 1 and pp.name != %s and pp.modified > %s
+                limit 1""",
+                (self.sales_order_item, self.production_plan, last_cancel),
+            ):
+                return
+        replanned_by = frappe.db.sql(
+            """select pp.name from `tabProduction Plan Item` ppi
+            inner join `tabProduction Plan` pp on pp.name = ppi.parent
+            where ppi.sales_order_item = %s and pp.docstatus = 1 and pp.name != %s
+            order by pp.modified desc limit 1""",
+            (self.sales_order_item, self.production_plan),
+        ) or [[_("another Production Plan")]]
+        planned = flt(frappe.db.get_value("Production Plan Item", self.production_plan_item, "planned_qty"))
+        ordered = flt(
+            frappe.db.sql(
+                """select ifnull(sum(qty), 0) from `tabWork Order`
+                where production_plan_item = %s and docstatus = 1 and name != %s""",
+                (self.production_plan_item, self.name or ""),
+            )[0][0]
+        )
+        allowance = flt(frappe.db.get_single_value("Manufacturing Settings", "overproduction_percentage_for_work_order"))
+        open_qty = max(0.0, planned - ordered - released.qty)
+        max_qty = flt(open_qty * (1 + allowance / 100), 3)
+        if flt(self.qty) > max_qty + 0.0005:
+            frappe.throw(
+                frappe._(
+                    "{0} of Production Plan {1} was given back to Sales Order {2} when its Work Order was "
+                    "cancelled, and Production Plan {3} has planned that order line since. "
+                    "Making it here as well would plan it twice. This plan row can still make {4}."
+                ).format(
+                    flt(released.qty, 3), self.production_plan, self.sales_order, replanned_by[0][0], max_qty
+                ),
+                title=frappe._("Quantity already planned again"),
+            )
 
 @frappe.whitelist()
 def make_stock_entry(work_order_id, purpose, qty=None, target_warehouse=None):

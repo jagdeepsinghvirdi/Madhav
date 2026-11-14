@@ -606,7 +606,9 @@ function apply_work_order_filters(frm) {
                 creation: ['between', [
                     frm.doc.date + ' 00:00:00',
                     frm.doc.date + ' 23:59:59'
-                ]]
+                ]],
+                // Same Work Orders that Fetch Pending Work Orders brings in.
+                status: ['not in', ['Draft', 'Completed', 'Cancelled', 'Closed', 'Stopped']]
             },
             fields: ['sales_order', 'name', 'customer'],
             limit_page_length: 0

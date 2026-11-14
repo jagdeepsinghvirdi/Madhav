@@ -1,0 +1,222 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "naming_series:",
+ "creation": "2026-11-12 19:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "is_submittable": 1,
+ "track_changes": 1,
+ "module": "Madhav",
+ "name": "Party Transfer",
+ "naming_rule": "By \"Naming Series\" field",
+ "owner": "Administrator",
+ "modified": "2026-11-13 10:00:00.000000",
+ "modified_by": "Administrator",
+ "description": "Move reserved finished goods from one customer's order to another. The stock stays where it is; only the reservation moves. The giving order's quantity becomes available for a new Production Plan.",
+ "field_order": [
+  "section_to",
+  "naming_series",
+  "to_sales_order",
+  "to_line",
+  "to_sales_order_item",
+  "column_break_to",
+  "to_customer",
+  "to_customer_name",
+  "item_code",
+  "item_name",
+  "section_from",
+  "items",
+  "section_totals",
+  "total_qty",
+  "total_pieces",
+  "column_break_totals",
+  "posting_date",
+  "company",
+  "remarks",
+  "amended_from"
+ ],
+ "fields": [
+  {
+   "fieldname": "section_to",
+   "fieldtype": "Section Break",
+   "label": "Give stock to"
+  },
+  {
+   "fieldname": "naming_series",
+   "fieldtype": "Select",
+   "label": "Series",
+   "options": "PTR-.YY.-.####",
+   "default": "PTR-.YY.-.####",
+   "hidden": 1,
+   "reqd": 1,
+   "no_copy": 1,
+   "print_hide": 1
+  },
+  {
+   "fieldname": "to_sales_order",
+   "fieldtype": "Link",
+   "label": "To Sales Order",
+   "options": "Sales Order",
+   "reqd": 1,
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "description": "The order that needs the stock now (Party B)."
+  },
+  {
+   "fieldname": "to_line",
+   "fieldtype": "Autocomplete",
+   "label": "To Order Line",
+   "description": "Type the item code or line number to find the line that needs the stock."
+  },
+  {
+   "fieldname": "to_sales_order_item",
+   "fieldtype": "Data",
+   "label": "To Sales Order Item",
+   "read_only": 1,
+   "hidden": 1,
+   "reqd": 0,
+   "search_index": 1
+  },
+  {
+   "fieldname": "column_break_to",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "to_customer",
+   "fieldtype": "Link",
+   "label": "To Customer",
+   "options": "Customer",
+   "read_only": 1,
+   "in_list_view": 1,
+   "in_standard_filter": 1
+  },
+  {
+   "fieldname": "to_customer_name",
+   "fieldtype": "Data",
+   "label": "To Customer Name",
+   "read_only": 1
+  },
+  {
+   "fieldname": "item_code",
+   "fieldtype": "Link",
+   "label": "Item",
+   "options": "Item",
+   "read_only": 1,
+   "in_list_view": 1,
+   "in_standard_filter": 1
+  },
+  {
+   "fieldname": "item_name",
+   "fieldtype": "Data",
+   "label": "Item Name",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_from",
+   "fieldtype": "Section Break",
+   "label": "Take it from these reservations",
+   "description": "Every open reservation of this item on other orders is listed. Enter the quantity to move on the rows you want; leave the rest at 0."
+  },
+  {
+   "fieldname": "items",
+   "fieldtype": "Table",
+   "label": "Reservations",
+   "options": "Party Transfer Item",
+   "reqd": 1
+  },
+  {
+   "fieldname": "section_totals",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "total_qty",
+   "fieldtype": "Float",
+   "label": "Total Qty",
+   "read_only": 1,
+   "in_list_view": 1,
+   "precision": "3"
+  },
+  {
+   "fieldname": "total_pieces",
+   "fieldtype": "Int",
+   "label": "Total Pieces",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_totals",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "posting_date",
+   "fieldtype": "Date",
+   "label": "Posting Date",
+   "default": "Today",
+   "reqd": 1
+  },
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "label": "Company",
+   "options": "Company",
+   "read_only": 1,
+   "reqd": 0
+  },
+  {
+   "fieldname": "remarks",
+   "fieldtype": "Small Text",
+   "label": "Remarks"
+  },
+  {
+   "fieldname": "amended_from",
+   "fieldtype": "Link",
+   "label": "Amended From",
+   "options": "Party Transfer",
+   "read_only": 1,
+   "no_copy": 1,
+   "print_hide": 1
+  }
+ ],
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "submit": 1,
+   "cancel": 1,
+   "amend": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Sales User",
+   "share": 1,
+   "submit": 1,
+   "write": 1
+  },
+  {
+   "read": 1,
+   "report": 1,
+   "print": 1,
+   "export": 1,
+   "role": "Manufacturing User"
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "to_customer_name",
+ "links": []
+}
