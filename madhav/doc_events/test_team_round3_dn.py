@@ -61,6 +61,8 @@ class TestInvoiceQtyTotals(FrappeTestCase):
 
 # ------------------------------------------------------------------ item 5
 class FakeBundle(SimpleNamespace):
+	name = "SABB-00037964"
+
 	def save(self, **kw):
 		self.saved = getattr(self, "saved", 0) + 1
 
@@ -116,9 +118,10 @@ class TestDraftBundleFollowsRowQty(FrappeTestCase):
 		self.assertAlmostEqual(bundle.total_qty, -1.0)
 		self.assertAlmostEqual(bundle.entries[0].qty, -1.0)
 		self.assertEqual(bundle.saved, 1)
-		# 1.0 t / (6.575 m × 16.58 kg/m) ≈ 9.2 pieces
-		self.assertEqual(item.pieces, 9)
-		self.assertEqual(bundle.entries[0].pieces, 9)
+		# 1.0 t / (6.575 m × 16.58 kg/m) = 9.17 pieces; the app's whole-piece
+		# rule (int_pieces_from_qty) rounds up, as on insert.
+		self.assertEqual(item.pieces, 10)
+		self.assertEqual(bundle.entries[0].pieces, 10)
 
 	def test_back_up_to_reserved_qty_restores_pieces(self):
 		bundle = FakeBundle(entries=[_entry("MUBT-12505", 1.0, 9)], total_qty=-1.0, flags=frappe._dict())
