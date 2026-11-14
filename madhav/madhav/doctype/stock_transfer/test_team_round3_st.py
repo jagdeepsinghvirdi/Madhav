@@ -1,15 +1,12 @@
 # Copyright (c) 2026, Finbyz pvt. ltd. and Contributors
 # See license.txt
 
-"""Team feedback 14 Nov 2026, item 2: Stock Transfer must not offer stock
-reserved against a Sales Order until it is unreserved.
-
-Rule: every open reservation in the source warehouse counts, whichever Sales
-Order (or line) it is for. A Material Transfer takes the batch out of the
-reservation's warehouse, which would orphan the reservation. Quality
-Inspection → Finished Goods transfers are unaffected because finished goods
-are not reserved in the Quality Inspection warehouse (Finish Work Order skips
-the reservation for QI rows).
+"""Team feedback 14 Nov 2026, item 2 (rule as decided by Harsh, 14 Nov):
+Stock Transfer does not offer stock reserved for ANOTHER Sales Order line.
+Stock reserved for the batch's own line stays available; its reservation is
+released on submit, reserved again in the target warehouse for the same line,
+and given back if the transfer is cancelled. Quality Inspection → Finished
+Goods transfers are unaffected (nothing is reserved in QI warehouses).
 """
 
 from types import SimpleNamespace

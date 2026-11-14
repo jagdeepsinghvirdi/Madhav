@@ -96,7 +96,8 @@ def get_reserved_batch_map(warehouse, batch_nos, own_lines=None):
 	"""Open Sales Order reservations per batch in one warehouse.
 
 	Returns ``{batch_no: {"qty": undelivered reserved qty, "pieces": open pieces}}``
-	from submitted, not-yet-delivered Stock Reservation Entries.
+	from submitted, not-yet-delivered batch-based Stock Reservation Entries
+	(Madhav reserves by batch; qty-only reservations are not batch specific).
 
 	``own_lines`` is ``{batch_no: Sales Order Item}``: the order line the
 	batch was made / bought for. A reservation for that same line does not
@@ -138,6 +139,13 @@ def source_sales_order_line(source_doctype, source_name, item_code=None, batch_n
 	Stock Entry (Manufacture) → its Work Order's line; Purchase Receipt → the
 	receipt row's line. None when the batch is not tied to an order line.
 	"""
+	if (not source_doctype or not source_name) and batch_no:
+		# Row typed in by hand: use the document the batch came from.
+		ref = frappe.db.get_value(
+			"Batch", batch_no, ["reference_doctype", "reference_name"], as_dict=True
+		)
+		if isinstance(ref, dict):
+			source_doctype, source_name = ref.get("reference_doctype"), ref.get("reference_name")
 	if not source_doctype or not source_name:
 		return None
 	if source_doctype == "Stock Entry":

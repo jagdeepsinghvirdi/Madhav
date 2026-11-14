@@ -142,3 +142,20 @@ class TestWorkOrderPendingQty(FrappeTestCase):
 			FinishWorkOrder._restore_work_order_progress(SimpleNamespace(), row)
 		self.assertEqual(wo.pending_qty, 2.46)
 		self.assertEqual(wo.completed_pcs, 20)
+
+
+class TestLengthCheckSkipsOtherItems(FrappeTestCase):
+	def test_sub_assembly_work_order_is_not_checked(self):
+		doc = _fwo([])
+		with patch.object(fwo_module.frappe.db, "get_value", side_effect=lambda dt, n, f, *a, **k: "PPSA-1" if f == "production_plan_sub_assembly_item" else "FG002248"):
+			self.assertFalse(doc._row_is_sales_order_item(_pwo(), "9dfbiunqvh"))
+
+	def test_different_item_is_not_checked(self):
+		doc = _fwo([])
+		with patch.object(fwo_module.frappe.db, "get_value", side_effect=lambda dt, n, f, *a, **k: None if f == "production_plan_sub_assembly_item" else "OTHER-ITEM"):
+			self.assertFalse(doc._row_is_sales_order_item(_pwo(), "9dfbiunqvh"))
+
+	def test_ordered_item_is_checked(self):
+		doc = _fwo([])
+		with patch.object(fwo_module.frappe.db, "get_value", side_effect=lambda dt, n, f, *a, **k: None if f == "production_plan_sub_assembly_item" else "FG002248"):
+			self.assertTrue(doc._row_is_sales_order_item(_pwo(), "9dfbiunqvh"))

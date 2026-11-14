@@ -1157,6 +1157,17 @@ class FinishWorkOrder(Document):
             title=frappe._("Insufficient Raw Material"),
         )
 
+    def _row_is_sales_order_item(self, pwo, so_item):
+        """Only the ordered item itself is held to the SO length.
+
+        Sub-assembly Work Orders also carry the Sales Order line (ERPNext
+        copies it from the Production Plan), but make a different item.
+        """
+        if frappe.db.get_value("Work Order", pwo.work_order, "production_plan_sub_assembly_item"):
+            return False
+        line_item = frappe.db.get_value("Sales Order Item", so_item, "item_code")
+        return not line_item or line_item == pwo.item
+
     def _validate_row_length_against_so(self, pwo, so_item):
         from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
             get_so_length_window,
@@ -1305,7 +1316,7 @@ class FinishWorkOrder(Document):
             # the Sales Order warehouse (team, 14 Nov 2026). Previously only
             # rows that reserved on submit were checked, so QI rows let 6 m
             # through on a 12 m line.
-            if pwo.sales_order and so_item:
+            if pwo.sales_order and so_item and self._row_is_sales_order_item(pwo, so_item):
                 self._validate_row_length_against_so(pwo, so_item)
 
             if skip_consume:

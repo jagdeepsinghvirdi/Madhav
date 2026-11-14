@@ -199,3 +199,20 @@ class TestGetItemsMapsSalesOrderTaxes(FrappeTestCase):
 		first = captured["mappings"][0]
 		self.assertIn("Sales Taxes and Charges", first)
 		self.assertEqual(first["Sales Taxes and Charges"]["doctype"], "Sales Taxes and Charges")
+
+
+class TestBatchCapAcrossRows(FrappeTestCase):
+	def test_other_row_on_same_batch_reduces_the_cap(self):
+		bundle = FakeBundle(entries=[_entry("MUBT-12505", 1.0, 10)], total_qty=-1.0, flags=frappe._dict())
+		item = _item(qty=1.3)
+		other = SimpleNamespace(name="row2", serial_and_batch_bundle="SABB-OTHER", warehouse="Finished Goods RD - MUPL", batch_no=None, qty=0.5)
+		doc = _doc([item, other])
+		with patch(f"{MOD}._row_batch_cap", return_value=1.5), \
+			patch.object(dn.frappe, "get_all", return_value=[frappe._dict(batch_no="MUBT-12505", qty=-0.5, warehouse="Finished Goods RD - MUPL")]):
+			with self.assertRaises(frappe.ValidationError):
+				dn._validate_bundle_increase(item, bundle, 1.3, doc)  # 1.5 cap - 0.5 other row = 1.0 < 1.3
+
+	def test_other_uom_row_is_left_to_erpnext(self):
+		bundle = FakeBundle(entries=[_entry("MUBT-12505", 1.308, 12)], total_qty=-1.308, flags=frappe._dict())
+		_run_sync(_doc([_item(qty=1.0, conversion_factor=1000)]), bundle)
+		self.assertFalse(getattr(bundle, "saved", 0))

@@ -1651,16 +1651,44 @@ def _row_batch_cap(item, warehouse, batch_no):
     )
 
 
-def _validate_bundle_increase(item, bundle, target_qty):
-    """A larger Qty must still fit each batch already on the bundle."""
+def _other_rows_batch_use(doc, item):
+    """{(warehouse, batch): qty} drawn by the note's OTHER rows' bundles."""
+    used = {}
+    for row in doc.get("items") or []:
+        if row is item or getattr(row, "name", None) == getattr(item, "name", None):
+            continue
+        if not getattr(row, "serial_and_batch_bundle", None):
+            if getattr(row, "batch_no", None):
+                key = (row.warehouse, row.batch_no)
+                used[key] = used.get(key, 0) + abs(flt(row.qty))
+            continue
+        for e in frappe.get_all(
+            "Serial and Batch Entry",
+            filters={"parent": row.serial_and_batch_bundle, "parenttype": "Serial and Batch Bundle"},
+            fields=["batch_no", "qty", "warehouse"],
+        ):
+            if e.batch_no:
+                key = (e.warehouse or row.warehouse, e.batch_no)
+                used[key] = used.get(key, 0) + abs(flt(e.qty))
+    return used
+
+
+def _validate_bundle_increase(item, bundle, target_qty, doc=None):
+    """A larger Qty must still fit each batch already on the bundle, after
+    what the note's other rows take from the same batch."""
     entries = [e for e in bundle.entries if e.batch_no]
     current = sum(abs(flt(e.qty)) for e in entries)
     if flt(target_qty) <= current + BUNDLE_QTY_TOLERANCE:
         return
     desired = scaled_entry_qtys([e.qty for e in entries], target_qty)
+    other_use = _other_rows_batch_use(doc, item) if doc is not None else {}
     for entry, want in zip(entries, desired):
         warehouse = entry.warehouse or item.warehouse
-        cap = _row_batch_cap(item, warehouse, entry.batch_no)
+        cap = flt(
+            _row_batch_cap(item, warehouse, entry.batch_no)
+            - flt(other_use.get((warehouse, entry.batch_no))),
+            3,
+        )
         if flt(want, 3) > cap + BUNDLE_QTY_TOLERANCE:
             frappe.throw(
                 _(
@@ -1712,8 +1740,12 @@ def sync_draft_bundles_to_row_qty(doc):
         if not bundle_needs_resize(info.total_qty, item.qty, item.conversion_factor):
             continue
 
+        # The resize writes Qty into the bundle; a row in another UOM keeps
+        # ERPNext's own message (bundle must match Stock Qty).
+        if abs(flt(item.conversion_factor or 1) - 1) > 1e-9:
+            continue
         bundle = frappe.get_doc("Serial and Batch Bundle", item.serial_and_batch_bundle)
-        _validate_bundle_increase(item, bundle, flt(item.qty))
+        _validate_bundle_increase(item, bundle, flt(item.qty), doc)
         bundle_pieces = sum(cint(flt(e.pieces)) for e in bundle.entries if e.batch_no)
         # Pieces untouched since the bundle was made follow the new weight;
         # a count the user typed on this save wins (capped to stock).
