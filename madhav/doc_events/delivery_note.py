@@ -165,6 +165,7 @@ def before_validate(self, method):
     # can carry a FIFO batch_no that is not the reserved batch; clear +
     # rebuild from SRE and stamp custom_sre so WH pin survives validate.
     populate_missing_batch_bundle(self)
+    scale_return_row_pieces(self)
     # Previous flow restored (client Nov 2026): Qty is not rebuilt from
     # Pcs × Length × SW, and change_qty_serial_and_batch runs on insert only
     # (reserved weight). The formula value is shown in SW Qty instead.
@@ -174,6 +175,32 @@ def before_validate(self, method):
     set_dn_sw_qty(self)
     # Display only: reserved batch's Assorted Length on blank rows.
     _fill_dn_assorted_length_from_reservations(self)
+
+
+def return_row_pieces(original_pieces, original_qty, return_qty):
+    """Pieces coming back on a (partial) return, in proportion to the qty."""
+    original_qty = abs(flt(original_qty))
+    if original_qty <= 0 or cint(original_pieces) <= 0:
+        return 0
+    share = min(abs(flt(return_qty)) / original_qty, 1)
+    return max(1 if share > 0 else 0, int(round(cint(original_pieces) * share)))
+
+
+def scale_return_row_pieces(doc):
+    """A return row copies the original row's Pieces; scale it to the qty
+    returned, unless the user typed a different count."""
+    if not cint(getattr(doc, "is_return", 0)):
+        return
+    for row in doc.get("items") or []:
+        if not getattr(row, "dn_detail", None):
+            continue
+        original = frappe.db.get_value("Delivery Note Item", row.dn_detail, ["pieces", "qty"], as_dict=True)
+        if not original or cint(original.pieces) <= 0:
+            continue
+        current = cint(flt(getattr(row, "pieces", 0)))
+        if current and current != cint(original.pieces):
+            continue
+        row.pieces = return_row_pieces(original.pieces, original.qty, row.qty)
 
 
 def _custom_sre_name(row):
@@ -229,6 +256,13 @@ def _sync_dn_item_warehouse_to_reservation(doc):
     from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
         get_sre_reserved_warehouses_for_voucher,
     )
+
+    # A return (credit) is inward: ERPNext builds its bundle from the original
+    # Delivery Note on submit and leaves reservations alone. Building one from
+    # the Sales Order reservation made an Outward bundle the return could not
+    # submit with (team, 14 Nov 2026).
+    if cint(getattr(doc, "is_return", 0)):
+        return
 
     for row in doc.get("items") or []:
         if not row.against_sales_order or not row.so_detail:
@@ -619,6 +653,13 @@ def populate_missing_batch_bundle_from_si(self):
     they arrive at before_submit batchless and every unit of the invoice
     qty reads as a shortfall.
     """
+    # A return (credit) is inward: ERPNext builds its bundle from the original
+    # Delivery Note on submit and leaves reservations alone. Building one from
+    # the Sales Order reservation made an Outward bundle the return could not
+    # submit with (team, 14 Nov 2026).
+    if cint(getattr(self, "is_return", 0)):
+        return
+
     for item in self.items:
         if not item.against_sales_invoice or not item.si_detail:
             continue
@@ -761,6 +802,13 @@ def populate_missing_batch_bundle(self):
     ``custom_sre`` is stamped so Mill EXTRA vs FG warehouse pin survives
     ``set_missing_values``.
     """
+    # A return (credit) is inward: ERPNext builds its bundle from the original
+    # Delivery Note on submit and leaves reservations alone. Building one from
+    # the Sales Order reservation made an Outward bundle the return could not
+    # submit with (team, 14 Nov 2026).
+    if cint(getattr(self, "is_return", 0)):
+        return
+
     meta_has_sre = frappe.get_meta("Delivery Note Item").has_field("custom_sre")
 
     for item in self.items:

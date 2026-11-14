@@ -216,3 +216,57 @@ class TestBatchCapAcrossRows(FrappeTestCase):
 		bundle = FakeBundle(entries=[_entry("MUBT-12505", 1.308, 12)], total_qty=-1.308, flags=frappe._dict())
 		_run_sync(_doc([_item(qty=1.0, conversion_factor=1000)]), bundle)
 		self.assertFalse(getattr(bundle, "saved", 0))
+
+
+# ------------------------------------------------------------------ return fix (Harsh, 14 Nov)
+class TestSalesOrderLinkedReturn(FrappeTestCase):
+	def _return_doc(self, **row):
+		r = dict(name="r1", against_sales_order="MU-SO26-00376", so_detail="aqsroo4n0l", serial_and_batch_bundle=None,
+			batch_no=None, warehouse="Finished Goods RD - MUPL", qty=-2.0, pieces=41, dn_detail="bjhv5koebu")
+		r.update(row)
+		return _Doc(name="RET-1", is_return=1, items=[frappe._dict(r)])
+
+	def test_no_bundle_is_built_from_the_reservation(self):
+		doc = self._return_doc()
+		sre = frappe._dict(name="SRE-1", reservation_based_on="Serial and Batch", warehouse="Finished Goods RD - MUPL")
+		with patch.object(dn.frappe, "get_all", return_value=[sre]), \
+			patch(f"{MOD}.get_ssb_bundle_for_voucher_from_sre", return_value="SABB-OUTWARD"), \
+			patch(f"{MOD}._batch_is_reserved_for_so_line", return_value=True):
+			dn.populate_missing_batch_bundle(doc)
+		self.assertIsNone(doc.items[0].serial_and_batch_bundle)
+
+	def test_warehouse_is_not_moved_to_the_reservation(self):
+		doc = self._return_doc(warehouse="Finished Goods - MUPL")
+		with patch("erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry.get_sre_reserved_warehouses_for_voucher",
+			return_value=["Finished Goods RD - MUPL"]):
+			dn._sync_dn_item_warehouse_to_reservation(doc)
+		self.assertEqual(doc.items[0].warehouse, "Finished Goods - MUPL")
+
+	def test_partial_return_brings_back_pieces_in_proportion(self):
+		self.assertEqual(dn.return_row_pieces(41, 6.0, -2.0), 14)
+		self.assertEqual(dn.return_row_pieces(41, 6.0, -6.0), 41)
+		self.assertEqual(dn.return_row_pieces(41, 6.0, -0.01), 1)
+		doc = self._return_doc()
+		with patch.object(dn.frappe.db, "get_value", return_value=frappe._dict(pieces=41, qty=6.0)):
+			dn.scale_return_row_pieces(doc)
+		self.assertEqual(doc.items[0].pieces, 14)
+
+	def test_typed_return_pieces_win(self):
+		doc = self._return_doc(pieces=12)
+		with patch.object(dn.frappe.db, "get_value", return_value=frappe._dict(pieces=41, qty=6.0)):
+			dn.scale_return_row_pieces(doc)
+		self.assertEqual(doc.items[0].pieces, 12)
+
+
+class TestReturnPieceLedgerSign(FrappeTestCase):
+	def _sign(self, actual_qty, is_return):
+		from madhav.doc_events import stock_ledger_entry as sle_module
+		sle = SimpleNamespace(voucher_type="Delivery Note", voucher_no="DN-1", actual_qty=actual_qty)
+		with patch.object(sle_module.frappe.db, "get_value", return_value=is_return):
+			return sle_module.adjust_piece_qty_sign(sle, 14)
+
+	def test_return_adds_pieces_back(self):
+		self.assertEqual(self._sign(2.0, 1), 14)
+
+	def test_normal_delivery_still_takes_pieces_out(self):
+		self.assertEqual(self._sign(-2.0, 0), -14)

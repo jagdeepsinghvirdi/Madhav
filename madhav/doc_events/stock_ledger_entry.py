@@ -410,10 +410,12 @@ def get_piece_qty(sle_doc):
 
 def adjust_piece_qty_sign(sle_doc, piece_qty):
 	"""Make piece_qty negative for outgoing transactions."""
-	if sle_doc.voucher_type == "Delivery Note":
-		return -1 * abs(piece_qty)
-
-	if sle_doc.voucher_type == "Sales Invoice":
+	if sle_doc.voucher_type in ("Delivery Note", "Sales Invoice"):
+		# A sales return brings the pieces back in (team, 14 Nov 2026).
+		if flt(sle_doc.actual_qty) > 0 and frappe.db.get_value(
+			sle_doc.voucher_type, sle_doc.voucher_no, "is_return"
+		):
+			return abs(piece_qty)
 		return -1 * abs(piece_qty)
 
 	if sle_doc.voucher_type == "Purchase Receipt" and frappe.db.get_value(
