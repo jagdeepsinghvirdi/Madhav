@@ -76,6 +76,21 @@ def ensure_work_order_covers_fg(work_order, fg_qty, precision=3):
 		frappe.db.set_value(
 			"Work Order", work_order, "qty", needed, update_modified=False
 		)
+		_recount_sales_order_line(work_order)
+
+
+def _recount_sales_order_line(work_order):
+	"""Keep Sales Order Item.work_order_qty in step after a direct WO qty change.
+
+	Raising (or restoring) Work Order.qty with db.set_value skips ERPNext's
+	recount, which left 34 open order lines below their Work Orders on
+	production (Sep-Nov 2026) and Production Plan offered them again.
+	"""
+	from madhav.madhav.override.work_order import recount_line_work_order_qty
+
+	recount_line_work_order_qty(
+		frappe.db.get_value("Work Order", work_order, "sales_order_item")
+	)
 
 
 def work_order_pending_qty(wo_qty, produced_qty, precision=3):
@@ -212,6 +227,7 @@ class FinishWorkOrder(Document):
         )
         if flt(restored_qty, 3) != flt(wo.qty, 3):
             wo.db_set("qty", restored_qty)
+            _recount_sales_order_line(row.work_order)
 
         completed_pcs = max(flt(wo.completed_pcs or 0) - finished_pcs, 0)
         total_pcs = flt(wo.pieces or 0)

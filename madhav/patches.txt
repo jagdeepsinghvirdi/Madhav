@@ -15,3 +15,4 @@ madhav.patches.v1_0.ensure_assorted_length_rl_option
 madhav.patches.v1_0.ensure_dn_item_sw_qty
 madhav.patches.v1_0.party_transfer_work_order_recount
 madhav.patches.v1_0.party_transfer_reports_no_total
+madhav.patches.v1_0.recount_sales_order_work_order_qty

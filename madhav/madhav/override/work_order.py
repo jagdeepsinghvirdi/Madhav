@@ -3,6 +3,52 @@ from frappe import _
 from frappe.utils import flt, cint
 from erpnext.manufacturing.doctype.work_order.work_order import WorkOrder as ERPNextWorkOrder
 
+def line_work_order_qty(sales_order_item):
+	"""Sales Order Item.work_order_qty by the planning rule.
+
+	Sum of this line's submitted Work Orders (a Closed one counts only what
+	it produced), leaving out sub-assembly Work Orders. Returns None for a
+	product-bundle line, which keeps ERPNext's own bundle arithmetic.
+	"""
+	if not sales_order_item:
+		return None
+	item_code = frappe.db.get_value("Sales Order Item", sales_order_item, "item_code")
+	if not item_code:
+		return None
+	if frappe.db.exists(
+		"Work Order",
+		{"sales_order_item": sales_order_item, "docstatus": 1, "product_bundle_item": ["is", "set"]},
+	):
+		return None
+	qty = frappe.db.sql(
+		"""
+		select ifnull(sum(case when status = 'Closed' then least(produced_qty, qty) else qty end), 0)
+		from `tabWork Order`
+		where sales_order_item = %s and docstatus = 1 and production_item = %s
+			and ifnull(production_plan_sub_assembly_item, '') = ''
+		""",
+		(sales_order_item, item_code),
+	)[0][0]
+	return flt(qty, 3)
+
+
+def recount_line_work_order_qty(sales_order_item):
+	"""Write the planning-rule work_order_qty (and pieces) onto one SO line.
+
+	Call after anything changes a Work Order's qty without going through
+	submit / cancel / close (those already recount): e.g. Finish Work Order
+	raising the qty to the mill weight. Without it the line kept the old
+	figure, so Production Plan offered too much or too little.
+	"""
+	qty = line_work_order_qty(sales_order_item)
+	if qty is None:
+		return
+	frappe.db.set_value("Sales Order Item", sales_order_item, "work_order_qty", qty, update_modified=False)
+	from madhav.doc_events.work_order import recompute_work_order_pieces
+
+	recompute_work_order_pieces(sales_order_item)
+
+
 class WorkOrder(ERPNextWorkOrder):
     
     def update_work_order_qty_in_so(self):
