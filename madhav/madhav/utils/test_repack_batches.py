@@ -165,3 +165,25 @@ class TestRestoreOnCancel(unittest.TestCase):
 
 if __name__ == "__main__":
 	unittest.main()
+
+
+class TestBatchOptions(unittest.TestCase):
+	"""Found on the local copy of production (20 Nov): reserved batches were
+	missing from the list, and a fully reserved batch showed 21 free pieces."""
+
+	def _options(self, limits, stock):
+		batch = frappe._dict(name="MUBT-13666", average_length=8.43, section_weight=19.72, pieces=21,
+			manufacturing_date="2026-10-15", creation="2026-10-15")
+		with patch("erpnext.stock.doctype.batch.batch.get_batch_qty", return_value=stock) as gbq, \
+			patch.object(rb.frappe, "get_all", return_value=[batch]), \
+			patch(f"{BWRT}.get_batch_reservation_limits", return_value=limits), \
+			patch(f"{MOD}.batch_reservations", return_value=[frappe._dict(sre="SRE-1", qty=3.435)]):
+			out = rb.get_repack_batch_options("FG000873", "FG RD")
+		return out, gbq
+
+	def test_reserved_batch_is_listed_with_no_free_pieces(self):
+		out, gbq = self._options({"qty": 0, "pieces": 21}, [{"batch_no": "MUBT-13666", "qty": 3.435}])
+		self.assertTrue(gbq.call_args.kwargs.get("ignore_reserved_stock"))
+		self.assertEqual(len(out), 1)
+		self.assertEqual((out[0].free_qty, out[0].free_pieces), (0, 0))
+		self.assertEqual(out[0].reservations[0].sre, "SRE-1")

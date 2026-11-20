@@ -31,7 +31,8 @@ QTY_EPSILON = 0.0005
 def _batches_with_stock(item_code, warehouse):
 	from erpnext.stock.doctype.batch.batch import get_batch_qty
 
-	rows = get_batch_qty(warehouse=warehouse, item_code=item_code) or []
+	# Physical stock: reserved batches are listed too, with who holds them.
+	rows = get_batch_qty(warehouse=warehouse, item_code=item_code, ignore_reserved_stock=True) or []
 	return [r for r in rows if r.get("batch_no") and flt(r.get("qty")) > QTY_EPSILON]
 
 
@@ -105,7 +106,9 @@ def get_repack_batch_options(item_code, warehouse, min_length=None):
 				qty=flt(r["qty"], 3),
 				pieces=cint(b.pieces),
 				free_qty=flt(limits.get("qty"), 3),
-				free_pieces=cint(limits.get("pieces")),
+				# The shared helper returns the whole batch count when no qty is
+				# free; nothing free means no free pieces.
+				free_pieces=cint(limits.get("pieces")) if flt(limits.get("qty")) > QTY_EPSILON else 0,
 				reservations=reservations,
 				batch_date=b.manufacturing_date,
 				creation=b.creation,
@@ -214,9 +217,10 @@ def get_batch_reservations_for_repack(item_code, warehouse, batch_no):
 	)
 
 	limits = get_batch_reservation_limits(item_code, warehouse, batch_no)
+	free_qty = flt(limits.get("qty"), 3)
 	return {
-		"free_qty": flt(limits.get("qty"), 3),
-		"free_pieces": cint(limits.get("pieces")),
+		"free_qty": free_qty,
+		"free_pieces": cint(limits.get("pieces")) if free_qty > QTY_EPSILON else 0,
 		"reservations": batch_reservations(item_code, warehouse, batch_no),
 		"can_unreserve": bool(frappe.has_permission("Stock Reservation Entry", "cancel")),
 	}
