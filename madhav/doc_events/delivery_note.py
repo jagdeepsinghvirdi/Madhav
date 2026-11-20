@@ -5380,6 +5380,15 @@ def rebuild_row_bundle_fifo(doc, item, bundle=None):
     new_qty = flt(sum(abs(flt(e.qty)) for e in bundle.entries), 3)
     new_pieces = sum(cint(e.pieces) for e in bundle.entries)
 
+    # Deliver-as-Qty: an Invoice Qty still equal to the old Qty was never
+    # typed (weighbridge weight), so it follows the new Qty.
+    old_qty = flt(item.qty)
+    if (
+        cint(getattr(item, "custom_deliver_as_qty", 0))
+        and hasattr(item, "invoice_qty")
+        and abs(flt(item.invoice_qty) - old_qty) <= BUNDLE_QTY_TOLERANCE
+    ):
+        item.invoice_qty = new_qty / flt(item.conversion_factor or 1)
     item.qty = new_qty / flt(item.conversion_factor or 1)
     item.stock_qty = new_qty
     item.amount = flt(item.rate) * flt(item.qty)

@@ -308,3 +308,21 @@ class TestCancelUndoesDeliveryOnce(FrappeTestCase):
 		sre = SimpleNamespace(reservation_based_on="Serial and Batch", delivered_qty=2.0,
 			get=lambda k, d=None: [entry] if k == "sb_entries" else d)
 		self.assertEqual(dn._reversible_delivered_qty([sre], {"B-1": 1.0}), 1.0)
+
+
+class TestDeliverAsQtyInvoiceQtyFollows(FrappeTestCase):
+	"""Edge case on the local copy (20 Nov): on a Deliver-as-Qty order, lowering
+	Pieces changed Qty but left Invoice Qty at the old figure, so submit failed
+	the 3% check. An Invoice Qty nobody typed follows Qty; a typed one stays."""
+
+	def test_untyped_invoice_qty_follows(self):
+		bundle = _bundle([("B-001", 10, 2.0), ("B-002", 5, 1.0)])
+		item = _eight_metre_row(pieces=2, custom_deliver_as_qty=1, invoice_qty=3.0)
+		_rebuild(item, bundle)
+		self.assertAlmostEqual(item.invoice_qty, 0.4)
+
+	def test_typed_invoice_qty_is_kept(self):
+		bundle = _bundle([("B-001", 10, 2.0), ("B-002", 5, 1.0)])
+		item = _eight_metre_row(pieces=2, custom_deliver_as_qty=1, invoice_qty=0.42)
+		_rebuild(item, bundle)
+		self.assertAlmostEqual(item.invoice_qty, 0.42)

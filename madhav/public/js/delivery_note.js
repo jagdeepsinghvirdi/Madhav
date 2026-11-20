@@ -1027,7 +1027,12 @@ function preview_reserved_row_fifo(frm, cdt, cdn) {
 				return;
 			}
 			if (Math.abs(flt(live.qty) - flt(res.qty)) > 0.0005) {
+				// Deliver-as-Qty: an Invoice Qty still equal to Qty was never
+				// typed, so it follows the new Qty (as on save).
+				const follow =
+					cint(live.custom_deliver_as_qty) && Math.abs(flt(live.invoice_qty) - flt(live.qty)) <= 0.0005;
 				frappe.model.set_value(cdt, cdn, "qty", flt(res.qty, 3));
+				if (follow) frappe.model.set_value(cdt, cdn, "invoice_qty", flt(res.qty, 3));
 			}
 		});
 }

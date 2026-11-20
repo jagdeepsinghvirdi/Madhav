@@ -187,3 +187,29 @@ class TestBatchOptions(unittest.TestCase):
 		self.assertEqual(len(out), 1)
 		self.assertEqual((out[0].free_qty, out[0].free_pieces), (0, 0))
 		self.assertEqual(out[0].reservations[0].sre, "SRE-1")
+
+
+class TestTwoRowsOneBatch(unittest.TestCase):
+	"""Edge case on the local copy of production (20 Nov): two Repack rows of
+	1 t each from one fully reserved batch released only 1 t."""
+
+	def test_each_row_takes_its_own_share_off_the_reservation(self):
+		e = _entry("e1", "B-1", 3.435, pieces=21)
+		state = {"open": 3.435}
+
+		def set_qty(field, value, **kw):
+			if field == "qty":
+				state["open"] = value
+				e.qty = value
+
+		e.db_set.side_effect = set_qty
+		sre = FakeSRE(name="SRE-9", docstatus=1, item_code="FG001109", warehouse="FG", sb_entries=[e],
+			reserved_qty=3.435, delivered_qty=0, db_set=MagicMock(side_effect=lambda f, v, **k: setattr(sre, f, v)))
+		doc = _repack([_row(name="r1", transfer_qty=1.0, qty=1.0, pieces=6), _row(name="r2", idx=2, transfer_qty=1.0, qty=1.0, pieces=6)])
+		# Free stock grows as the first row unreserves: 3.435 physical - open reserved.
+		with patch.object(rb.frappe, "has_permission", return_value=True), \
+			patch(f"{BWRT}.get_batch_available_qty", side_effect=lambda *a: round(3.435 - state["open"], 3)), \
+			patch.object(rb.frappe, "get_doc", side_effect=lambda *a, **k: sre if a and a[0] == "Stock Reservation Entry" else MagicMock()), \
+			patch(f"{MOD}._snapshot", return_value={}), patch(f"{MOD}._refresh"):
+			rb.release_reservations_for_repack(doc)
+		self.assertAlmostEqual(sre.reserved_qty, 1.435)

@@ -263,8 +263,10 @@ def release_reservations_for_repack(doc, method=None):
 		)
 
 	log = []
-	# Free stock already used by earlier rows on this Repack.
-	used_free = {}
+	# Free stock per batch as it was before this Repack, used up row by row.
+	# Re-reading it per row counted what an earlier row had just unreserved
+	# as free again, so two rows on one batch under-released the reservation.
+	free_left = {}
 	for row in rows:
 		if not row.get("batch_no"):
 			frappe.throw(_("Row #{0}: pick a batch to unreserve.").format(row.idx))
@@ -272,9 +274,10 @@ def release_reservations_for_repack(doc, method=None):
 		need = flt(row.get("transfer_qty") or row.get("qty")) * (
 			1 if row.get("transfer_qty") else flt(row.get("conversion_factor") or 1)
 		)
-		free = max(0.0, flt(get_batch_available_qty(*key)) - flt(used_free.get(key)))
-		from_free = min(free, need)
-		used_free[key] = flt(used_free.get(key)) + from_free
+		if key not in free_left:
+			free_left[key] = max(0.0, flt(get_batch_available_qty(*key)))
+		from_free = min(free_left[key], need)
+		free_left[key] -= from_free
 		take = flt(need - from_free, 3)
 		if take <= QTY_EPSILON:
 			continue
