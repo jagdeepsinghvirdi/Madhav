@@ -592,11 +592,41 @@ function open_sales_order_items_selector_for_delivery_note(frm) {
 				),
 			];
 
+			// One customer per Delivery Note (team, Nov 2026): the note takes
+			// the customer of the lines picked, and lines of another customer
+			// are refused instead of being mixed in.
+			const customers = [
+				...new Set(
+					state.rows
+						.filter((row) => state.selected_children.has(row.name))
+						.map((row) => row.customer)
+						.filter(Boolean)
+				),
+			];
+			if (customers.length > 1) {
+				frappe.msgprint({
+					title: __("Several customers selected"),
+					indicator: "orange",
+					message: __("A Delivery Note is for one customer. Pick lines of one customer only: {0}", [customers.join(", ")]),
+				});
+				return;
+			}
+			if (frm.doc.customer && customers.length && customers[0] !== frm.doc.customer) {
+				frappe.msgprint({
+					title: __("Different customer"),
+					indicator: "orange",
+					message: __("This Delivery Note is for {0}, but the lines picked are for {1}.", [frm.doc.customer, customers[0]]),
+				});
+				return;
+			}
+
 			d.hide();
 
 			if (Array.isArray(frm.doc.items) && frm.doc.items.length && !frm.doc.items[0].item_code) {
 				frm.doc.items.splice(0, 1);
 			}
+
+			fill_header_from_sales_order(frm, customers[0]).then(() => {
 
 			// ✅ Loop over all source SOs
 			const calls = source_names.map(so_name => {
@@ -656,13 +686,32 @@ function open_sales_order_items_selector_for_delivery_note(frm) {
 						) + "<br><ul><li>" + [...new Set(skipped_charges)].join("</li><li>") + "</li></ul>",
 					});
 				}
-				frm.refresh();
-				update_invoice_qty_totals(frm);
+				// Branch / Cost Center from the Sales Order when the note has none
+				// (Branch is a required accounting dimension on submit).
+				const so_doc = (results.find((r) => r && r.message && (r.message.items || []).length) || {}).message;
+				const header_fills = [];
+				if (so_doc) {
+					["branch", "cost_center"].forEach((f) => {
+						if (so_doc[f] && !frm.doc[f] && frappe.meta.has_field("Delivery Note", f)) {
+							header_fills.push(frm.set_value(f, so_doc[f]));
+						}
+					});
+				}
+				Promise.all(header_fills).then(() => {
+					frm.refresh();
+					update_invoice_qty_totals(frm);
+				});
+			});
 			});
 		},
 	});
 
 	d.show();
+	// The team filters by PO: start there, not in the Sales Order name box.
+	setTimeout(() => {
+		const po = d.get_field("po_no");
+		if (po && po.$input) po.$input.focus();
+	}, 400);
 
 	frappe.model.with_doctype("Sales Order", () => {
 		const filter_group = new frappe.ui.FilterGroup({
@@ -1035,4 +1084,16 @@ function preview_reserved_row_fifo(frm, cdt, cdn) {
 				if (follow) frappe.model.set_value(cdt, cdn, "invoice_qty", flt(res.qty, 3));
 			}
 		});
+}
+
+
+// Get Items From → Sales Order on a note with no customer yet: take the
+// customer of the lines picked, and let ERPNext finish loading that
+// customer's details (address, price list, tax template) before rows and the
+// Sales Order's taxes are added, so nothing it loads overwrites them.
+function fill_header_from_sales_order(frm, customer) {
+	if (frm.doc.customer || !customer) return Promise.resolve();
+	return frm.set_value("customer", customer).then(
+		() => new Promise((resolve) => frappe.after_ajax(() => setTimeout(resolve, 300)))
+	);
 }

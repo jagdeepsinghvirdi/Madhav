@@ -49,7 +49,7 @@ class Row(SimpleNamespace):
 			amount=0, base_amount=0, warehouse=None, serial_and_batch_bundle=None, batch_no=None,
 			pieces=0, lengthpieces_so=0, length_size=0, length_sizeso=0, average_length=0,
 			section_weight=0, custom_sre=None, custom_reserved_batch_pool=None, sw_qty=0,
-			custom_deliver_as_qty=0, against_sales_order="MU-SO26-00600", so_detail="soline1",
+			custom_deliver_as_qty=0, against_sales_order="MU-SO26-00600", so_detail="soline1", branch=None,
 		)
 		base.update(kw)
 		super().__init__(**base)
@@ -326,3 +326,33 @@ class TestDeliverAsQtyInvoiceQtyFollows(FrappeTestCase):
 		item = _eight_metre_row(pieces=2, custom_deliver_as_qty=1, invoice_qty=0.42)
 		_rebuild(item, bundle)
 		self.assertAlmostEqual(item.invoice_qty, 0.42)
+
+
+class TestRowBranchFromSalesOrder(FrappeTestCase):
+	"""Team, 21 Nov: Branch (a required accounting dimension) came in blank on
+	fetched rows, so submit stopped until it was typed in."""
+
+	def test_row_takes_the_sales_order_branch(self):
+		so = SimpleNamespace(name="MU-SO26-00443", branch="Rolling Division", get=lambda k, d=None: {"branch": "Rolling Division"}.get(k, d))
+		row = Row(branch=None)
+		with patch.object(dn.frappe, "get_meta", return_value=_meta()):
+			dn._fill_dn_item_branch(row, so, frappe._dict(branch=None))
+		self.assertEqual(row.branch, "Rolling Division")
+
+	def test_line_branch_wins_and_a_set_branch_is_kept(self):
+		so = SimpleNamespace(name="SO", branch="Rolling Division", get=lambda k, d=None: None)
+		row = Row(branch=None)
+		with patch.object(dn.frappe, "get_meta", return_value=_meta()):
+			dn._fill_dn_item_branch(row, so, frappe._dict(branch="Fabrication/Galvanization"))
+		self.assertEqual(row.branch, "Fabrication/Galvanization")
+		kept = Row(branch="Other")
+		with patch.object(dn.frappe, "get_meta", return_value=_meta()):
+			dn._fill_dn_item_branch(kept, so, frappe._dict(branch=None))
+		self.assertEqual(kept.branch, "Other")
+
+	def test_fetch_puts_branch_on_the_row(self):
+		t = TestGetItemsOneRowPerLength()
+		so_item = frappe._dict(name="soline1", item_code="FG001109", length_size=8, section_weight=25.0)
+		with patch(f"{MOD}._fill_dn_item_branch", side_effect=lambda r, so, si: setattr(r, "branch", "Rolling Division")):
+			doc, _ = t._fetch(t._sres(), team_pool())
+		self.assertEqual({r.branch for r in doc.items}, {"Rolling Division"})

@@ -4642,6 +4642,7 @@ def make_delivery_note_custom(source_name, target_doc=None, kwargs=None):
             dn_item.qty = available_reserved / flt(dn_item.conversion_factor or 1)
             dn_item.warehouse = sre.warehouse
             dn_item.custom_deliver_as_qty = so.deliver_as_qty
+            _fill_dn_item_branch(dn_item, so, so_item)
             _apply_reserved_dims_to_dn_item(dn_item, so_item, sre)
             _set_dn_assorted_length_from_sre(dn_item, sre.name, override=True)
             if frappe.get_meta("Delivery Note Item").has_field("sw_qty"):
@@ -5161,6 +5162,21 @@ def _stamp_length_group_on_dn_item(dn_item, so_item, group, total_qty, total_pie
             dn_item.assorted_length = assorted
 
 
+def _fill_dn_item_branch(dn_item, so, so_item):
+    """Branch on the row from the Sales Order line, else the Sales Order.
+
+    Branch is a required accounting dimension when the note is submitted;
+    Sales Order lines usually leave it blank and carry it on the header.
+    """
+    if not _dn_item_has_field("branch") or dn_item.get("branch"):
+        return
+    branch = so_item.get("branch") or getattr(so, "branch", None) or (
+        so.get("branch") if hasattr(so, "get") else None
+    )
+    if branch:
+        dn_item.branch = branch
+
+
 def _dn_items_for_length_groups(so, so_item, groups):
     """Delivery Note Item rows, one per length group of one Sales Order line."""
     from madhav.madhav.utils.reserved_length_groups import pool_to_json
@@ -5196,6 +5212,7 @@ def _dn_items_for_length_groups(so, so_item, groups):
         dn_item.qty = stock_qty / flt(dn_item.conversion_factor or 1)
         dn_item.warehouse = group["warehouse"]
         dn_item.custom_deliver_as_qty = so.deliver_as_qty
+        _fill_dn_item_branch(dn_item, so, so_item)
         dn_item.serial_and_batch_bundle = bundle_name
         if hasattr(dn_item, "batch_no"):
             dn_item.batch_no = None
