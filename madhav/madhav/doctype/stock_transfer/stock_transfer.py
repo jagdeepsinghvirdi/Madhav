@@ -57,13 +57,36 @@ def _cancel_psles_for_voucher(voucher_no):
 		psle.cancel()
 
 
+# A piece-ledger row belongs to a batch when it names the batch, or (older
+# rows without batch_no) when its bundle holds that one batch only.
+PSLE_BATCH_MATCH = """(
+	psle.batch_no = %(batch_no)s
+	OR (
+		IFNULL(psle.batch_no, '') = ''
+		AND psle.serial_and_batch_bundle IS NOT NULL
+		AND EXISTS (
+			SELECT 1 FROM `tabSerial and Batch Entry` sbe
+			WHERE sbe.parent = psle.serial_and_batch_bundle AND sbe.batch_no = %(batch_no)s
+		)
+		AND (
+			SELECT COUNT(DISTINCT sbe2.batch_no) FROM `tabSerial and Batch Entry` sbe2
+			WHERE sbe2.parent = psle.serial_and_batch_bundle AND IFNULL(sbe2.batch_no, '') != ''
+		) = 1
+	)
+)"""
+
+
 def get_live_batch_qty(item_code, warehouse, batch_no):
 	"""Physical batch quantity in one warehouse; never read Batch.batch_qty."""
 	if not item_code or not warehouse or not batch_no:
 		return 0
+	# The batch's own share of each movement. sle.actual_qty is the whole
+	# bundle, so a delivery of several batches used to be counted in full
+	# against each of them (round 4 fix; e.g. MUBT-03524 showed -10.745 t
+	# where ERPNext has 0).
 	return flt(frappe.db.sql(
 		"""
-		SELECT COALESCE(SUM(sle.actual_qty), 0)
+		SELECT COALESCE(SUM(SIGN(sle.actual_qty) * ABS(sbe.qty)), 0)
 		FROM `tabStock Ledger Entry` sle
 		INNER JOIN `tabSerial and Batch Entry` sbe
 			ON sbe.parent = sle.serial_and_batch_bundle
@@ -78,16 +101,19 @@ def get_live_batch_pieces(item_code, warehouse, batch_no):
 	"""Physical pieces in one warehouse, when piece ledger history exists."""
 	if not item_code or not warehouse or not batch_no:
 		return None
+	# Piece rows carry their batch; older rows without one count only through
+	# a single-batch bundle. Joining through the bundle credited every batch
+	# of a multi-batch movement with all of its pieces (round 4 fix, same
+	# rule as Delivery Note get_batch_available_pieces).
 	rows = frappe.db.sql(
-		"""
+		f"""
 		SELECT COUNT(psle.name), COALESCE(SUM(psle.actual_qty), 0)
 		FROM `tabPiece Stock Ledger Entry` psle
-		INNER JOIN `tabSerial and Batch Entry` sbe
-			ON sbe.parent = psle.serial_and_batch_bundle
-		WHERE psle.item_code = %s AND psle.warehouse = %s
-		  AND sbe.batch_no = %s AND psle.is_cancelled = 0
+		WHERE psle.item_code = %(item_code)s AND psle.warehouse = %(warehouse)s
+		  AND psle.is_cancelled = 0
+		  AND {PSLE_BATCH_MATCH}
 		""",
-		(item_code, warehouse, batch_no),
+		{"item_code": item_code, "warehouse": warehouse, "batch_no": batch_no},
 	)
 	return flt(rows[0][1]) if rows and rows[0][0] else None
 
@@ -1152,16 +1178,30 @@ def get_batch_stock(
 
 		LEFT JOIN (
 			SELECT
-				sbe2.batch_no,
-				psle.warehouse,
-				SUM(psle.actual_qty) AS pieces
-			FROM `tabPiece Stock Ledger Entry` psle
-			INNER JOIN `tabSerial and Batch Entry` sbe2
-				ON sbe2.parent = psle.serial_and_batch_bundle
-			WHERE IFNULL(psle.is_cancelled, 0) = 0
+				pb.batch_no,
+				pb.warehouse,
+				SUM(pb.actual_qty) AS pieces
+			FROM (
+				SELECT
+					COALESCE(
+						NULLIF(psle.batch_no, ''),
+						(
+							SELECT MIN(sbe2.batch_no)
+							FROM `tabSerial and Batch Entry` sbe2
+							WHERE sbe2.parent = psle.serial_and_batch_bundle
+							  AND IFNULL(sbe2.batch_no, '') != ''
+							HAVING COUNT(DISTINCT sbe2.batch_no) = 1
+						)
+					) AS batch_no,
+					psle.warehouse,
+					psle.actual_qty
+				FROM `tabPiece Stock Ledger Entry` psle
+				WHERE IFNULL(psle.is_cancelled, 0) = 0
+			) pb
+			WHERE pb.batch_no IS NOT NULL
 			GROUP BY
-				sbe2.batch_no,
-				psle.warehouse
+				pb.batch_no,
+				pb.warehouse
 		) p
 			ON p.batch_no = sbe.batch_no
 			AND p.warehouse = sle.warehouse

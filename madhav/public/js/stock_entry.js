@@ -129,7 +129,12 @@ frappe.ui.form.on('Stock Entry', {
         });
     },
 
+    refresh: function(frm) {
+        add_repack_suggest_button(frm);
+    },
+
     stock_entry_type: function(frm) {
+        add_repack_suggest_button(frm);
         if (frm.doc.stock_entry_type === "Material Issue Return") {
             frappe.msgprint({
                 title: "Mandatory Reference",
@@ -191,6 +196,14 @@ function fetch_batch_details_for_repack(frm, cdt, cdn) {
     const child = locals[cdt][cdn];
     if (!child.batch_no) {
         return;
+    }
+    // Rows filled by "Suggest Batches" already carry their qty and pieces.
+    if (child.__madhav_suggested) {
+        child.__madhav_suggested = false;
+        return;
+    }
+    if (child.custom_unreserve_from) {
+        frappe.model.set_value(cdt, cdn, "custom_unreserve_from", null);
     }
 
     frappe.db.get_value(
@@ -257,16 +270,11 @@ function fetch_batch_details_for_repack(frm, cdt, cdn) {
                     }
                     if (free_qty > 0) {
                         updates.qty = free_qty;
-                    } else {
-                        frappe.show_alert({
-                            message: __("Batch {0} has no free qty in {1} (stock is reserved or empty).", [
-                                child.batch_no,
-                                child.s_warehouse,
-                            ]),
-                            indicator: "orange",
-                        });
                     }
                     apply();
+                    // Reserved stock on this batch: say for whom, and offer
+                    // "Unreserve and use" (round 4).
+                    offer_unreserve_for_repack(frm, cdt, cdn, free_qty);
                 },
                 error: () => apply(),
             });
@@ -278,7 +286,20 @@ function set_batch_filter(frm, cdt, cdn) {
     // Set the query filter for batch_no field
     frm.set_query('batch_no', 'items', function(doc, cdt, cdn) {
         const child = locals[cdt][cdn];
-        
+
+        // Repack source rows: free stock first, oldest first, with length,
+        // pieces and who the rest is reserved for (round 4).
+        if (is_repack(doc) && child.s_warehouse) {
+            return {
+                query: "madhav.madhav.utils.repack_batches.repack_batch_query",
+                filters: {
+                    item_code: child.item_code,
+                    warehouse: child.s_warehouse,
+                    average_length: child.average_length
+                }
+            };
+        }
+
         return {
             query: "madhav.api.get_filtered_batches",
             filters: {
@@ -388,4 +409,145 @@ function update_items_fields(frm) {
     });
 
     frm.refresh_field('items');
+}
+
+// ── Repack: find the right batch (round 4, team batch sheet, Nov 2026) ──
+
+function is_repack(doc) {
+    return doc.purpose === "Repack" || doc.stock_entry_type === "Repack";
+}
+
+function add_repack_suggest_button(frm) {
+    frm.remove_custom_button(__("Suggest Batches"));
+    if (frm.doc.docstatus !== 0 || !is_repack(frm.doc)) return;
+    set_batch_filter(frm);
+    frm.add_custom_button(__("Suggest Batches"), () => open_repack_suggest_dialog(frm));
+}
+
+function open_repack_suggest_dialog(frm) {
+    const d = new frappe.ui.Dialog({
+        title: __("Suggest Batches (free stock, oldest first)"),
+        fields: [
+            { fieldname: "item_code", fieldtype: "Link", options: "Item", label: __("Item"), reqd: 1 },
+            {
+                fieldname: "warehouse", fieldtype: "Link", options: "Warehouse", label: __("Source Warehouse"),
+                reqd: 1, default: frm.doc.from_warehouse
+            },
+            { fieldname: "length", fieldtype: "Float", label: __("Length (m), blank for any") },
+            { fieldname: "col", fieldtype: "Column Break" },
+            { fieldname: "pieces", fieldtype: "Int", label: __("Pieces") },
+            { fieldname: "qty", fieldtype: "Float", label: __("Or Qty (t)") },
+        ],
+        primary_action_label: __("Add Rows"),
+        primary_action(v) {
+            if (!cint(v.pieces) && !flt(v.qty)) {
+                frappe.msgprint(__("Enter Pieces or Qty."));
+                return;
+            }
+            frappe.call({
+                method: "madhav.madhav.utils.repack_batches.suggest_repack_batches",
+                args: v,
+                freeze: true,
+            }).then((r) => {
+                const res = r.message || {};
+                if (!(res.rows || []).length) {
+                    frappe.msgprint(__("No free stock of {0} in {1}{2}.", [
+                        v.item_code, v.warehouse, v.length ? __(" at {0} m", [v.length]) : ""
+                    ]));
+                    return;
+                }
+                res.rows.forEach((s) => {
+                    const row = frm.add_child("items", {
+                        item_code: v.item_code,
+                        s_warehouse: v.warehouse,
+                        qty: s.qty,
+                        transfer_qty: s.qty,
+                        pieces: s.pieces,
+                        average_length: s.average_length,
+                        section_weight: s.section_weight,
+                        use_serial_batch_fields: 1,
+                    });
+                    row.__madhav_suggested = true;
+                    row.batch_no = s.batch_no;
+                });
+                frm.refresh_field("items");
+                d.hide();
+                const short = cint(res.short_pieces) || flt(res.short_qty);
+                frappe.show_alert({
+                    message: short
+                        ? __("Added {0} batch rows. Free stock is short by {1}; the rest is reserved (pick a batch to unreserve it).", [res.rows.length, short])
+                        : __("Added {0} batch rows, oldest first.", [res.rows.length]),
+                    indicator: short ? "orange" : "green",
+                });
+            });
+        },
+    });
+    d.show();
+}
+
+function offer_unreserve_for_repack(frm, cdt, cdn, free_qty) {
+    const child = locals[cdt][cdn];
+    if (!child || !child.batch_no || !child.s_warehouse || !child.item_code) return;
+    frappe.call({
+        method: "madhav.madhav.utils.repack_batches.get_batch_reservations_for_repack",
+        args: { item_code: child.item_code, warehouse: child.s_warehouse, batch_no: child.batch_no },
+    }).then((r) => {
+        const res = r.message || {};
+        const reservations = res.reservations || [];
+        if (!reservations.length || locals[cdt][cdn].batch_no !== child.batch_no) return;
+
+        const lines = reservations.map((x) =>
+            `<li>${frappe.utils.escape_html(x.sales_order || x.sre)} · ${frappe.utils.escape_html(x.customer_name || x.customer || "")}`
+            + (x.po_no ? ` · PO ${frappe.utils.escape_html(x.po_no)}` : "")
+            + ` · <b>${flt(x.qty, 3)} t</b>, ${cint(x.pieces)} pcs</li>`
+        ).join("");
+        const intro = __("Batch {0} in {1}: {2} t is free. Reserved:", [
+            `<b>${child.batch_no}</b>`, child.s_warehouse, flt(res.free_qty, 3)
+        ]);
+
+        if (!res.can_unreserve) {
+            frappe.msgprint({
+                title: __("Reserved stock"),
+                indicator: "orange",
+                message: `${intro}<ul>${lines}</ul>` + __("Ask someone who can cancel Stock Reservation Entries to unreserve it."),
+            });
+            return;
+        }
+
+        const options = reservations.map((x) => ({
+            value: x.sre,
+            label: `${x.sales_order || x.sre} · ${x.customer_name || x.customer || ""} · ${flt(x.qty, 3)} t`,
+        }));
+        const d = new frappe.ui.Dialog({
+            title: __("Batch {0} is reserved", [child.batch_no]),
+            fields: [
+                { fieldtype: "HTML", options: `<p>${intro}</p><ul>${lines}</ul>` },
+                {
+                    fieldname: "sre", fieldtype: "Select", label: __("Take from reservation"),
+                    options: options, default: options[0].value
+                },
+                {
+                    fieldtype: "HTML",
+                    options: `<p class="text-muted small">${__("On submit only the qty this row needs beyond the free stock comes off that reservation. Cancelling the Repack puts it back.")}</p>`
+                },
+            ],
+            primary_action_label: __("Unreserve and use"),
+            primary_action(v) {
+                const pick = reservations.find((x) => x.sre === v.sre);
+                const live = locals[cdt][cdn];
+                const qty = flt(flt(res.free_qty) + flt(pick.qty), 3);
+                frappe.model.set_value(cdt, cdn, "custom_unreserve_from", v.sre);
+                frappe.model.set_value(cdt, cdn, "qty", qty);
+                if (cint(live.pieces) && cint(pick.pieces)) {
+                    frappe.model.set_value(cdt, cdn, "pieces", cint(res.free_pieces) + cint(pick.pieces));
+                }
+                d.hide();
+            },
+            secondary_action_label: flt(free_qty) > 0 ? __("Use free stock only") : __("Close"),
+            secondary_action() {
+                d.hide();
+            },
+        });
+        d.show();
+    });
 }

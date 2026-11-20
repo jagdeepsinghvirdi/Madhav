@@ -106,7 +106,10 @@ def _run_sync(doc, bundle, info=None, cap=10.0):
 		patch(f"{MOD}.resolve_entry_length", side_effect=lambda e, *a: e.length), \
 		patch(f"{MOD}.resolve_entry_section_weight", side_effect=lambda e, *a: e.section_weight), \
 		patch(f"{MOD}.sync_dn_item_length_from_entries", return_value=None), \
-		patch(f"{MOD}._delivery_tolerance_percent", return_value=3):
+		patch(f"{MOD}._delivery_tolerance_percent", return_value=3), \
+		patch(f"{MOD}._row_reserved_pool", return_value=[]):
+		# No open reservation behind the row: the proportional resize (rows
+		# with one go oldest first, see test_round4_dn.py).
 		dn.sync_draft_bundles_to_row_qty(doc)
 
 

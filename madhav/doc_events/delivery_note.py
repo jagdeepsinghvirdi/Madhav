@@ -1662,6 +1662,10 @@ def change_qty_serial_and_batch(self):
             item.serial_and_batch_bundle,
         )
         bundle.reload()
+        # Rows fetched per length: Pieces or Qty lowered before the first
+        # save → oldest batch first (round 4). Other rows: as before.
+        if getattr(item, RESERVED_POOL_FIELD, None) and rebuild_row_bundle_fifo(self, item, bundle):
+            continue
         _resize_bundle_to_row_qty(self, item, bundle)
 
 
@@ -1805,14 +1809,20 @@ def sync_draft_bundles_to_row_qty(doc):
             continue
         if flt(item.qty) <= 0:
             continue
-        if not bundle_needs_resize(info.total_qty, item.qty, item.conversion_factor):
-            continue
 
         # The resize writes Qty into the bundle; a row in another UOM keeps
         # ERPNext's own message (bundle must match Stock Qty).
         if abs(flt(item.conversion_factor or 1) - 1) > 1e-9:
             continue
+
+        # Reserved rows: a changed Pieces or Qty re-takes the batches oldest
+        # first (round 4; replaces the proportional resize for them).
         bundle = frappe.get_doc("Serial and Batch Bundle", item.serial_and_batch_bundle)
+        if rebuild_row_bundle_fifo(doc, item, bundle):
+            continue
+
+        if not bundle_needs_resize(info.total_qty, item.qty, item.conversion_factor):
+            continue
         _validate_bundle_increase(item, bundle, flt(item.qty), doc)
         bundle_pieces = sum(cint(flt(e.pieces)) for e in bundle.entries if e.batch_no)
         # Pieces untouched since the bundle was made follow the new weight;
@@ -3182,7 +3192,11 @@ def on_cancel(doc, method=None):
 
 	release_stock_used_by_delivery_note(doc)
 	restore_released_so_reservations(doc)
-	reverse_sre_delivery_for_dn(doc)
+	# The submit log already reversed exactly what this note delivered
+	# (selling_controller.update_stock_reservation_entries). Undoing again by
+	# batch took back another note's delivery of the same batch (round 4 fix).
+	if not doc.flags.get("madhav_sre_undelivered_from_log"):
+		reverse_sre_delivery_for_dn(doc)
 	restore_stock_reservations_after_cancel(doc)
 	update_sales_order_quantities_on_cancel(doc)
 	sync_batch_master_qty_from_delivery(doc)
@@ -4569,9 +4583,34 @@ def make_delivery_note_custom(source_name, target_doc=None, kwargs=None):
 
         so_items = {d.name: d for d in so.items}
 
+        # Batch reservations: one row per Sales Order line + warehouse +
+        # length, batches oldest first behind it (team, Nov 2026). Rows keep
+        # the Sales Order line order.
+        batch_sres_by_line = {}
+        for sre in sre_list:
+            if selected_sre and sre.voucher_detail_no not in selected_sre:
+                continue
+            if sre.reservation_based_on != "Serial and Batch":
+                continue
+            if flt(sre.reserved_qty) - flt(sre.delivered_qty) <= 0:
+                continue
+            batch_sres_by_line.setdefault(sre.voucher_detail_no, []).append(sre.name)
+
+        for so_item in so.items:
+            sre_names = batch_sres_by_line.get(so_item.name)
+            if not sre_names:
+                continue
+            groups = _so_line_length_groups(so.name, so_item.name, sre_names=sre_names)
+            for dn_item in _dn_items_for_length_groups(so, so_item, groups):
+                target_doc.append("items", dn_item)
+
         for sre in sre_list:
 
             if selected_sre and sre.voucher_detail_no not in selected_sre:
+                continue
+
+            # Batch reservations were added above, grouped by length.
+            if sre.reservation_based_on == "Serial and Batch":
                 continue
 
             so_item = so_items.get(sre.voucher_detail_no)
@@ -5038,3 +5077,365 @@ def release_stuck_reservations_on_delivered_so_lines(dry_run=1):
     if not dry_run:
         frappe.db.commit()
     return out
+
+
+# ── Round 4 (team, Nov 2026): one row per item + length, oldest batch first ──
+#
+# Get Items From → Sales Order used to add one row per reservation, so one
+# Sales Order line came in as several rows of the same length. Rows are now
+# built per warehouse + length; the batches stay behind the row in its Serial
+# and Batch Bundle, oldest first. When the user lowers Pieces (or Qty) on a
+# draft, the bundle is rebuilt from the oldest batch first, and what is not
+# taken stays reserved for the Sales Order line.
+
+RESERVED_POOL_FIELD = "custom_reserved_batch_pool"
+
+
+def _dn_item_has_field(fieldname):
+    return bool(frappe.get_meta("Delivery Note Item").has_field(fieldname))
+
+
+def _make_dn_bundle_from_allocations(item_code, warehouse, allocations):
+    """New outward draft bundle for a Delivery Note row, entries oldest first."""
+    entries = [a for a in allocations if flt(a.get("take_qty")) > 0]
+    if not entries:
+        return None
+    bundle = frappe.new_doc("Serial and Batch Bundle")
+    bundle.item_code = item_code
+    bundle.warehouse = warehouse
+    bundle.voucher_type = "Delivery Note"
+    bundle.type_of_transaction = "Outward"
+    bundle.has_batch_no = 1
+    bundle.posting_date = nowdate()
+    bundle.posting_time = nowtime()
+    for a in entries:
+        bundle.append(
+            "entries",
+            {
+                "batch_no": a.get("batch_no"),
+                "qty": -abs(flt(a.get("take_qty"))),
+                "warehouse": a.get("warehouse") or warehouse,
+                "pieces": cint(a.get("take_pieces")),
+                "length": flt(a.get("length")),
+                "section_weight": flt(a.get("section_weight")),
+            },
+        )
+    bundle.total_qty = -sum(abs(flt(a.get("take_qty"))) for a in entries)
+    bundle.flags.ignore_permissions = True
+    bundle.insert(ignore_permissions=True)
+    return bundle.name
+
+
+def _stamp_length_group_on_dn_item(dn_item, so_item, group, total_qty, total_pieces):
+    """Length, pieces, section weight and display fields for one length group."""
+    so_length = flt(so_item.get("length_size"))
+    if so_length and hasattr(dn_item, "length_sizeso"):
+        dn_item.length_sizeso = so_length
+    length = flt(group.get("length")) or so_length
+    if length and hasattr(dn_item, "length_size"):
+        dn_item.length_size = length
+    if length and hasattr(dn_item, "average_length"):
+        dn_item.average_length = length
+    if hasattr(dn_item, "pieces"):
+        dn_item.pieces = cint(total_pieces)
+    if hasattr(dn_item, "lengthpieces_so") and total_pieces:
+        dn_item.lengthpieces_so = cint(total_pieces)
+
+    section_weight = flt(so_item.get("section_weight"))
+    if not section_weight:
+        section_weight = next(
+            (flt(e.get("section_weight")) for e in group["entries"] if flt(e.get("section_weight"))),
+            0,
+        )
+    if not section_weight and so_item.get("item_code"):
+        section_weight = flt(
+            frappe.db.get_value("Item", so_item.get("item_code"), "weight_per_meter") or 0
+        )
+    if hasattr(dn_item, "section_weight") and section_weight:
+        dn_item.section_weight = section_weight
+
+    assorted = group.get("assorted_length")
+    if assorted and _dn_item_has_field("assorted_length"):
+        df = frappe.get_meta("Delivery Note Item").get_field("assorted_length")
+        if df.fieldtype != "Select" or assorted in (df.options or "").split("\n"):
+            dn_item.assorted_length = assorted
+
+
+def _dn_items_for_length_groups(so, so_item, groups):
+    """Delivery Note Item rows, one per length group of one Sales Order line."""
+    from madhav.madhav.utils.reserved_length_groups import pool_to_json
+
+    rows = []
+    for group in groups:
+        allocations = [
+            dict(e, take_qty=flt(e.get("qty")), take_pieces=cint(e.get("pieces")))
+            for e in group["entries"]
+        ]
+        bundle_name = _make_dn_bundle_from_allocations(
+            so_item.item_code, group["warehouse"], allocations
+        )
+        if not bundle_name:
+            continue
+
+        dn_item = get_mapped_doc(
+            "Sales Order Item",
+            so_item.name,
+            {
+                "Sales Order Item": {
+                    "doctype": "Delivery Note Item",
+                    "field_map": {
+                        "name": "so_detail",
+                        "parent": "against_sales_order",
+                        "rate": "rate",
+                    },
+                }
+            },
+            ignore_permissions=True,
+        )
+        stock_qty = flt(group["qty"])
+        dn_item.qty = stock_qty / flt(dn_item.conversion_factor or 1)
+        dn_item.warehouse = group["warehouse"]
+        dn_item.custom_deliver_as_qty = so.deliver_as_qty
+        dn_item.serial_and_batch_bundle = bundle_name
+        if hasattr(dn_item, "batch_no"):
+            dn_item.batch_no = None
+        _stamp_length_group_on_dn_item(dn_item, so_item, group, stock_qty, group["pieces"])
+        if _dn_item_has_field("sw_qty"):
+            dn_item.sw_qty = _dn_sw_qty(dn_item)
+        # One reservation behind the row: pin it (warehouse pin, cancel restore).
+        # Several: leave it blank so submit matches every reservation by batch,
+        # as the Create → Delivery Note merged bundle already does.
+        if _dn_item_has_field("custom_sre") and len(group["sres"]) == 1:
+            dn_item.custom_sre = group["sres"][0]
+        if _dn_item_has_field(RESERVED_POOL_FIELD):
+            dn_item.set(RESERVED_POOL_FIELD, pool_to_json(group["entries"]))
+        rows.append(dn_item)
+    return rows
+
+
+def _so_line_length_groups(sales_order, so_detail, sre_names=None, warehouse=None):
+    from madhav.madhav.utils.reserved_length_groups import (
+        get_reserved_pool,
+        group_pool_by_length,
+    )
+
+    pool = get_reserved_pool(sales_order, so_detail, warehouse=warehouse, sre_names=sre_names)
+    return group_pool_by_length(pool)
+
+
+def _row_reserved_pool(doc, item):
+    """Open reserved batches this row may draw on, oldest first.
+
+    The batches recorded when the row was fetched, else the batches already
+    in its bundle; less what the note's other rows take from them.
+    """
+    from madhav.madhav.utils.reserved_length_groups import (
+        get_reserved_pool,
+        merge_entries_by_batch,
+        pool_batches_from_json,
+    )
+
+    if not getattr(item, "against_sales_order", None) or not getattr(item, "so_detail", None):
+        return []
+    batch_nos = pool_batches_from_json(getattr(item, RESERVED_POOL_FIELD, None))
+    bundle_name = getattr(item, "serial_and_batch_bundle", None)
+    if not batch_nos and bundle_name:
+        batch_nos = sorted(
+            b
+            for b in frappe.get_all(
+                "Serial and Batch Entry",
+                filters={"parent": bundle_name, "parenttype": "Serial and Batch Bundle"},
+                pluck="batch_no",
+            )
+            or []
+            if b
+        )
+    if not batch_nos:
+        return []
+
+    pool = merge_entries_by_batch(
+        get_reserved_pool(
+            item.against_sales_order,
+            item.so_detail,
+            warehouse=item.warehouse,
+            batch_nos=batch_nos,
+        )
+    )
+    if not pool:
+        return []
+
+    other_use = _other_rows_batch_use(doc, item) if doc is not None else {}
+    out = []
+    for entry in pool:
+        used = flt(other_use.get((entry.get("warehouse") or item.warehouse, entry.get("batch_no"))))
+        if used > 0:
+            open_qty = flt(entry.get("qty"))
+            left = max(0.0, open_qty - used)
+            if open_qty > 0:
+                entry["pieces"] = int(round(cint(entry.get("pieces")) * left / open_qty))
+            entry["qty"] = left
+        if flt(entry.get("qty")) > 0:
+            out.append(entry)
+    return out
+
+
+def rebuild_row_bundle_fifo(doc, item, bundle=None):
+    """Re-take a reserved row's batches oldest first after Pieces or Qty changed.
+
+    Pieces changed → that many bars, oldest batch first; the weight follows.
+    Otherwise Qty changed → that weight, oldest batch first; bars follow.
+    Returns True when the row was handled here (the caller then skips the
+    proportional resize), False when the row has no reserved pool.
+    """
+    from madhav.madhav.utils.reserved_length_groups import (
+        allocate_pieces_fifo,
+        allocate_qty_fifo,
+    )
+
+    if cint(getattr(doc, "is_return", 0)) or not getattr(item, "serial_and_batch_bundle", None):
+        return False
+    pool = _row_reserved_pool(doc, item)
+    if not pool:
+        return False
+
+    bundle = bundle or frappe.get_doc("Serial and Batch Bundle", item.serial_and_batch_bundle)
+    if cint(bundle.docstatus) != 0:
+        return False
+    current = [e for e in bundle.entries if e.batch_no]
+    bundle_qty = sum(abs(flt(e.qty)) for e in current)
+    bundle_pieces = sum(cint(flt(e.pieces)) for e in current)
+    row_pieces = cint(flt(getattr(item, "pieces", None)))
+    row_stock_qty = flt(item.qty) * flt(item.conversion_factor or 1)
+
+    # Pieces drive the rebuild only on rows fetched per length: older rows can
+    # carry a display count that differs from the bundle (piece caps).
+    pieces_changed = (
+        bool(getattr(item, RESERVED_POOL_FIELD, None)) and row_pieces > 0 and row_pieces != bundle_pieces
+    )
+    qty_changed = row_stock_qty > 0 and abs(row_stock_qty - bundle_qty) > BUNDLE_QTY_TOLERANCE
+    if not pieces_changed and not qty_changed:
+        return True
+
+    if pieces_changed:
+        allocations, short = allocate_pieces_fifo(pool, row_pieces)
+        short_qty = 0.0
+        if short and allocations:
+            last = allocations[-1]
+            per_piece = (
+                flt(last.get("qty")) / cint(last.get("pieces")) if cint(last.get("pieces")) else 0
+            )
+            short_qty = flt(short * per_piece, 3)
+    else:
+        allocations, short_qty = allocate_qty_fifo(pool, row_stock_qty)
+        short = 0
+
+    if not allocations:
+        return False
+
+    # Asked for more than is reserved: the newest batch on the row may still
+    # give free stock (the same rule as before), never another order's stock.
+    if short_qty > BUNDLE_QTY_TOLERANCE or short:
+        last = allocations[-1]
+        warehouse = last.get("warehouse") or item.warehouse
+        cap = flt(
+            _row_batch_cap(item, warehouse, last["batch_no"])
+            - flt(_other_rows_batch_use(doc, item).get((warehouse, last["batch_no"]))),
+            3,
+        )
+        want = flt(last["take_qty"] + short_qty, 3)
+        if want > cap + BUNDLE_QTY_TOLERANCE:
+            asked = (
+                _("{0} pieces").format(row_pieces)
+                if pieces_changed
+                else _("Qty {0}").format(flt(row_stock_qty, 3))
+            )
+            reserved_pieces = sum(cint(e.get("pieces")) for e in pool)
+            reserved_qty = flt(sum(flt(e.get("qty")) for e in pool), 3)
+            frappe.throw(
+                _(
+                    "Row #{0}: {1} is more than is reserved for this Sales Order line at this length "
+                    "({2} pieces, {3}) plus the free stock of batch {4}. Lower the Pieces or Qty, "
+                    "or reserve more stock first."
+                ).format(item.idx, asked, reserved_pieces, reserved_qty, frappe.bold(last["batch_no"])),
+                title=_("Not enough reserved stock"),
+            )
+        last["take_qty"] = want
+        last["take_pieces"] = cint(last.get("take_pieces")) + cint(short)
+
+    bundle.set("entries", [])
+    for a in allocations:
+        if flt(a.get("take_qty")) <= 0:
+            continue
+        bundle.append(
+            "entries",
+            {
+                "batch_no": a.get("batch_no"),
+                "qty": -abs(flt(a.get("take_qty"))),
+                "warehouse": a.get("warehouse") or item.warehouse,
+                "pieces": cint(a.get("take_pieces")),
+                "length": flt(a.get("length")),
+                "section_weight": flt(a.get("section_weight")),
+            },
+        )
+    new_qty = flt(sum(abs(flt(e.qty)) for e in bundle.entries), 3)
+    new_pieces = sum(cint(e.pieces) for e in bundle.entries)
+
+    item.qty = new_qty / flt(item.conversion_factor or 1)
+    item.stock_qty = new_qty
+    item.amount = flt(item.rate) * flt(item.qty)
+    item.base_amount = item.amount * flt(getattr(doc, "conversion_rate", 1) or 1)
+    if hasattr(item, "pieces"):
+        item.pieces = new_pieces
+    sync_dn_item_length_from_entries(item, bundle.entries, item.so_detail)
+    if _dn_item_has_field("sw_qty"):
+        item.sw_qty = _dn_sw_qty(item)
+
+    bundle.total_qty = -new_qty
+    bundle.flags.ignore_validate = True
+    bundle.flags.ignore_links = True
+    bundle.save(ignore_permissions=True)
+    bundle.reload()
+    return True
+
+
+@frappe.whitelist()
+def preview_fifo_for_dn_row(row, items=None):
+    """Qty and pieces a draft row would get, oldest batch first (for the form).
+
+    ``row`` is the Delivery Note Item as a dict; ``items`` the note's rows so
+    batches other rows already take are not offered twice.
+    """
+    from madhav.madhav.utils.reserved_length_groups import (
+        allocate_pieces_fifo,
+        allocate_qty_fifo,
+    )
+
+    if isinstance(row, str):
+        row = json.loads(row)
+    if isinstance(items, str):
+        items = json.loads(items)
+    item = frappe._dict(row or {})
+    doc = frappe._dict(items=[frappe._dict(d) for d in (items or [])], is_return=0)
+    for d in doc["items"]:
+        d.setdefault("serial_and_batch_bundle", None)
+    pool = _row_reserved_pool(doc, item)
+    if not pool:
+        return None
+    if cint(flt(getattr(item, "pieces", None))) > 0 and getattr(item, "_changed", None) == "pieces":
+        allocations, short = allocate_pieces_fifo(pool, cint(flt(item.pieces)))
+    else:
+        allocations, _short = allocate_qty_fifo(
+            pool, flt(getattr(item, "qty", None)) * flt(getattr(item, "conversion_factor", None) or 1)
+        )
+        short = 0
+    qty = flt(sum(flt(a["take_qty"]) for a in allocations), 3)
+    return {
+        "qty": qty / flt(getattr(item, "conversion_factor", None) or 1),
+        "pieces": sum(cint(a["take_pieces"]) for a in allocations),
+        "short_pieces": cint(short),
+        "reserved_pieces": sum(cint(e.get("pieces")) for e in pool),
+        "batches": [
+            {"batch_no": a["batch_no"], "pieces": cint(a["take_pieces"]), "qty": flt(a["take_qty"], 3)}
+            for a in allocations
+        ],
+    }

@@ -181,6 +181,7 @@ frappe.ui.form.on('Delivery Note Item', {
 		calculate_qty(cdt, cdn);
 		set_sw_qty(cdt, cdn);
 		enforce_delivery_note_piece_limits(frm, false, cdt, cdn);
+		preview_reserved_row_fifo(frm, cdt, cdn);
 	},
 	average_length(frm, cdt, cdn) {
 		calculate_qty(cdt, cdn);
@@ -987,4 +988,46 @@ function open_sales_order_items_selector_for_delivery_note(frm) {
 			});
 		});
 	}
+}
+
+// Rows fetched per length (round 4, team Nov 2026): lowering Pieces takes
+// bars from the oldest reserved batch first. Show the weight that follows
+// straight away; the server rebuilds the batch bundle the same way on save.
+function preview_reserved_row_fifo(frm, cdt, cdn) {
+	const row = locals[cdt][cdn];
+	if (!row || !row.custom_reserved_batch_pool || cint(row.pieces) <= 0) return;
+	if (frm.doc.docstatus !== 0 || cint(frm.doc.is_return)) return;
+	frappe
+		.call({
+			method: "madhav.doc_events.delivery_note.preview_fifo_for_dn_row",
+			args: {
+				row: Object.assign({}, row, { _changed: "pieces" }),
+				items: (frm.doc.items || []).map((d) => ({
+					name: d.name,
+					item_code: d.item_code,
+					warehouse: d.warehouse,
+					batch_no: d.batch_no,
+					qty: d.qty,
+					serial_and_batch_bundle: d.serial_and_batch_bundle,
+				})),
+			},
+		})
+		.then((r) => {
+			const res = r && r.message;
+			const live = locals[cdt][cdn];
+			if (!res || !live || cint(live.pieces) !== cint(row.pieces)) return;
+			if (cint(res.short_pieces) > 0) {
+				frappe.show_alert({
+					message: __("Row #{0}: only {1} pieces are reserved at this length.", [
+						live.idx,
+						res.reserved_pieces,
+					]),
+					indicator: "orange",
+				});
+				return;
+			}
+			if (Math.abs(flt(live.qty) - flt(res.qty)) > 0.0005) {
+				frappe.model.set_value(cdt, cdn, "qty", flt(res.qty, 3));
+			}
+		});
 }

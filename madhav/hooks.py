@@ -196,10 +196,17 @@ doc_events = {
     "Stock Entry":{
         "before_validate": "madhav.doc_events.stock_entry.auto_calculation",
         "on_submit": "madhav.doc_events.stock_entry.after_submit",
-        "before_submit": "madhav.doc_events.stock_entry.validation_section_weight",
+        "before_submit": [
+            "madhav.doc_events.stock_entry.validation_section_weight",
+            # Repack "Unreserve and use" (round 4)
+            "madhav.madhav.utils.repack_batches.release_reservations_for_repack",
+        ],
         "validate": "madhav.doc_events.stock_entry.validate",
         "before_cancel": "madhav.doc_events.stock_entry.cancel_linked_psles",
-        "on_cancel":"madhav.doc_events.stock_entry.on_cancel"
+        "on_cancel": [
+            "madhav.doc_events.stock_entry.on_cancel",
+            "madhav.madhav.utils.repack_batches.restore_reservations_after_repack_cancel",
+        ],
     },
     "Purchase Invoice": {
     "before_save": [

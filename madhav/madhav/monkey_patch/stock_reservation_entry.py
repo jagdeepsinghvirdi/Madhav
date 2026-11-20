@@ -810,12 +810,25 @@ _ORIGINAL_AUTO_RESERVE_SERIAL_AND_BATCH = (
     _sre_module.StockReservationEntry.auto_reserve_serial_and_batch
 )
 
-from frappe.query_builder.functions import Sum
+from frappe.query_builder.functions import IfNull, Sum
 
 def get_sre_reserved_qty_for_items_and_warehouses(
-    item_code_list: list, warehouse_list: list | None = None , batch_list :list | None = None
+    item_code_list: list, warehouse_list: list | None = None, batch_list: list | None = None
 ) -> dict:
-    """Returns {(item_code, warehouse, batch_no): reserved_qty}"""
+    """Open reserved qty, as ERPNext's own function returns it.
+
+    Without ``batch_list``: ``{(item_code, warehouse): reserved_qty}``, the
+    shape the Item dashboard, Stock Balance and Stock Balance Madhav look up.
+    Batch reservations count their open batch rows (the header total over-
+    counts multi-batch rows); Qty reservations count their header.
+
+    With ``batch_list``: ``{(item_code, warehouse, batch_no): reserved_qty}``
+    for those batches only.
+
+    Round 4 fix: this returned batch keys for every caller, so the Reserved
+    Stock column read 0 everywhere (dashboard showed 0 for FG003793 while
+    20.865 t was reserved, 20 Nov 2026).
+    """
 
     if not item_code_list:
         return {}
@@ -823,35 +836,57 @@ def get_sre_reserved_qty_for_items_and_warehouses(
     sre = frappe.qb.DocType("Stock Reservation Entry")
     srei = frappe.qb.DocType("Serial and Batch Entry")
 
-    query = (
-        frappe.qb.from_(sre)
-        .inner_join(srei)
-        .on(sre.name == srei.parent)
-        .select(
-            sre.item_code,
-            sre.warehouse,
-            srei.batch_no,
-			# The header contains all batches on the SRE.  Using it here for
-			# every child batch over-reserves multi-batch rows.
-            Sum(srei.qty - srei.delivered_qty).as_("reserved_qty"),
+    def batch_rows(group_by_batch):
+        query = (
+            frappe.qb.from_(sre)
+            .inner_join(srei)
+            .on((sre.name == srei.parent) & (srei.parenttype == "Stock Reservation Entry"))
+            .where(
+                (sre.docstatus == 1)
+                & sre.item_code.isin(item_code_list)
+                & (sre.status.notin(["Delivered", "Cancelled"]))
+                & (sre.reservation_based_on == "Serial and Batch")
+            )
         )
+        if warehouse_list:
+            query = query.where(sre.warehouse.isin(warehouse_list))
+        if batch_list:
+            query = query.where(srei.batch_no.isin(batch_list))
+        fields = [sre.item_code, sre.warehouse]
+        if group_by_batch:
+            fields.append(srei.batch_no)
+        return (
+            query.select(*fields, Sum(srei.qty - IfNull(srei.delivered_qty, 0)).as_("reserved_qty"))
+            .groupby(*fields)
+            .run(as_dict=True)
+        )
+
+    if batch_list:
+        return {
+            (d["item_code"], d["warehouse"], d["batch_no"]): d["reserved_qty"]
+            for d in batch_rows(True)
+        }
+
+    out = {}
+    for d in batch_rows(False):
+        key = (d["item_code"], d["warehouse"])
+        out[key] = flt(out.get(key)) + flt(d["reserved_qty"])
+
+    qty_query = (
+        frappe.qb.from_(sre)
+        .select(sre.item_code, sre.warehouse, Sum(sre.reserved_qty - sre.delivered_qty).as_("reserved_qty"))
         .where(
             (sre.docstatus == 1)
             & sre.item_code.isin(item_code_list)
             & (sre.status.notin(["Delivered", "Cancelled"]))
+            & (sre.reservation_based_on != "Serial and Batch")
         )
-        .groupby(sre.item_code, sre.warehouse, srei.batch_no)
+        .groupby(sre.item_code, sre.warehouse)
     )
-
     if warehouse_list:
-        query = query.where(sre.warehouse.isin(warehouse_list))
+        qty_query = qty_query.where(sre.warehouse.isin(warehouse_list))
+    for d in qty_query.run(as_dict=True):
+        key = (d["item_code"], d["warehouse"])
+        out[key] = flt(out.get(key)) + flt(d["reserved_qty"])
 
-    if batch_list:
-        query = query.where(srei.batch_no.isin(batch_list))
-
-    data = query.run(as_dict=True)
-
-    return {
-        (d["item_code"], d["warehouse"], d["batch_no"]): d["reserved_qty"]
-        for d in data
-    } if data else {}
+    return {k: v for k, v in out.items() if flt(v) > 0}
