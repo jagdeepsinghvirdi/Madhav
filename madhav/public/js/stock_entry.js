@@ -456,6 +456,10 @@ function open_repack_suggest_dialog(frm) {
                     ]));
                     return;
                 }
+                // Drop the blank starter row(s) so the suggestion is the list.
+                (frm.doc.items || []).filter((r) => !r.item_code).forEach((r) => {
+                    frappe.model.clear_doc(r.doctype, r.name);
+                });
                 res.rows.forEach((s) => {
                     const row = frm.add_child("items", {
                         item_code: v.item_code,
