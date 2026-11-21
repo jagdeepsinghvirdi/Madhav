@@ -198,12 +198,15 @@ frappe.ui.form.on('Delivery Note Item', {
 // Get Items From → Sales Order: bring the Sales Order's taxes and charges
 // (freight, loading, GST), as Create → Delivery Note does (team, 14 Nov 2026).
 // `mapped` is the Delivery Note built server side from one Sales Order.
-// The Delivery Note's taxes are replaced by the Sales Order's only when every
-// tax row already on the Delivery Note is also on the Sales Order (blank, or
-// the default GST rows), so nothing typed by hand is lost and row order
-// ("On Previous Row Total") stays as on the Sales Order. Otherwise the
-// missing charges are listed for the user.
-function apply_sales_order_taxes(frm, mapped) {
+// When this fetch is what fills an empty Delivery Note, the Sales Order's
+// taxes replace whatever the note had: those are only the defaults ERPNext
+// put in when the customer was set (team feedback 3, 21 Nov 2026: a note for
+// an IGST order kept its default rows and the order's IGST and Freight were
+// "not added"). When the note already has rows from another order, its taxes
+// are replaced only when every row on it is also on the Sales Order, so
+// nothing typed by hand is lost; otherwise the missing charges are listed.
+// Row order ("On Previous Row Total") stays as on the Sales Order.
+function apply_sales_order_taxes(frm, mapped, replace_defaults) {
 	const so_taxes = (mapped.taxes || []).filter((t) => t.account_head);
 	if (!so_taxes.length) return { changed: false, skipped: [] };
 	const key = (t) => `${t.charge_type}|${t.account_head}`;
@@ -211,7 +214,7 @@ function apply_sales_order_taxes(frm, mapped) {
 	const existing = (frm.doc.taxes || []).filter((t) => t.account_head);
 	const dn_keys = new Set(existing.map(key));
 
-	if (!existing.every((t) => so_keys.has(key(t)))) {
+	if (!replace_defaults && !existing.every((t) => so_keys.has(key(t)))) {
 		return {
 			changed: false,
 			skipped: so_taxes.filter((t) => !dn_keys.has(key(t))).map((t) => t.description || t.account_head),
@@ -231,8 +234,11 @@ function apply_sales_order_taxes(frm, mapped) {
 		});
 	});
 	// Assign directly: set_value would make ERPNext reload the template rows.
+	// The note's own template goes too, so it is not re-applied over these rows.
 	["taxes_and_charges", "tax_category"].forEach((f) => {
-		if (mapped[f] && frappe.meta.has_field("Delivery Note", f)) frm.doc[f] = mapped[f];
+		if (!frappe.meta.has_field("Delivery Note", f)) return;
+		if (mapped[f]) frm.doc[f] = mapped[f];
+		else if (replace_defaults && f === "taxes_and_charges") frm.doc[f] = "";
 	});
 	frm.refresh_field("taxes");
 	frm.refresh_field("taxes_and_charges");
@@ -625,6 +631,8 @@ function open_sales_order_items_selector_for_delivery_note(frm) {
 			if (Array.isArray(frm.doc.items) && frm.doc.items.length && !frm.doc.items[0].item_code) {
 				frm.doc.items.splice(0, 1);
 			}
+			// An empty note takes the first order's taxes in place of its defaults.
+			const note_was_empty = !(frm.doc.items || []).some((row) => row.item_code);
 
 			fill_header_from_sales_order(frm, customers[0]).then(() => {
 
@@ -645,10 +653,12 @@ function open_sales_order_items_selector_for_delivery_note(frm) {
 			Promise.all(calls.map(c => c.then ? c : Promise.resolve(c))).then(results => {
 				let taxes_changed = false;
 				const skipped_charges = [];
+				let first_order = note_was_empty;
 				results.forEach(r => {
 					// Only an order that actually brought rows brings its charges.
 					if (r && r.message && (r.message.items || []).length) {
-						const res = apply_sales_order_taxes(frm, r.message);
+						const res = apply_sales_order_taxes(frm, r.message, first_order);
+						first_order = false;
 						taxes_changed = taxes_changed || res.changed;
 						skipped_charges.push(...res.skipped);
 					}

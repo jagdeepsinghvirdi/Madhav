@@ -102,6 +102,7 @@ class TestGetItemsOneRowPerLength(FrappeTestCase):
 			patch(f"{POOL_MOD}.get_reserved_pool", return_value=pool), \
 			patch(f"{MOD}._make_dn_bundle_from_allocations", side_effect=fake_bundle), \
 			patch(f"{MOD}._dn_sw_qty", return_value=0), \
+			patch(f"{MOD}.batch_section_weight", return_value=0), \
 			patch(f"{MOD}._restore_dn_warehouses_from_custom_sre", return_value=None), \
 			patch(f"{MOD}.make_packing_list", return_value=None):
 			doc = dn.make_delivery_note_custom(

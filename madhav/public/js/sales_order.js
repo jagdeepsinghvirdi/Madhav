@@ -7,6 +7,7 @@ frappe.ui.form.on('Sales Order', {
     },
 
     refresh(frm) {
+        madhav_confirm_close_with_reserved_stock(frm);
         frm.remove_custom_button(__("Update Items"));
 
 		// Add custom button
@@ -980,3 +981,37 @@ frappe.ui.form.on("Sales Order", {
 		);
 	},
 });
+
+
+// Close with reserved stock (team feedback 3, 21 Nov 2026): the server
+// unreserves what is still reserved and moves it to For Mill (EXTRA). Say so
+// before it happens.
+function madhav_confirm_close_with_reserved_stock(frm) {
+    if (!frm.cscript || frm.cscript.__madhav_close_wrapped) return;
+    frm.cscript.__madhav_close_wrapped = true;
+    frm.cscript.close_sales_order = function () {
+        const close = () => frm.cscript.update_status("Close", "Closed");
+        frappe.call({
+            method: "madhav.madhav.utils.close_sales_order.get_close_summary",
+            args: { sales_order: frm.doc.name },
+        }).then((r) => {
+            const s = r.message || {};
+            if (!s.reservations) {
+                close();
+                return;
+            }
+            let msg = __("{0} t is still reserved for this order. Closing it will unreserve that stock.", [
+                format_number(s.reserved_qty, null, 3),
+            ]);
+            if (s.move_qty > 0) {
+                msg += "<br>" + __("{0} t ({1} batches) will move to {2}.", [
+                    format_number(s.move_qty, null, 3),
+                    (s.moves || []).length,
+                    s.target || __("For Mill (EXTRA)"),
+                ]);
+            }
+            msg += "<br><br>" + __("Close the order?");
+            frappe.confirm(msg, close);
+        });
+    };
+}

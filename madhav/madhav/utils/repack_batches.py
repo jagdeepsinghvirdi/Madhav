@@ -350,6 +350,70 @@ def release_reservations_for_repack(doc, method=None):
 			).insert(ignore_permissions=True)
 
 
+def _row_batch_takes(row):
+	"""(batch_no, qty) a source row takes: its batch field, else its bundle."""
+	qty = flt(row.get("transfer_qty")) or flt(row.get("qty")) * flt(row.get("conversion_factor") or 1)
+	if row.get("batch_no"):
+		return [(row.batch_no, qty)]
+	bundle = row.get("serial_and_batch_bundle")
+	if not bundle:
+		return []
+	return [
+		(e.batch_no, abs(flt(e.qty)))
+		for e in frappe.get_all(
+			"Serial and Batch Entry",
+			filters={"parent": bundle, "parenttype": "Serial and Batch Bundle"},
+			fields=["batch_no", "qty"],
+		)
+		if e.batch_no
+	]
+
+
+def validate_repack_reserved_stock(doc, method=None):
+	"""before_submit, after the release: a Repack may only take free stock.
+
+	ERPNext's own check lets a Repack take a batch that is reserved for a
+	Sales Order: it compares the reservation with the stock *before* this entry,
+	so as long as the batch is not over-reserved already it passes. Team
+	feedback 21 Nov 2026: skipping the unreserve pop-up let a Repack use
+	reserved stock; the Sales Order kept the reservation and its Delivery Note
+	then failed. Rows marked "Unreserve and use" were released just before
+	this runs, so what they need is free by now.
+	"""
+	from madhav.madhav.doctype.batch_wise_reservation_tool.batch_wise_reservation_tool import (
+		get_batch_available_qty,
+	)
+
+	if doc.get("stock_entry_type") != "Repack":
+		return
+	need = {}
+	rows_of = {}
+	for row in doc.get("items") or []:
+		if not row.get("s_warehouse") or not row.get("item_code"):
+			continue
+		for batch_no, qty in _row_batch_takes(row):
+			key = (row.item_code, row.s_warehouse, batch_no)
+			need[key] = need.get(key, 0.0) + qty
+			rows_of.setdefault(key, []).append(row)
+	for key, qty in need.items():
+		free = max(0.0, flt(get_batch_available_qty(*key)))
+		if qty <= free + QTY_EPSILON:
+			continue
+		holders = batch_reservations(*key)
+		who = ", ".join(
+			"{0} ({1} t)".format(h.sales_order, flt(h.qty, 3)) for h in holders[:3]
+		)
+		row = rows_of[key][0]
+		frappe.throw(
+			_(
+				"Row #{0}: this Repack takes {1} t of batch {2}, but only {3} t of it is free; "
+				"the rest is reserved for {4}. Choose that reservation in <b>Unreserve From</b> on the row "
+				"(or unreserve it on the Sales Order), or pick another batch."
+			).format(row.idx, flt(qty, 3), frappe.bold(key[2]), flt(free, 3), who or _("a Sales Order")),
+			title=_("Reserved Stock"),
+		)
+
+
 def restore_reservations_after_repack_cancel(doc, method=None):
 	"""on_cancel: put every reservation this Repack took from back exactly."""
 	if not _is_repack(doc) or not doc.get(RELEASE_LOG_FIELD):
@@ -394,6 +458,13 @@ def _recreate_from_snapshot(snap, doc):
 			sre.set(field, snap.get(field))
 	sre.available_qty = flt(snap.get("available_qty")) or flt(snap.get("reserved_qty"))
 	sre.reserved_qty = flt(snap.get("reserved_qty"))
+	if snap.get("reservation_based_on") == "Serial and Batch":
+		sre.use_serial_batch_fields = 1
+		# The batches come from the snapshot. Madhav's auto-pick (length window
+		# of the Sales Order line) must not re-pick them: it crashed on lines
+		# with a length, so Repack MUST26-09778 could not be cancelled on demo
+		# (21 Nov 2026). The Delivery Note restore switches it off the same way.
+		sre.auto_reserve_serial_and_batch = lambda *args, **kwargs: None
 	for e in snap.get("sb_entries") or []:
 		sre.append(
 			"sb_entries",

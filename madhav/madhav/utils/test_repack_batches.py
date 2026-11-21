@@ -167,6 +167,67 @@ if __name__ == "__main__":
 	unittest.main()
 
 
+
+class TestRepackTakesOnlyFreeStock(unittest.TestCase):
+	"""Team feedback 3 (21 Nov 2026): skipping the unreserve pop-up let a Repack
+	use reserved stock; ERPNext's own check passed it."""
+
+	def _check(self, rows, free, holders=None, entry_type="Repack"):
+		doc = _repack(rows, stock_entry_type=entry_type)
+		with patch(f"{BWRT}.get_batch_available_qty", side_effect=lambda *a: free.get(a[2], 0)), \
+			patch(f"{MOD}.batch_reservations", return_value=holders or [frappe._dict(sales_order="SO-1", qty=2.0)]):
+			rb.validate_repack_reserved_stock(doc)
+
+	def test_taking_reserved_stock_is_refused(self):
+		with self.assertRaises(frappe.ValidationError) as cm:
+			self._check([_row(custom_unreserve_from=None, transfer_qty=3.0)], {"B-1": 1.0})
+		self.assertIn("SO-1", str(cm.exception))
+
+	def test_free_stock_is_fine(self):
+		self._check([_row(custom_unreserve_from=None, transfer_qty=0.8)], {"B-1": 1.0})
+
+	def test_two_rows_on_one_batch_add_up(self):
+		rows = [_row(name="r1", transfer_qty=0.6, custom_unreserve_from=None),
+			_row(name="r2", idx=2, transfer_qty=0.6, custom_unreserve_from=None)]
+		with self.assertRaises(frappe.ValidationError):
+			self._check(rows, {"B-1": 1.0})
+
+	def test_target_rows_and_production_stages_are_not_checked(self):
+		self._check([_row(s_warehouse=None, t_warehouse="FG", transfer_qty=9)], {})
+		self._check([_row(custom_unreserve_from=None, transfer_qty=9)], {"B-1": 0}, entry_type="Production Entry")
+
+
+class TestRecreateDoesNotRePickBatches(unittest.TestCase):
+	"""Demo, 21 Nov 2026: cancelling Repack MUST26-09778 failed because the
+	recreated reservation ran Madhav's auto batch pick, which crashes on Sales
+	Order lines that have a length."""
+
+	def test_snapshot_batches_are_kept(self):
+		class FakeNewSRE(SimpleNamespace):
+			def append(self, table, row):
+				self.sb_entries.append(row)
+
+			def set(self, k, v):
+				setattr(self, k, v)
+
+			def auto_reserve_serial_and_batch(self, *a, **k):
+				raise AttributeError("'NoneType' object has no attribute 'get'")
+
+			def insert(self, **k):
+				self.name = "SRE-NEW"
+
+			def submit(self):
+				self.auto_reserve_serial_and_batch()  # what before_submit does
+
+		sre = FakeNewSRE(sb_entries=[], flags=frappe._dict())
+		snap = {"name": "SRE-9", "item_code": "FG000522", "warehouse": "FG", "voucher_no": "SO-1",
+			"reservation_based_on": "Serial and Batch", "reserved_qty": 2.427,
+			"sb_entries": [{"batch_no": "B-1", "qty": 2.427, "pieces": 15}]}
+		with patch.object(rb.frappe, "new_doc", return_value=sre), patch.object(rb.frappe, "msgprint"):
+			self.assertEqual(rb._recreate_from_snapshot(snap, frappe._dict(name="MUST26-1")), "SRE-NEW")
+		self.assertEqual([e["batch_no"] for e in sre.sb_entries], ["B-1"])
+
+
 class TestBatchOptions(unittest.TestCase):
 	"""Found on the local copy of production (20 Nov): reserved batches were
 	missing from the list, and a fully reserved batch showed 21 free pieces."""

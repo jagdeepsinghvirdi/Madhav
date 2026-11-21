@@ -200,6 +200,8 @@ doc_events = {
             "madhav.doc_events.stock_entry.validation_section_weight",
             # Repack "Unreserve and use" (round 4)
             "madhav.madhav.utils.repack_batches.release_reservations_for_repack",
+            # ...then a Repack may only take free stock (team feedback 3)
+            "madhav.madhav.utils.repack_batches.validate_repack_reserved_stock",
         ],
         "validate": "madhav.doc_events.stock_entry.validate",
         "before_cancel": "madhav.doc_events.stock_entry.cancel_linked_psles",
@@ -352,6 +354,15 @@ from madhav.madhav.monkey_patch.selling_controller import (
 )
 
 SellingController.update_stock_reservation_entries = madhav_update_stock_reservation_entries
+
+# Close a Sales Order with reserved stock: unreserve it and move it to
+# For Mill (EXTRA) instead of refusing (team feedback 3, 21 Nov 2026).
+from erpnext.selling.doctype.sales_order.sales_order import SalesOrder
+from madhav.madhav.utils.close_sales_order import (
+	validate_no_reserved_stock as madhav_validate_no_reserved_stock,
+)
+
+SalesOrder.validate_no_reserved_stock = madhav_validate_no_reserved_stock
 
 from erpnext.stock.doctype.delivery_note.delivery_note import DeliveryNote
 from madhav.madhav.monkey_patch.delivery_note import (

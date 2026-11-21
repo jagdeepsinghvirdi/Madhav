@@ -633,6 +633,10 @@ class FinishWorkOrder(Document):
 
         if not sales_order:
             return
+        from madhav.madhav.utils.close_sales_order import skip_reservation_for_closed_order
+
+        if skip_reservation_for_closed_order(sales_order, item_code):
+            return
         if quality_required:
             frappe.log_error(
                 title="Quality Inspection Required - Skipping Stock Reservation",

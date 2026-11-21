@@ -255,7 +255,7 @@ async function validate_batch_limit(cdt, cdn, fieldname) {
 
             frappe.msgprint({
                 title: "Batch Limit Reached",
-                message: `Pieces cannot exceed the free warehouse pieces (stock reserved for another order line is not free). Value reset to <b>${limit}</b>`,
+                message: `Pieces cannot exceed the free warehouse pieces (reserved stock is not free; unreserve it on the Sales Order first). Value reset to <b>${limit}</b>`,
                 indicator: "orange"
             });
 
@@ -285,7 +285,7 @@ async function validate_batch_limit(cdt, cdn, fieldname) {
 
             frappe.msgprint({
                 title: "Batch Limit Reached",
-                message: `Qty cannot exceed the free warehouse qty (stock reserved for another order line is not free). Value reset to <b>${limit}</b>`,
+                message: `Qty cannot exceed the free warehouse qty (reserved stock is not free; unreserve it on the Sales Order first). Value reset to <b>${limit}</b>`,
                 indicator: "orange"
             });
 

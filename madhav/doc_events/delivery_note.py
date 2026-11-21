@@ -1275,6 +1275,110 @@ def validate(self, method):
                 args["validate_qty"] = False
 
     set_invoice_qty_totals(self)
+    stamp_batch_section_weights(self)
+    delete_orphan_draft_bundles(self)
+
+
+def delete_orphan_draft_bundles(doc):
+    """Delete draft batch bundles no row of this note uses any more.
+
+    Team feedback 3 (21 Nov 2026): a line removed after Save left its draft
+    Serial and Batch Bundle behind; it still showed under the Batch after the
+    note was submitted. Candidates are the bundles the rows had before this
+    save and the draft bundles booked to this note; a bundle another document
+    still points to is left alone.
+    """
+    current = {r.serial_and_batch_bundle for r in doc.get("items") or [] if r.get("serial_and_batch_bundle")}
+    candidates = set()
+    before = doc.get_doc_before_save() if hasattr(doc, "get_doc_before_save") else None
+    if before:
+        candidates |= {r.serial_and_batch_bundle for r in before.get("items") or [] if r.get("serial_and_batch_bundle")}
+    if doc.get("name") and not (hasattr(doc, "is_new") and doc.is_new()):
+        candidates |= set(
+            frappe.get_all(
+                "Serial and Batch Bundle",
+                filters={"voucher_type": "Delivery Note", "voucher_no": doc.name, "docstatus": 0},
+                pluck="name",
+            )
+        )
+    for name in sorted(candidates - current):
+        if cint(frappe.db.get_value("Serial and Batch Bundle", name, "docstatus")) != 0:
+            continue
+        if not frappe.db.exists("Serial and Batch Bundle", name):
+            continue
+        used_elsewhere = frappe.db.sql(
+            """select 1 from `tabDelivery Note Item`
+            where serial_and_batch_bundle = %s and parent != %s limit 1""",
+            (name, doc.get("name") or ""),
+        )
+        if used_elsewhere:
+            continue
+        frappe.delete_doc("Serial and Batch Bundle", name, force=True, ignore_permissions=True)
+
+
+def batch_section_weight(batches):
+    """Section weight of the batches behind a row, from the Batch master.
+
+    ``batches`` is ``[(batch_no, pieces, length)]``. One section weight when the
+    batches agree; otherwise their average weighted by metres (pieces x length),
+    so a row of 20 bars at 34.2 and 2 bars at 34.6 shows about 34.24. Batches
+    without a section weight are left out. 0 when none has one.
+    """
+    names = list({b for b, _p, _l in batches if b})
+    if not names:
+        return 0
+    sw = {
+        r.name: flt(r.section_weight)
+        for r in frappe.get_all("Batch", filters={"name": ["in", names]}, fields=["name", "section_weight"])
+        if flt(r.section_weight) > 0
+    }
+    if not sw:
+        return 0
+    if len(set(sw.values())) == 1:
+        return next(iter(sw.values()))
+    metres = weighted = 0.0
+    for batch_no, pieces, length in batches:
+        if batch_no not in sw:
+            continue
+        m = abs(flt(pieces)) * flt(length) or 1.0
+        metres += m
+        weighted += sw[batch_no] * m
+    return flt(weighted / metres, 3) if metres else 0
+
+
+def _row_batches(row):
+    """[(batch_no, pieces, length)] behind a Delivery Note row."""
+    if row.get("serial_and_batch_bundle"):
+        return [
+            (e.batch_no, e.get("pieces"), flt(e.get("length")) or flt(row.get("length_size")))
+            for e in frappe.get_all(
+                "Serial and Batch Entry",
+                filters={"parent": row.serial_and_batch_bundle, "parenttype": "Serial and Batch Bundle"},
+                fields=["batch_no", "pieces", "length"],
+            )
+            if e.batch_no
+        ]
+    if row.get("batch_no"):
+        return [(row.batch_no, row.get("pieces"), flt(row.get("length_size")))]
+    return []
+
+
+def stamp_batch_section_weights(doc):
+    """Every row shows the section weight of its batch (team feedback 3, 21 Nov 2026).
+
+    The rebuilds on save took the section weight from the reservation rows,
+    some of which were worked out from weight / (pieces x length), so it moved
+    with the qty (34.200 became 34.615 after save). The field is read-only;
+    rows whose batches carry no section weight keep what they had.
+    """
+    if not frappe.get_meta("Delivery Note Item").has_field("section_weight"):
+        return
+    for row in doc.get("items") or []:
+        sw = batch_section_weight(_row_batches(row))
+        if sw:
+            row.section_weight = sw
+    # SW Qty (display) follows the section weight shown.
+    set_dn_sw_qty(doc)
 
 
 def invoice_basis_qty(row):
@@ -5142,7 +5246,12 @@ def _stamp_length_group_on_dn_item(dn_item, so_item, group, total_qty, total_pie
     if hasattr(dn_item, "lengthpieces_so") and total_pieces:
         dn_item.lengthpieces_so = cint(total_pieces)
 
-    section_weight = flt(so_item.get("section_weight"))
+    # The batches' own section weight (team feedback 3), else as before.
+    section_weight = batch_section_weight(
+        [(e.get("batch_no"), e.get("pieces"), flt(e.get("length")) or length) for e in group["entries"]]
+    )
+    if not section_weight:
+        section_weight = flt(so_item.get("section_weight"))
     if not section_weight:
         section_weight = next(
             (flt(e.get("section_weight")) for e in group["entries"] if flt(e.get("section_weight"))),

@@ -1,12 +1,15 @@
 # Copyright (c) 2026, Finbyz pvt. ltd. and Contributors
 # See license.txt
 
-"""Team feedback 14 Nov 2026, item 2 (rule as decided by Harsh, 14 Nov):
-Stock Transfer does not offer stock reserved for ANOTHER Sales Order line.
-Stock reserved for the batch's own line stays available; its reservation is
-released on submit, reserved again in the target warehouse for the same line,
-and given back if the transfer is cancelled. Quality Inspection → Finished
-Goods transfers are unaffected (nothing is reserved in QI warehouses).
+"""Stock Transfer and reserved stock.
+
+Team feedback 14 Nov 2026, item 2: Stock Transfer does not offer reserved stock.
+Round 3 kept stock reserved for the batch's own order line movable (its
+reservation moved with it); team feedback 3 (21 Nov 2026) asked for reserved
+stock not to be fetched or moved at all, so that exception is gone. Quality
+Inspection → Finished Goods transfers are unaffected (nothing is reserved in QI
+warehouses). Cancelling a transfer submitted under the round 3 rule still gives
+the moved reservation back.
 """
 
 from types import SimpleNamespace
@@ -99,7 +102,7 @@ class TestSubmitBlocksReservedStock(FrappeTestCase):
 	def test_qty_into_reserved_part_is_blocked(self):
 		with self.assertRaises(frappe.ValidationError) as cm:
 			self._validate(2.5, 10, {"qty": 1.0, "pieces": 10})
-		self.assertIn("reserved against another Sales Order line", str(cm.exception))
+		self.assertIn("reserved for a Sales Order", str(cm.exception))
 
 	def test_pieces_into_reserved_part_is_blocked(self):
 		with self.assertRaises(frappe.ValidationError):
@@ -120,8 +123,8 @@ class TestSubmitBlocksReservedStock(FrappeTestCase):
 		self.assertEqual(out["pieces"], 20)
 
 
-# --- Harsh, 14 Nov 2026: stock reserved for the SAME order line stays available ---
-class TestOwnLineReservationIsAvailable(FrappeTestCase):
+# --- Feedback 3 (21 Nov 2026): stock reserved for the batch's own line is not free either ---
+class TestOwnLineReservationIsNotFree(FrappeTestCase):
 	def _map(self, own_lines):
 		rows = [
 			frappe._dict(batch_no="B1", voucher_detail_no="LINE-A", qty=1.0, delivered_qty=0, pieces=10),
@@ -136,23 +139,28 @@ class TestOwnLineReservationIsAvailable(FrappeTestCase):
 	def test_without_own_line_everything_counts(self):
 		self.assertAlmostEqual(self._map(None)["B1"]["qty"], 1.5)
 
-	def test_save_allows_moving_own_line_reserved_stock(self):
+	def _own_line_map(self, warehouse, batches, own_lines=None):
+		# Round 3 rule: a reservation of the batch's own line did not count.
+		return {} if own_lines and own_lines.get("B1") == "LINE-A" else {"B1": {"qty": 1.0, "pieces": 10}}
+
+	def test_own_line_reserved_stock_cannot_be_moved(self):
+		"""Feedback 3: reserved stock never moves, own line or not."""
 		doc = StockTransfer.__new__(StockTransfer)
 		doc.source_warehouse = WH
 		doc.transfer_item = [SimpleNamespace(idx=1, item_code="FG000569", batch="B1", source_warehouse=WH,
 			qty=1.0, pieces=10, source_document_type="Stock Entry", source_document_name="MUST-1")]
-		seen = {}
-
-		def reserved_map(warehouse, batches, own_lines=None):
-			seen["own"] = own_lines
-			return {} if own_lines and own_lines.get("B1") == "LINE-A" else {"B1": {"qty": 1.0, "pieces": 10}}
-
 		with patch(f"{MOD}.get_live_batch_qty", return_value=1.0), \
 			patch(f"{MOD}.get_live_batch_pieces", return_value=10), \
-			patch(f"{MOD}.source_sales_order_line", return_value="LINE-A"), \
-			patch(f"{MOD}.get_reserved_batch_map", side_effect=reserved_map):
-			doc.validate_transfer_item_limits()
-		self.assertEqual(seen["own"], {"B1": "LINE-A"})
+			patch(f"{MOD}.source_sales_order_line", return_value="LINE-A", create=True), \
+			patch(f"{MOD}.get_reserved_batch_map", side_effect=self._own_line_map):
+			with self.assertRaises(frappe.ValidationError):
+				doc.validate_transfer_item_limits()
+
+	def test_own_line_reserved_stock_is_not_fetched(self):
+		rows = [_batch_row("B1", 1.0, 10)]
+		with patch(f"{MOD}.source_sales_order_line", return_value="LINE-A", create=True), \
+			patch(f"{MOD}.get_reserved_batch_map", side_effect=self._own_line_map):
+			self.assertEqual(st_module._exclude_reserved_stock(rows, WH), [])
 
 
 class FakeSRE(SimpleNamespace):
@@ -167,33 +175,6 @@ class TestReleaseAndRestore(FrappeTestCase):
 		doc.transfer_item = [SimpleNamespace(name="row1", idx=1, item_code="FG000569", batch="B1", source_warehouse=WH,
 			qty=qty, pieces=10, source_document_type="Stock Entry", source_document_name="MUST-1")]
 		return doc
-
-	def _release(self, qty, sre):
-		entry = frappe._dict(name=sre.name, qty=1.0, delivered_qty=0, pieces=10, length=6.5, section_weight=16)
-		comments = []
-		with patch(f"{MOD}.source_sales_order_line", return_value="LINE-A"), \
-			patch.object(st_module.frappe.db, "sql", return_value=[entry]), \
-			patch.object(st_module.frappe, "get_doc", side_effect=lambda *a, **k: comments.append(a[0]) or MagicMock() if isinstance(a[0], dict) else sre), \
-			patch.object(st_module.frappe, "msgprint"), \
-			patch("madhav.madhav.doctype.party_transfer.party_transfer.trim_reservation") as trim:
-			released = self._doc(qty).release_own_line_reservations()
-		return released, trim, comments
-
-	def test_full_move_cancels_the_reservation(self):
-		sre = FakeSRE(name="SRE-1", reserved_qty=1.0, delivered_qty=0, docstatus=1, flags=frappe._dict())
-		released, trim, comments = self._release(1.0, sre)
-		self.assertEqual(sre.docstatus, 2)
-		trim.assert_not_called()
-		self.assertEqual(released[0]["qty"], 1.0)
-		self.assertTrue(comments and comments[0]["content"].startswith(st_module.RELEASED_SRE_PREFIX))
-
-	def test_part_move_trims_the_reservation(self):
-		sre = FakeSRE(name="SRE-1", reserved_qty=1.0, delivered_qty=0, docstatus=1, flags=frappe._dict())
-		released, trim, _c = self._release(0.4, sre)
-		self.assertEqual(sre.docstatus, 1)
-		trim.assert_called_once()
-		self.assertEqual(trim.call_args[0][1:3], ("B1", 0.4))
-		self.assertEqual(released[0]["pieces"], 4)
 
 	def test_cancel_gives_back_trimmed_and_cancelled_reservations(self):
 		import json as _json
@@ -210,44 +191,3 @@ class TestReleaseAndRestore(FrappeTestCase):
 		self.assertEqual(errors, [])
 		trim.assert_called_once_with(docs["SRE-1"], "B1", -0.4, -4)
 		self.assertEqual(recreate.call_args[0][1].transfer_qty, 1.0)
-
-
-class FakeNewSRE(SimpleNamespace):
-	def set(self, f, v):
-		setattr(self, f, list(v))
-
-	def append(self, f, v):
-		getattr(self, f).append(v)
-
-	def insert(self):
-		self.inserted = True
-
-	def submit(self):
-		self.submitted = True
-
-
-class TestReservationMovesToTarget(FrappeTestCase):
-	def _run(self, reserved_rows):
-		doc = StockTransfer.__new__(StockTransfer)
-		doc.doctype, doc.name, doc.target_warehouse = "Stock Transfer", "STE-TEST", "For Mill (EXTRA) - MUPL"
-		doc.transfer_item = [SimpleNamespace(name="row1", target_warehouse=None)]
-		doc._fg_reservation_data = [{"from_voucher_detail_no": r} for r in reserved_rows]
-		doc._released_reservations = [{"sre": "SRE-1", "row": "row1", "batch_no": "B1", "qty": 1.308, "pieces": 12, "length": 6.575, "section_weight": 16.58}]
-		new = FakeNewSRE(item_code="FG000569", reservation_based_on="Serial and Batch", sb_entries=[], flags=frappe._dict())
-		with patch.object(st_module.frappe, "get_doc", return_value=SimpleNamespace(name="SRE-1")), \
-			patch.object(st_module.frappe, "copy_doc", return_value=new), \
-			patch(f"{MOD}.get_available_qty_to_reserve", return_value=5):
-			doc.carry_released_reservations()
-		return new
-
-	def test_reserved_again_in_target_for_same_line(self):
-		new = self._run([])
-		self.assertTrue(getattr(new, "submitted", False))
-		self.assertEqual(new.warehouse, "For Mill (EXTRA) - MUPL")
-		self.assertEqual((new.from_voucher_type, new.from_voucher_no), ("Stock Transfer", "STE-TEST"))
-		self.assertEqual(new.sb_entries[0]["qty"], 1.308)
-		self.assertEqual(new.sb_entries[0]["warehouse"], "For Mill (EXTRA) - MUPL")
-
-	def test_not_twice_when_sales_order_warehouse_rule_reserved_it(self):
-		new = self._run(["row1"])
-		self.assertFalse(getattr(new, "submitted", False))
