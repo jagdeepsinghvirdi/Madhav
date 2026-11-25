@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+import math
 
 import frappe
 from frappe import _
@@ -344,11 +345,16 @@ def get_remaining_unreserved_stock_qty(sales_order_item):
 
 
 def get_remaining_pieces_for_new_production_plan(sales_order_item, so_pieces, production_plan_pieces):
-	"""Pieces still to plan, using the same rule as the qty."""
+	"""Pieces still to plan, using the same rule as the qty.
+
+	Always whole bars (team feedback 4, 26 Nov 2026: Get Items showed 18.940
+	pieces for SO MU-SO26-00626). Reservations scaled by their delivered
+	weight can give fractions; the nearest whole bar is offered.
+	"""
 	effective_planned_pieces = get_effective_planned(
 		sales_order_item, None, production_plan_pieces
 	).pieces
-	return pending_for_new_production_plan(
+	pending = pending_for_new_production_plan(
 		so_pieces,
 		effective_planned_pieces,
 		get_delivered_pieces(sales_order_item),
@@ -356,6 +362,7 @@ def get_remaining_pieces_for_new_production_plan(sales_order_item, so_pieces, pr
 		get_bwrt_delivered_pieces(sales_order_item),
 		production_open=production_open_pieces(sales_order_item, so_pieces),
 	)
+	return float(math.floor(flt(pending) + 0.5))
 
 
 def production_open_pieces(sales_order_item, so_pieces):
@@ -385,7 +392,8 @@ class CustomProductionPlan(ERPNextProductionPlan):
 			if isinstance(row.length, str):
 				row.length = row.length.strip()
 			if row.pieces:
-				row.pieces = int(row.pieces)
+				# Nearest whole bar, not cut down (18.94 is 19, not 18).
+				row.pieces = int(math.floor(flt(row.pieces) + 0.5))
 
 	@frappe.whitelist()
 	def get_items(self):

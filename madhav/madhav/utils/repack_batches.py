@@ -216,9 +216,17 @@ def get_batch_reservations_for_repack(item_code, warehouse, batch_no):
 		get_batch_reservation_limits,
 	)
 
+	from erpnext.stock.doctype.batch.batch import get_batch_qty
+
 	limits = get_batch_reservation_limits(item_code, warehouse, batch_no)
 	free_qty = flt(limits.get("qty"), 3)
 	return {
+		# The batch's stock here, reserved or not (team feedback 4: a fully
+		# reserved batch showed Pcs x Length x SW, 1.925, instead of 1.969).
+		"batch_qty": flt(
+			get_batch_qty(batch_no=batch_no, warehouse=warehouse, item_code=item_code, ignore_reserved_stock=True),
+			3,
+		),
 		"free_qty": free_qty,
 		"free_pieces": cint(limits.get("pieces")) if free_qty > QTY_EPSILON else 0,
 		"reservations": batch_reservations(item_code, warehouse, batch_no),

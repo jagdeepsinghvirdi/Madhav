@@ -220,12 +220,14 @@ class TestOldestBatchFirstOnDraft(FrappeTestCase):
 		self.assertEqual([(e.batch_no, e.pieces) for e in bundle.entries], [("B-001", 10), ("B-002", 5)])
 		self.assertAlmostEqual(item.qty, 3.0)
 
-	def test_lower_qty_takes_weight_oldest_first(self):
+	def test_lower_qty_keeps_the_bars(self):
+		# Team feedback 4 (26 Nov 2026) replaced "less qty takes weight oldest
+		# first, bars follow": a typed Qty is the weight of the same bars.
 		bundle = _bundle([("B-001", 10, 2.0), ("B-002", 5, 1.0)])
 		item = _eight_metre_row(qty=2.5, stock_qty=2.5)
 		_rebuild(item, bundle)
-		self.assertEqual([(e.batch_no, -e.qty) for e in bundle.entries], [("B-001", 2.0), ("B-002", 0.5)])
-		self.assertEqual(item.pieces, 13)  # 10 + a started 3 of B-002's 5
+		self.assertEqual([(e.batch_no, e.pieces, -e.qty) for e in bundle.entries], [("B-001", 10, 1.667), ("B-002", 5, 0.833)])
+		self.assertEqual(item.pieces, 15)
 
 	def test_unchanged_row_is_not_rewritten(self):
 		bundle = _bundle([("B-001", 10, 2.0), ("B-002", 5, 1.0)])

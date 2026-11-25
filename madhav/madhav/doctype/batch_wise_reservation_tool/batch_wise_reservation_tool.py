@@ -815,7 +815,9 @@ def get_reserved_pieces_map(so_details):
 	rows = frappe.db.sql(
 		"""
 		SELECT sre.voucher_detail_no AS sales_order_item,
-		       SUM(sbe.pieces) AS pieces
+		       SUM(CASE WHEN IFNULL(sbe.qty, 0) > 0
+		                THEN IFNULL(sbe.pieces, 0) * GREATEST(sbe.qty - IFNULL(sbe.delivered_qty, 0), 0) / sbe.qty
+		                ELSE 0 END) AS pieces
 		FROM `tabStock Reservation Entry` sre
 		INNER JOIN `tabSerial and Batch Entry` sbe
 			ON sbe.parent = sre.name
@@ -829,7 +831,9 @@ def get_reserved_pieces_map(so_details):
 		{"so_details": tuple(so_details)},
 		as_dict=True,
 	)
-	return {d.sales_order_item: cint(d.pieces) for d in rows}
+	# Bars still reserved and not yet delivered, as whole bars (team feedback 4:
+	# a partly delivered reservation showed its delivered bars as reserved).
+	return {d.sales_order_item: cint(math.floor(flt(d.pieces) + 0.5)) for d in rows}
 
 
 @frappe.whitelist()

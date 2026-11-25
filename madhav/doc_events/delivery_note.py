@@ -2288,7 +2288,7 @@ def sync_batch_master_qty_from_delivery(doc):
             recalculate_batch_pieces(batch_no)
 
 
-def get_available_qty_for_item(row, already_claimed=None):
+def get_available_qty_for_item(row, already_claimed=None, note_lines=None):
     """"Available" must always be live physical stock when it can be
     resolved, never averaged/maxed against a bundle's reservation-time
     snapshot. A max() with the snapshot fixes a stale-too-small
@@ -2326,12 +2326,13 @@ def get_available_qty_for_item(row, already_claimed=None):
     if batch_nos and warehouse:
         live_total = 0.0
         has_live = False
+        reserved_for_others = _reserved_for_other_lines(row, warehouse, batch_nos, note_lines)
         for b in batch_nos:
             if _has_live_batch_ledger(row.item_code, warehouse, b):
                 has_live = True
             live = get_batch_qty_from_sle(row.item_code, warehouse, b)
             used = flt((already_claimed or {}).get((row.item_code, warehouse, b), 0))
-            live_total += max(0.0, flt(live) - used)
+            live_total += max(0.0, flt(live) - flt(reserved_for_others.get(b)) - used)
         if has_live:
             return live_total
 
@@ -2347,6 +2348,63 @@ def get_available_qty_for_item(row, already_claimed=None):
             return reserved
 
     return 0
+
+
+def _row_own_so_line(row):
+    """Sales Order line a Delivery Note row delivers (also through its Sales Invoice line)."""
+    so_detail = getattr(row, "so_detail", None)
+    if so_detail:
+        return so_detail
+    si_detail = row.get("si_detail") if hasattr(row, "get") else getattr(row, "si_detail", None)
+    if si_detail:
+        return frappe.db.get_value("Sales Invoice Item", si_detail, "so_detail")
+    return None
+
+
+def _reserved_for_other_lines(row, warehouse, batch_nos, note_lines=None):
+    """{batch_no: open qty reserved for OTHER Sales Order lines} in this warehouse.
+
+    Team feedback 4 (26 Nov 2026), DCA/26-27/1583: Invoice Qty 0.520 on a
+    0.510 reservation. The batch held 3.425, so the extra 0.010 counted as
+    available and was taken from another order's reservation (ERPNext then
+    refused, or the other order was left short). Stock reserved for another
+    line is not this row's to deliver; above this row's own reservation plus
+    the free stock, Invoice Qty is a shortfall that the Stock Reconciliation
+    tops up.
+
+    ``note_lines``: every Sales Order line on the same Delivery Note. Their
+    reservations are delivered by this note (its rows' claims count them),
+    so they are not "other orders" here.
+    """
+    batch_nos = [b for b in batch_nos or [] if b]
+    if not warehouse or not batch_nos:
+        return {}
+    skip = {l for l in (note_lines or ()) if l}
+    own = _row_own_so_line(row)
+    if own:
+        skip.add(own)
+    rows = frappe.db.sql(
+        """
+        SELECT sbe.batch_no, sre.voucher_detail_no,
+            SUM(GREATEST(sbe.qty - IFNULL(sbe.delivered_qty, 0), 0)) AS qty
+        FROM `tabStock Reservation Entry` sre
+        INNER JOIN `tabSerial and Batch Entry` sbe
+            ON sbe.parent = sre.name AND sbe.parenttype = 'Stock Reservation Entry'
+        WHERE sre.docstatus = 1
+          AND sre.status IN ('Reserved', 'Partially Reserved', 'Partially Delivered')
+          AND sre.warehouse = %(warehouse)s
+          AND sbe.batch_no IN %(batch_nos)s
+        GROUP BY sbe.batch_no, sre.voucher_detail_no
+        """,
+        {"warehouse": warehouse, "batch_nos": tuple(batch_nos)},
+        as_dict=True,
+    )
+    out = {}
+    for r in rows or []:
+        if r.voucher_detail_no in skip:
+            continue
+        out[r.batch_no] = out.get(r.batch_no, 0) + flt(r.qty)
+    return out
 
 
 def _undelivered_qty_on_matching_sres(row, warehouse, batch_nos):
@@ -2849,6 +2907,7 @@ def before_submit(self, method):
     # split onto two Deliver-as-Qty lines cannot both expand to the full
     # live balance (0.39+0.39 from a 0.765 batch → negative stock).
     claimed = {}
+    note_lines = {_row_own_so_line(r) for r in self.items} - {None}
 
     for i in self.items:
         if not i.custom_deliver_as_qty:
@@ -2865,7 +2924,7 @@ def before_submit(self, method):
                 ).format(i.idx, i.item_code)
             )
 
-        available_qty = get_available_qty_for_item(i, already_claimed=claimed)
+        available_qty = get_available_qty_for_item(i, already_claimed=claimed, note_lines=note_lines)
 
         # Round to stock qty precision first so a 1.189 vs 1.190 gap that
         # collapses at 2 decimals (both 1.19) is not treated as a shortfall,
@@ -5082,6 +5141,71 @@ def _stuck_sres_for_so_line(so_detail):
     )
 
 
+def _sres_with_all_bars_delivered(so_detail):
+    """Partially Delivered SREs of a line whose reserved bars have all been delivered.
+
+    Team feedback 4 (26 Nov 2026), SO MU-SO26-00626 / DCA/26-27/1592: a
+    Deliver-as-Qty note took all 3 bars of MAT-SRE-2026-04081 at 0.98 of its
+    1.000 t. The 0.02 t stayed reserved with no bar behind it: the Production
+    Plan then offered 7.990 t / 18.94 pcs and the reservation tool showed the
+    3 delivered bars as reserved. A batch's bars are all delivered when the
+    line's submitted notes (less returns) took at least as many bars of that
+    batch as the line's reservations held; the weight left is not stock any
+    note of this line can still take.
+    """
+    sres = frappe.db.sql(
+        """
+        select sre.name, sre.warehouse, sbe.batch_no, sbe.qty, ifnull(sbe.delivered_qty, 0) as delivered_qty,
+            ifnull(sbe.pieces, 0) as pieces, sre.status
+        from `tabStock Reservation Entry` sre
+        inner join `tabSerial and Batch Entry` sbe
+            on sbe.parent = sre.name and sbe.parenttype = 'Stock Reservation Entry'
+        where sre.voucher_type = 'Sales Order' and sre.voucher_detail_no = %s
+            and sre.docstatus = 1 and sre.reservation_based_on = 'Serial and Batch'
+            and sre.status not in ('Cancelled')
+        """,
+        so_detail,
+        as_dict=True,
+    )
+    if not any(r.status == "Partially Delivered" for r in sres):
+        return []
+
+    reserved_bars = {}
+    for r in sres:
+        key = (r.warehouse, r.batch_no)
+        reserved_bars[key] = reserved_bars.get(key, 0) + cint(flt(r.pieces))
+
+    delivered_bars = {}
+    for d in frappe.db.sql(
+        """
+        select ifnull(sbe.warehouse, dni.warehouse) as warehouse, sbe.batch_no,
+            sum(case when dn.is_return = 1 then -abs(ifnull(sbe.pieces, 0)) else abs(ifnull(sbe.pieces, 0)) end) as pieces
+        from `tabDelivery Note Item` dni
+        inner join `tabDelivery Note` dn on dn.name = dni.parent
+        inner join `tabSerial and Batch Entry` sbe
+            on sbe.parent = dni.serial_and_batch_bundle and sbe.parenttype = 'Serial and Batch Bundle'
+        where dni.so_detail = %s and dn.docstatus = 1
+        group by ifnull(sbe.warehouse, dni.warehouse), sbe.batch_no
+        """,
+        so_detail,
+        as_dict=True,
+    ):
+        delivered_bars[(d.warehouse, d.batch_no)] = cint(flt(d.pieces))
+
+    out = []
+    by_sre = {}
+    for r in sres:
+        if r.status != "Partially Delivered" or flt(r.qty) - flt(r.delivered_qty) <= 1e-9:
+            continue
+        key = (r.warehouse, r.batch_no)
+        done = reserved_bars.get(key, 0) > 0 and delivered_bars.get(key, 0) >= reserved_bars[key]
+        by_sre[r.name] = by_sre.get(r.name, True) and done
+    for name, done in by_sre.items():
+        if done:
+            out.append(name)
+    return out
+
+
 def release_fully_delivered_so_reservations(doc):
     """Free over-production reservation left on a fully delivered SO line.
 
@@ -5101,7 +5225,9 @@ def release_fully_delivered_so_reservations(doc):
 
     released = []
     for so_detail in {r.so_detail for r in doc.items if r.so_detail}:
-        for sre_name in _stuck_sres_for_so_line(so_detail):
+        names = list(_stuck_sres_for_so_line(so_detail))
+        names += [n for n in _sres_with_all_bars_delivered(so_detail) if n not in names]
+        for sre_name in names:
             rec = _release_leftover_on_sre(sre_name)
             if rec:
                 released.append(rec)
@@ -5405,11 +5531,58 @@ def _row_reserved_pool(doc, item):
     return out
 
 
+def _keep_bars_new_weight(doc, item, entries, pool, new_qty, old_qty):
+    """Allocations with each entry's bars unchanged and ``new_qty`` shared by weight.
+
+    A batch may give more weight than is reserved for the line only from its
+    free stock (the same rule as before), never from another order's stock.
+    """
+    pool_qty = {}
+    for p in pool:
+        key = (p.get("warehouse") or item.warehouse, p.get("batch_no"))
+        pool_qty[key] = pool_qty.get(key, 0) + flt(p.get("qty"))
+    other_use = None
+    allocations = []
+    left = flt(new_qty)
+    for i, e in enumerate(entries):
+        share = abs(flt(e.qty)) / old_qty if old_qty else 1.0 / len(entries)
+        take = flt(left, 3) if i == len(entries) - 1 else flt(new_qty * share, 3)
+        left -= take
+        warehouse = getattr(e, "warehouse", None) or item.warehouse
+        if take > flt(pool_qty.get((warehouse, e.batch_no))) + BUNDLE_QTY_TOLERANCE:
+            if other_use is None:
+                other_use = _other_rows_batch_use(doc, item)
+            cap = flt(
+                _row_batch_cap(item, warehouse, e.batch_no) - flt(other_use.get((warehouse, e.batch_no))), 3
+            )
+            if take > cap + BUNDLE_QTY_TOLERANCE:
+                frappe.throw(
+                    _(
+                        "Row #{0}: Qty {1} for these {2} pieces is more than batch {3} can give this line "
+                        "({4}: its reservation plus free stock). Lower the Qty, or reserve more stock first."
+                    ).format(item.idx, flt(new_qty, 3), sum(cint(x.pieces) for x in entries),
+                        frappe.bold(e.batch_no), cap),
+                    title=_("Not enough reserved stock"),
+                )
+        allocations.append(
+            {
+                "batch_no": e.batch_no,
+                "warehouse": warehouse,
+                "take_qty": flt(take, 3),
+                "take_pieces": cint(flt(e.pieces)),
+                "length": flt(getattr(e, "length", 0)),
+                "section_weight": flt(getattr(e, "section_weight", 0)),
+            }
+        )
+    return allocations
+
+
 def rebuild_row_bundle_fifo(doc, item, bundle=None):
     """Re-take a reserved row's batches oldest first after Pieces or Qty changed.
 
     Pieces changed → that many bars, oldest batch first; the weight follows.
-    Otherwise Qty changed → that weight, oldest batch first; bars follow.
+    Otherwise Qty changed → the same bars at that weight (team feedback 4);
+    a bundle without bar counts takes that weight oldest batch first.
     Returns True when the row was handled here (the caller then skips the
     proportional resize), False when the row has no reserved pool.
     """
@@ -5451,6 +5624,12 @@ def rebuild_row_bundle_fifo(doc, item, bundle=None):
                 flt(last.get("qty")) / cint(last.get("pieces")) if cint(last.get("pieces")) else 0
             )
             short_qty = flt(short * per_piece, 3)
+    elif bundle_pieces > 0:
+        # Team feedback 4 (26 Nov 2026), DCA/26-27/1588: a typed Qty is the
+        # weight of the same bars (63 stayed 63, not 58). Keep each batch's
+        # bars and share the new weight over them.
+        allocations = _keep_bars_new_weight(doc, item, current, pool, row_stock_qty, bundle_qty)
+        short, short_qty = 0, 0.0
     else:
         allocations, short_qty = allocate_qty_fifo(pool, row_stock_qty)
         short = 0

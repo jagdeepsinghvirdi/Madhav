@@ -50,6 +50,16 @@ def _get_batch_constraints(voucher_type, voucher_detail_no, item_code=None,from_
     if max_length is None:
         max_length = default_max
 
+    # Restored (team feedback 4 usage review, 26 Nov 2026): the 10 Sep change
+    # (2dea563) dropped these lines, so the function returned None for every
+    # Sales Order line with a length and "Reserve Stock" on the Sales Order
+    # crashed ("'NoneType' object has no attribute 'get'", demo 25 Nov).
+    if min_length > max_length:
+        min_length, max_length = max_length, min_length
+
+    constraints.update({"min_length": min_length, "max_length": max_length})
+    return constraints
+
 
 def _default_length_window(length_size):
     """Return (min_length, max_length) for batch filtering; never None when length_size > 0."""

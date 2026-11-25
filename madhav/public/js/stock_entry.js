@@ -499,6 +499,12 @@ function offer_unreserve_for_repack(frm, cdt, cdn, free_qty) {
         const res = r.message || {};
         const reservations = res.reservations || [];
         if (!reservations.length || locals[cdt][cdn].batch_no !== child.batch_no) return;
+        // Nothing free: show the batch's real stock, not Pcs x Length x SW
+        // (team feedback 4: 1.925 shown for a 1.969 batch when the pop-up
+        // was closed). Submit still needs "Unreserve and use".
+        if (flt(free_qty) <= 0 && flt(res.batch_qty) > 0) {
+            frappe.model.set_value(cdt, cdn, "qty", flt(res.batch_qty, 3));
+        }
 
         const lines = reservations.map((x) =>
             `<li>${frappe.utils.escape_html(x.sales_order || x.sre)} · ${frappe.utils.escape_html(x.customer_name || x.customer || "")}`

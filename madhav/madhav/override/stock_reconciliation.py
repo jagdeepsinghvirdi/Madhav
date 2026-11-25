@@ -57,10 +57,16 @@ class StockReconciliation(_StockReconciliation):
             # reason to block - only a real shortage is.
             return self._validate_reserved_stock_for_dn_cancel(sre_rows, reco_keys)
 
+        topped_up = self._dn_top_up_qty_by_key() if self._action == "submit" else {}
+
         data = []
         for row in sre_rows:
             key = (row.item_code, row.warehouse, row.batch_no)
             reserved_qty = flt(row.reserved_qty)
+            # A Delivery Note's shortfall top-up only adds stock: other
+            # orders' reservations on the batch stay covered (team feedback 4).
+            if key in topped_up and topped_up[key] + 0.001 >= reserved_qty:
+                continue
             if key in reco_keys and reserved_qty > 0.001:
                 data.append([
                     row.item_code,
@@ -90,6 +96,24 @@ class StockReconciliation(_StockReconciliation):
             ).format(self._action, items_html)
 
         frappe.throw(msg, title=_("Stock Reservation"))
+
+    def _dn_top_up_qty_by_key(self):
+        """{(item, warehouse, batch): new qty} for batches this SR only tops up for a Delivery Note.
+
+        A key qualifies when every row on it comes from a Delivery Note
+        shortfall (``delivery_note_ref``) and raises the batch (qty above
+        current qty). Any other row on the batch keeps ERPNext's rule.
+        """
+        out, other = {}, set()
+        for item in self.items:
+            if not item.batch_no:
+                continue
+            key = (item.item_code, item.warehouse, item.batch_no)
+            if item.get("delivery_note_ref") and flt(item.qty) > flt(item.current_qty):
+                out[key] = out.get(key, 0) + flt(item.qty)
+            else:
+                other.add(key)
+        return {k: v for k, v in out.items() if k not in other}
 
     def _validate_reserved_stock_for_dn_cancel(self, sre_rows, reco_keys):
         """Cancel of a Delivery Note's shortfall SR: block only a real shortage.
